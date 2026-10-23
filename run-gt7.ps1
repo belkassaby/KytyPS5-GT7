@@ -6,6 +6,11 @@ param(
     [int]$Width = 1920,
     [int]$Height = 1080,
     [ValidateSet('Fifo', 'Mailbox', 'Immediate')][string]$PresentMode = 'Mailbox',
+    [ValidateSet('None', 'Size', 'Performance')][string]$ShaderOptimization = 'Performance',
+    [switch]$NoBindless,
+    # Guest shaders to skip. 3a2026af8161d470: a compute shader NVIDIA's 591.86 laptop driver crashes
+    # compiling (in vkCreateComputePipelines, at the GT logo), whatever the SPIR-V optimization.
+    [string]$SkipShaders = '3a2026af8161d470',
     [string[]]$Extra = @()
 )
 $exe = Join-Path $PSScriptRoot '_Build\windows-noqt\kyty_emulator.exe'
@@ -14,10 +19,10 @@ $arguments = @(
     '--screen-width', $Width, '--screen-height', $Height,
     '--present-mode', $PresentMode,
     '--vblank-frequency', 60,
-    '--shader-optimization-type', 'Performance',
-    '--tessellation', '--bindless', '--redzone',
+    '--shader-optimization-type', $ShaderOptimization,
+    '--tessellation', '--redzone',
     '--printf-direction', 'File'
-) + $Extra
+) + $(if ($SkipShaders) { @('--skip-shaders', $SkipShaders) } else { @() }) + $(if ($NoBindless) { @() } else { @('--bindless') }) + $Extra
 Set-Location $PSScriptRoot
 & $exe @arguments
 "exit code: $LASTEXITCODE"
