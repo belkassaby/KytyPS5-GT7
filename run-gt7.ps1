@@ -11,9 +11,10 @@ param(
     # Guest shaders to skip. 3a2026af8161d470: a compute shader NVIDIA's 591.86 laptop driver crashes
     # compiling (in vkCreateComputePipelines, at the GT logo), whatever the SPIR-V optimization.
     [string]$SkipShaders = '3a2026af8161d470',
+    [switch]$Dev,
     [string[]]$Extra = @()
 )
-$exe = Join-Path $PSScriptRoot '_Build\windows-noqt\kyty_emulator.exe'
+$exe = Join-Path $PSScriptRoot $(if ($Dev) { '_Build\windows-noqt-dev\kyty_emulator.exe' } else { '_Build\windows-noqt\kyty_emulator.exe' })
 $arguments = @(
     '--game', $Game,
     '--screen-width', $Width, '--screen-height', $Height,

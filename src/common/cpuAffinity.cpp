@@ -39,7 +39,61 @@ static bool Enabled() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+static bool EnvOff(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr && value[0] == '0';
+}
+
+// GT7 port (from the AnyPS5 port's host scheduling): once per process, a 1 ms timer resolution
+// and no power throttling (EcoQoS), so Windows neither coarsens the emulator's timed waits nor
+// runs it at efficiency clocks. KYTY_HOST_TUNING=0 leaves both as Windows chooses.
+static void TuneProcessOnce() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		if (EnvOff("KYTY_HOST_TUNING")) {
+			return;
+		}
+		if (const auto winmm = LoadLibraryW(L"winmm.dll")) {
+			using BeginPeriod = UINT(WINAPI*)(UINT);
+			if (const auto begin = reinterpret_cast<BeginPeriod>(
+			        reinterpret_cast<void*>(GetProcAddress(winmm, "timeBeginPeriod")))) {
+				begin(1);
+			}
+		}
+		PROCESS_POWER_THROTTLING_STATE state {};
+		state.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+		state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+		                    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+		state.StateMask   = 0;
+		const bool unthrottled = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+		                                               &state, sizeof(state)) != 0;
+		LOGF("CPU: 1 ms timer resolution, power throttling %s (KYTY_HOST_TUNING=0 leaves both)\n",
+		     unthrottled ? "off" : "unchanged (refused)");
+	});
+}
+
+// The emulator's latency-critical threads join the Multimedia Class Scheduler's "Games" task, the
+// steady raised priority a game's render thread gets. KYTY_MMCSS=0 leaves them at their priority.
+static void JoinGamesSchedulingClass(const char* name) {
+	if (EnvOff("KYTY_MMCSS")) {
+		return;
+	}
+	static const auto join = [] {
+		using Join      = HANDLE(WINAPI*)(LPCWSTR, LPDWORD);
+		const auto avrt = LoadLibraryW(L"avrt.dll");
+		return avrt != nullptr ? reinterpret_cast<Join>(reinterpret_cast<void*>(
+		                             GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW")))
+		                       : nullptr;
+	}();
+	DWORD task = 0;
+	if (join == nullptr || join(L"Games", &task) == nullptr) {
+		LOGF("CPU: %s could not join the MMCSS Games task\n", name);
+	}
+}
+
 void PreferPerformanceCores(const char* name) {
+	TuneProcessOnce();
+	JoinGamesSchedulingClass(name);
 	if (!Enabled()) {
 		return;
 	}
