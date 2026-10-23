@@ -8,9 +8,10 @@ param(
     [ValidateSet('Fifo', 'Mailbox', 'Immediate')][string]$PresentMode = 'Mailbox',
     [ValidateSet('None', 'Size', 'Performance')][string]$ShaderOptimization = 'Performance',
     [switch]$NoBindless,
-    # Guest shaders to skip. 3a2026af8161d470: a compute shader NVIDIA's 591.86 laptop driver crashes
-    # compiling (in vkCreateComputePipelines, at the GT logo), whatever the SPIR-V optimization.
-    [string]$SkipShaders = '3a2026af8161d470',
+    # Guest shaders to skip (hex hashes, comma separated). NVIDIA drivers before 616 crash compiling
+    # compute shader 3a2026af8161d470 at the GT logo (591.86 did, 621.01 does not): on such a driver
+    # pass -SkipShaders 3a2026af8161d470, or better update the driver.
+    [string]$SkipShaders = '',
     [switch]$Dev,
     [string[]]$Extra = @()
 )
