@@ -12,6 +12,7 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/spirvMeshTest.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -338,13 +339,17 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(device_features2.features.independentBlend, "independentBlend");
 		check_feature(device_features2.features.tessellationShader, "tessellationShader");
 
-		if (!skip_device) {
+		// Every missing extension is named, also on a device a missing feature rejected already,
+		// and a rejected device lists what it has (round 138: a report named only the first).
+		{
 			auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
 			    "vkEnumerateDeviceExtensionProperties",
 			    [&](uint32_t* count, vk::ExtensionProperties* values) {
 				    return device.enumerateDeviceExtensionProperties(nullptr, count, values);
 			    });
-			EXIT_NOT_IMPLEMENTED(available_extensions.empty());
+			if (available_extensions.empty()) {
+				reject("the device lists no extensions");
+			}
 
 			for (const char* ext: device_extensions) {
 				if (!HasExtension(available_extensions, ext)) {
@@ -838,6 +843,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     ShaderRecompiler::Spirv::GetCoherentLoadAcquire() ? "on" : "off",
 	     ShaderRecompiler::Spirv::CoherentLoadModeName(
 	         ShaderRecompiler::Spirv::GetCoherentLoadMode()));
+	// Round 151: AMD's driver crashed on the mesh shaders' Layer output (spirvMeshTest.h).
+	SetMeshHost(properties2.properties.vendorID);
 	vk::PhysicalDeviceAddressBindingReportFeaturesEXT address_binding {};
 	if (graphics.address_binding_report_enabled) {
 		address_binding.reportAddressBinding = VK_TRUE;
