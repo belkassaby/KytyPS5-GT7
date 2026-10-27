@@ -1,4 +1,5 @@
 #include "common/fileReadLog.h"
+#include "graphics/host_gpu/renderer/textureRegistry.h"
 #include "common/abi.h"
 #include "common/dateTime.h"
 #include "common/file.h"
@@ -2225,6 +2226,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		*bytes_read += read;
 	}
 	Common::FileReadLog::Record(destination, *bytes_read, host_path, file_offset);
+	Graphics::TextureRegistry::NotePackageRead(destination, *bytes_read, host_path);
 	if (file_hash != nullptr) {
 		hashes->file = XXH3_64bits_digest(file_hash);
 		// What guest memory holds now, read through its backing (no tracking faults).
