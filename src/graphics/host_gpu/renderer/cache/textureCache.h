@@ -106,6 +106,14 @@ public:
 	// CPU or a GPU buffer write), and its pages are all tracked, so that FindImage and FindTexture
 	// would find it and its view and leave it as it is. It is then touched as FindImage touches it.
 	[[nodiscard]] bool ReuseTextureBinding(ImageId id);
+	// GT7 port, target reuse (RenderExecutor::PrepareDrawRenderState): a render or depth target
+	// FindImage gave for `desc`, used again while the image set's generation has not changed (so
+	// FindImage would give it again). TargetStillRegistered says whether it still may be;
+	// RefindTarget then does what FindImage does to an image it finds: touches it and materializes
+	// its pending metadata clear (`metadata_base_layer`: the layer the registers give, before
+	// FindImage placed the view).
+	[[nodiscard]] bool TargetStillRegistered(ImageId id);
+	void               RefindTarget(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] Image&        GetImage(ImageId id) {

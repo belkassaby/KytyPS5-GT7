@@ -5731,6 +5731,15 @@ bool PipelineCache::FinishPending(Pipeline& pipeline) {
 	return true;
 }
 
+// GT7 port: the last graphics pipeline found is compared first (KYTY_STATE_REUSE=0: not).
+static bool GraphicsPipelineMemoOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_STATE_REUSE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
 PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
@@ -6034,8 +6043,21 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 		return nullptr;
 	};
-	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		auto& found = *iter->second;
+	// GT7 port (KYTY_STATE_REUSE, renderDraw.cpp): ~94 % of a race's draws have the pipeline of
+	// the draw before; its key is compared first, before a hash of the key and a map lookup.
+	// Pipelines stay in the map until the cache is destroyed, so the pointer stays valid.
+	Pipeline* known = nullptr;
+	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
+		known = m_last_graphics_pipeline;
+	} else if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		known = iter->second.get();
+		if (GraphicsPipelineMemoOn()) {
+			m_last_graphics_key      = key;
+			m_last_graphics_pipeline = known;
+		}
+	}
+	if (known != nullptr) {
+		auto& found = *known;
 		if (found.pending && !FinishPending(found)) {
 			if (defer == PipelineDefer::Allowed) {
 				return skip_draw(*found.pending);

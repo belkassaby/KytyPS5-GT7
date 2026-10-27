@@ -457,6 +457,9 @@ private:
 	std::vector<vk::Pipeline> m_quick_retired;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// GT7 port: the key and pipeline the last map lookup found (TryGetGraphicsPipeline).
+	GraphicsPipelineKey m_last_graphics_key {};
+	Pipeline*           m_last_graphics_pipeline = nullptr;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	// Round 97: by shader hash, its last expansion whose compute pipeline is ready (the program id
 	// and the expanded code), run while a newer one compiles (GetComputeProgram); and the newer
