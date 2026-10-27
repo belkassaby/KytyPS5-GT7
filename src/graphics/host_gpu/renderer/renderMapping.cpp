@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/renderMapping.h"
 
+#include "common/file.h"
+#include "common/fileReadLog.h"
 #include "common/guestWatch.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -145,6 +147,32 @@ std::vector<std::vector<Place>> Search(const std::vector<Key>& keys, uint64_t& s
 	return places;
 }
 
+// Where the bytes at `address` came from (Common::FileReadLog): the file and offset of the read
+// that filled them, and whether that file holds the same T# there (prebuilt) or other bytes (the
+// guest changed them after the read: base address or flags patched).
+std::string FromFile(uint64_t address, const std::array<uint32_t, 4>& tsharp) {
+	Common::FileReadLog::Read read;
+	if (!Common::FileReadLog::Find(address, &read)) {
+		return ", not from a file read";
+	}
+	const auto   offset = read.file_offset + (address - read.destination);
+	Common::File file;
+	std::array<uint32_t, 4> in_file {};
+	uint32_t                got = 0;
+	if (file.Open(read.path, Common::File::Mode::Read) && file.Seek(offset)) {
+		file.Read(in_file.data(), sizeof(in_file), &got);
+	}
+	file.Close();
+	const auto bytes = got == sizeof(in_file)
+	                       ? fmt::format("{:08x} {:08x} {:08x} {:08x}", in_file[0], in_file[1],
+	                                     in_file[2], in_file[3])
+	                       : std::string("unreadable");
+	return fmt::format(", read from {} at 0x{:x} (a read of 0x{:x} bytes into 0x{:x}); the file "
+	                   "has {} there: {}",
+	                   read.path, offset, read.size, read.destination, bytes,
+	                   in_file == tsharp ? "the same T#" : "other bytes");
+}
+
 void Map(State& state, BufferCache& buffers) {
 	std::vector<std::pair<Key, uint64_t>> busiest;
 	// Mipmapped textures only (KYTY_MAP_TEXTURES_ALL=1: any): the busiest single-level ones are
@@ -185,10 +213,10 @@ void Map(State& state, BufferCache& buffers) {
 		for (const auto& place: places[k]) {
 			const bool gpu_dirty = buffers.HasGpuDirtyBytes(place.address, 32);
 			const auto writers   = BufferCache::GpuWritersOf(place.address, 32);
-			LOGF("Texture map:   0x%" PRIx64 " %s, %s, last GPU writers: %s\n", place.address,
+			LOGF("Texture map:   0x%" PRIx64 " %s, %s, last GPU writers: %s%s\n", place.address,
 			     place.protected_ ? "protected" : "readable",
 			     gpu_dirty ? "GPU-written (not downloaded)" : "CPU copy current",
-			     writers.empty() ? "-" : writers.c_str());
+			     writers.empty() ? "-" : writers.c_str(), FromFile(place.address, d).c_str());
 		}
 		// One watch for each of the four busiest T#s found in readable memory: the place with the
 		// highest address (a texture package header in GPU memory lies above the per-frame tables).

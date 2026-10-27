@@ -1,3 +1,4 @@
+#include "common/fileReadLog.h"
 #include "common/abi.h"
 #include "common/dateTime.h"
 #include "common/file.h"
@@ -2223,6 +2224,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), chunk.data(), read);
 		*bytes_read += read;
 	}
+	Common::FileReadLog::Record(destination, *bytes_read, host_path, file_offset);
 	if (file_hash != nullptr) {
 		hashes->file = XXH3_64bits_digest(file_hash);
 		// What guest memory holds now, read through its backing (no tracking faults).
