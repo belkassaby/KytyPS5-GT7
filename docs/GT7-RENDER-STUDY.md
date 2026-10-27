@@ -71,3 +71,15 @@ and are copied into per-frame tables. A fast path keyed on those texture objects
 object's T# (it changes only when the texture streams in or is replaced) to find the engine's
 texture creation and streaming code; and repeat for the per-draw constant and vertex buffers
 (the V# side).
+
+## Where the bound T#s live (KYTY_MAP_TEXTURES=1)
+
+- A race binds about 6,600 to 8,400 distinct non-bindless T#s. The busiest (each bound about a
+  million times a minute) are render targets and global images (`0x120…` addresses).
+- In guest memory each lives in **per-frame tables** (a chain of copies from `0x1000015f40` on,
+  1,920 bytes apart, or around `0x10000e…`), and the default texture also in the game's `.bss` at
+  `0x9063163b8` (the same address in every session; not written during a race load).
+- Copies found at `0x7e…` are **the emulator's own heap**, not guest memory: Kyty keeps T#s for
+  draw preparation and validation. A write watch armed there fired inside the host allocator and
+  ended the session with an uncaught C++ exception; the search and `_mapping/arm.txt` now keep
+  to guest-mapped memory (`TryClampRangeSize`).

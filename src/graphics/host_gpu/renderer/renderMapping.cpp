@@ -3,6 +3,7 @@
 #include "common/guestWatch.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
@@ -65,6 +66,11 @@ State& GetState() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+// Whether the 32 bytes at `address` lie in memory the guest has mapped.
+bool IsGuest(uint64_t address) {
+	return LibKernel::Memory::TryClampRangeSize(address, 32) == 32;
+}
+
 bool ReadableProtection(DWORD protect) {
 	return (protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0 &&
 	       (protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
@@ -101,8 +107,10 @@ std::vector<std::vector<uint64_t>> Search(const std::vector<Key>& keys, uint64_t
 					for (size_t k = 0; k < keys.size(); k++) {
 						uint64_t want = 0;
 						std::memcpy(&want, keys[k].dwords.data(), 8);
+						// Guest memory only: the emulator keeps its own copies of the T#s it binds
+						// in its heap, which lies in the same address range.
 						if (first == want && std::memcmp(&chunk[i + 1], &keys[k].dwords[2], 8) == 0 &&
-						    places[k].size() < MaxPlaces) {
+						    places[k].size() < MaxPlaces && IsGuest(at + i * 8)) {
 							places[k].push_back(at + i * 8);
 						}
 					}
@@ -172,7 +180,12 @@ void CheckArmFile() {
 	std::vector<uint64_t> addresses;
 	unsigned long long    value = 0;
 	while (addresses.size() < 4 && std::fscanf(file, "%llx", &value) == 1) {
-		addresses.push_back(value);
+		// A watch on the emulator's own memory fires inside its allocator: guest memory only.
+		if (LibKernel::Memory::TryClampRangeSize(value, 8) == 8) {
+			addresses.push_back(value);
+		} else {
+			LOGF("Texture map: 0x%llx is not guest memory; not watched\n", value);
+		}
 	}
 	std::fclose(file);
 	std::remove(Path);
