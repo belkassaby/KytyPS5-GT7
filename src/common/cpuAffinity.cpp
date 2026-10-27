@@ -91,53 +91,99 @@ static void JoinGamesSchedulingClass(const char* name) {
 	}
 }
 
+// The CPU sets of a hybrid processor by efficiency class: the fastest (performance cores) and the
+// slowest (efficiency cores); both empty when every core is alike.
+struct CoreClasses {
+	std::vector<ULONG> fast;
+	std::vector<ULONG> slow;
+	size_t             total   = 0;
+	BYTE               highest = 0;
+};
+
+static const CoreClasses& HybridCoreClasses() {
+	static const CoreClasses classes = [] {
+		CoreClasses result;
+		ULONG       length = 0;
+		GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+		if (length == 0) {
+			return result;
+		}
+		std::vector<uint8_t> buffer(length);
+		auto* first = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data());
+		if (!GetSystemCpuSetInformation(first, length, &length, GetCurrentProcess(), 0)) {
+			return result;
+		}
+		struct Set {
+			ULONG id;
+			BYTE  efficiency;
+		};
+		std::vector<Set> sets;
+		BYTE             lowest = 0xff, highest = 0;
+		for (ULONG offset = 0; offset < length;) {
+			const auto* info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data() + offset);
+			if (info->Size == 0) {
+				break;
+			}
+			if (info->Type == CpuSetInformation) {
+				sets.push_back({info->CpuSet.Id, info->CpuSet.EfficiencyClass});
+				lowest  = std::min(lowest, info->CpuSet.EfficiencyClass);
+				highest = std::max(highest, info->CpuSet.EfficiencyClass);
+			}
+			offset += info->Size;
+		}
+		result.total   = sets.size();
+		result.highest = highest;
+		if (sets.empty() || lowest == highest) {
+			return result; // All cores alike.
+		}
+		for (const auto& set: sets) {
+			if (set.efficiency == highest) {
+				result.fast.push_back(set.id);
+			} else if (set.efficiency == lowest) {
+				result.slow.push_back(set.id);
+			}
+		}
+		return result;
+	}();
+	return classes;
+}
+
 void PreferPerformanceCores(const char* name) {
 	TuneProcessOnce();
 	JoinGamesSchedulingClass(name);
 	if (!Enabled()) {
 		return;
 	}
-	ULONG length = 0;
-	GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
-	if (length == 0) {
+	const auto& classes = HybridCoreClasses();
+	if (classes.fast.empty()) {
 		return;
 	}
-	std::vector<uint8_t> buffer(length);
-	auto* first = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data());
-	if (!GetSystemCpuSetInformation(first, length, &length, GetCurrentProcess(), 0)) {
-		return;
-	}
-	struct Set {
-		ULONG id;
-		BYTE  efficiency;
-	};
-	std::vector<Set> sets;
-	BYTE             lowest = 0xff, highest = 0;
-	for (ULONG offset = 0; offset < length;) {
-		const auto* info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data() + offset);
-		if (info->Size == 0) {
-			break;
-		}
-		if (info->Type == CpuSetInformation) {
-			sets.push_back({info->CpuSet.Id, info->CpuSet.EfficiencyClass});
-			lowest  = std::min(lowest, info->CpuSet.EfficiencyClass);
-			highest = std::max(highest, info->CpuSet.EfficiencyClass);
-		}
-		offset += info->Size;
-	}
-	if (sets.empty() || lowest == highest) {
-		return; // All cores alike.
-	}
-	std::vector<ULONG> fast;
-	for (const auto& set: sets) {
-		if (set.efficiency == highest) {
-			fast.push_back(set.id);
-		}
-	}
-	const bool ok =
-	    SetThreadSelectedCpuSets(GetCurrentThread(), fast.data(), static_cast<ULONG>(fast.size())) != 0;
+	const bool ok = SetThreadSelectedCpuSets(GetCurrentThread(), classes.fast.data(),
+	                                         static_cast<ULONG>(classes.fast.size())) != 0;
 	LOGF("CPU: %s prefers the %zu fastest of %zu logical processors (efficiency class %u)%s\n", name,
-	     fast.size(), sets.size(), static_cast<unsigned>(highest), ok ? "" : " - failed");
+	     classes.fast.size(), classes.total, static_cast<unsigned>(classes.highest), ok ? "" : " - failed");
+}
+
+// GT7 port: background threads (shader translation, pipeline compiles, cache saves) run on the
+// efficiency cores of a hybrid processor, so that a fresh shader cache's compiles (20 to 30 busy
+// threads on an i9-13900HX) leave the performance cores and their turbo to the GPU thread and the
+// game. KYTY_BACKGROUND_ECORES=0 leaves them on every core.
+static void PreferEfficiencyCores() {
+	if (EnvOff("KYTY_BACKGROUND_ECORES")) {
+		return;
+	}
+	const auto& classes = HybridCoreClasses();
+	if (classes.slow.empty()) {
+		return;
+	}
+	SetThreadSelectedCpuSets(GetCurrentThread(), classes.slow.data(),
+	                         static_cast<ULONG>(classes.slow.size()));
+	static std::once_flag once;
+	std::call_once(once, [&] {
+		LOGF("CPU: background threads prefer the %zu efficiency-core processors of %zu "
+		     "(KYTY_BACKGROUND_ECORES=0 leaves them on every core)\n",
+		     classes.slow.size(), classes.total);
+	});
 }
 
 namespace {
@@ -609,6 +655,7 @@ std::string StartCpuSet(std::string* reason) {
 void LowerThreadPriority() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+	PreferEfficiencyCores();
 #elif !defined(__APPLE__)
 	(void)setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 5);
 #endif

@@ -39,7 +39,8 @@ void RegisterGpuSideThread(const char* name);
 
 // Round 117: the calling thread runs below normal priority, so that the game's threads go first
 // (background work such as the driver's compiles of big shaders). Windows:
-// THREAD_PRIORITY_BELOW_NORMAL; Linux: a nice value of 5; a no-op elsewhere.
+// THREAD_PRIORITY_BELOW_NORMAL, and on a hybrid processor the efficiency cores (GT7 port;
+// KYTY_BACKGROUND_ECORES=0 leaves them on every core); Linux: a nice value of 5; a no-op elsewhere.
 void LowerThreadPriority();
 
 // Round 152: while it lives, the calling thread runs at normal priority at least, so that threads
