@@ -2,6 +2,7 @@
 
 #include "common/guestWatch.h"
 #include "common/logging/log.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "kernel/memory.h"
 
@@ -77,10 +78,37 @@ bool ReadableProtection(DWORD protect) {
 	                   PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) != 0;
 }
 
-// Every 8-byte-aligned place in readable guest memory whose 16 bytes are one of `keys`.
-std::vector<std::vector<uint64_t>> Search(const std::vector<Key>& keys, uint64_t& scanned) {
-	std::vector<std::vector<uint64_t>> places(keys.size());
-	scanned = 0;
+struct Place {
+	uint64_t address    = 0;
+	bool     protected_ = false; // found through the backing store: the page has no CPU access
+};
+
+// Every 8-byte-aligned place in guest memory whose 16 bytes are one of `keys`. Readable pages are
+// copied with ReadProcessMemory (a protection the tracker changes meanwhile makes the copy fail
+// instead of faulting this thread); pages without CPU access (GPU-written, or read-watched) are
+// read from the guest's backing store.
+std::vector<std::vector<Place>> Search(const std::vector<Key>& keys, uint64_t& scanned,
+                                       uint64_t& scanned_protected) {
+	std::vector<std::vector<Place>> places(keys.size());
+	scanned           = 0;
+	scanned_protected = 0;
+	static std::vector<uint64_t> chunk(ChunkBytes / 8 + 1);
+	const auto match = [&](uint64_t at, uint64_t got, bool protected_) {
+		const auto count = got / 8 - 1;
+		for (uint64_t i = 0; i < count && i < ChunkBytes / 8; i++) {
+			const auto first = chunk[i];
+			for (size_t k = 0; k < keys.size(); k++) {
+				uint64_t want = 0;
+				std::memcpy(&want, keys[k].dwords.data(), 8);
+				// Guest memory only: the emulator keeps its own copies of the T#s it binds in its
+				// heap, which lies in the same address range.
+				if (first == want && std::memcmp(&chunk[i + 1], &keys[k].dwords[2], 8) == 0 &&
+				    places[k].size() < MaxPlaces && IsGuest(at + i * 8)) {
+					places[k].push_back({at + i * 8, protected_});
+				}
+			}
+		}
+	};
 	for (uint64_t address = GuestBegin; address < GuestEnd;) {
 		MEMORY_BASIC_INFORMATION info {};
 		if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == 0) {
@@ -88,32 +116,27 @@ std::vector<std::vector<uint64_t>> Search(const std::vector<Key>& keys, uint64_t
 		}
 		const auto base = reinterpret_cast<uint64_t>(info.BaseAddress);
 		const auto end  = base + info.RegionSize;
-		if (info.State == MEM_COMMIT && ReadableProtection(info.Protect) && info.RegionSize >= 16) {
-			// Copied, not read in place: a protection the tracker changes meanwhile makes the copy
-			// fail instead of faulting on this thread.
-			static std::vector<uint64_t> chunk(ChunkBytes / 8 + 1);
+		if (info.State == MEM_COMMIT && info.RegionSize >= 16) {
+			const bool readable = ReadableProtection(info.Protect);
 			for (uint64_t at = base; at < end; at += ChunkBytes) {
 				const auto bytes = std::min<uint64_t>(ChunkBytes + 8, end - at);
-				SIZE_T     got   = 0;
-				if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at),
-				                      chunk.data(), bytes, &got) == FALSE ||
-				    got < 16) {
-					continue;
-				}
-				scanned += got;
-				const auto count = got / 8 - 1;
-				for (uint64_t i = 0; i < count && i < ChunkBytes / 8; i++) {
-					const auto first = chunk[i];
-					for (size_t k = 0; k < keys.size(); k++) {
-						uint64_t want = 0;
-						std::memcpy(&want, keys[k].dwords.data(), 8);
-						// Guest memory only: the emulator keeps its own copies of the T#s it binds
-						// in its heap, which lies in the same address range.
-						if (first == want && std::memcmp(&chunk[i + 1], &keys[k].dwords[2], 8) == 0 &&
-						    places[k].size() < MaxPlaces && IsGuest(at + i * 8)) {
-							places[k].push_back(at + i * 8);
-						}
+				uint64_t   got   = 0;
+				if (readable) {
+					SIZE_T copied = 0;
+					if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at),
+					                      chunk.data(), bytes, &copied) != FALSE) {
+						got = copied;
 					}
+					scanned += got;
+				} else {
+					got = LibKernel::Memory::TryClampRangeSize(at, bytes);
+					if (got != 0 && !LibKernel::Memory::TryReadBacking(at, chunk.data(), got)) {
+						got = 0;
+					}
+					scanned_protected += got;
+				}
+				if (got >= 16) {
+					match(at, got, !readable);
 				}
 			}
 		}
@@ -122,7 +145,7 @@ std::vector<std::vector<uint64_t>> Search(const std::vector<Key>& keys, uint64_t
 	return places;
 }
 
-void Map(State& state) {
+void Map(State& state, BufferCache& buffers) {
 	std::vector<std::pair<Key, uint64_t>> busiest;
 	// Mipmapped textures only (KYTY_MAP_TEXTURES_ALL=1: any): the busiest single-level ones are
 	// render targets, whose T#s live only in the per-frame tables. A T#'s last mip level is
@@ -139,31 +162,43 @@ void Map(State& state) {
 	for (const auto& [key, uses]: busiest) {
 		keys.push_back(key);
 	}
-	const auto started = std::chrono::steady_clock::now();
-	uint64_t   scanned = 0;
-	const auto places  = Search(keys, scanned);
-	LOGF("Texture map: %zu distinct T#s bound; searched %.1f GB of guest memory for the %zu busiest "
-	     "in %.1f s\n",
-	     state.uses.size(), static_cast<double>(scanned) / (1u << 30u), keys.size(),
+	const auto started           = std::chrono::steady_clock::now();
+	uint64_t   scanned           = 0;
+	uint64_t   scanned_protected = 0;
+	const auto places            = Search(keys, scanned, scanned_protected);
+	LOGF("Texture map: %zu distinct T#s bound; searched %.1f GB of readable and %.1f GB of protected "
+	     "guest memory for the %zu busiest in %.1f s\n",
+	     state.uses.size(), static_cast<double>(scanned) / (1u << 30u),
+	     static_cast<double>(scanned_protected) / (1u << 30u), keys.size(),
 	     std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
 	uint32_t armed = 0;
 	for (size_t k = 0; k < keys.size(); k++) {
 		const auto& d    = keys[k].dwords;
 		const auto  base = (static_cast<uint64_t>(d[0]) | (static_cast<uint64_t>(d[1] & 0xffu) << 32u))
 		                  << 8u;
-		std::string list;
-		for (const auto place: places[k]) {
-			list += fmt::format(" 0x{:x}", place);
-		}
 		LOGF("Texture map: T# %08x %08x %08x %08x (texture at 0x%" PRIx64 ") bound %" PRIu64
-		     " times, at%s\n",
-		     d[0], d[1], d[2], d[3], base, busiest[k].second, list.empty() ? " nowhere" : list.c_str());
-		// One watch for each of the four busiest T#s found in memory: the place found first (the
-		// lowest address).
-		if (armed < 4 && !places[k].empty()) {
-			const auto reason = fmt::format("T# of texture 0x{:x}", base);
-			if (Common::GuestWatch::ArmExpecting(places[k].front(), reason.c_str()) != 0) {
-				armed++;
+		     " times, at %zu places%s\n",
+		     d[0], d[1], d[2], d[3], base, busiest[k].second, places[k].size(),
+		     places[k].empty() ? " (nowhere)" : "");
+		// Each place: whether the CPU can read it, whether the GPU wrote those bytes (the buffer
+		// cache's record), and which shaders wrote them last (with KYTY_GPU_WRITERS=1).
+		for (const auto& place: places[k]) {
+			const bool gpu_dirty = buffers.HasGpuDirtyBytes(place.address, 32);
+			const auto writers   = BufferCache::GpuWritersOf(place.address, 32);
+			LOGF("Texture map:   0x%" PRIx64 " %s, %s, last GPU writers: %s\n", place.address,
+			     place.protected_ ? "protected" : "readable",
+			     gpu_dirty ? "GPU-written (not downloaded)" : "CPU copy current",
+			     writers.empty() ? "-" : writers.c_str());
+		}
+		// One watch for each of the four busiest T#s found in readable memory: the place found
+		// first (the lowest address).
+		for (const auto& place: places[k]) {
+			if (armed < 4 && !place.protected_) {
+				const auto reason = fmt::format("T# of texture 0x{:x}", base);
+				if (Common::GuestWatch::ArmExpecting(place.address, reason.c_str()) != 0) {
+					armed++;
+				}
+				break;
 			}
 		}
 	}
@@ -171,7 +206,7 @@ void Map(State& state) {
 
 #else
 
-void Map(State& /*state*/) {
+void Map(State& /*state*/, BufferCache& /*buffers*/) {
 	LOGF("Texture map: needs Windows\n");
 }
 
@@ -214,7 +249,7 @@ bool Enabled() {
 }
 
 void NoteTextures(std::span<const ShaderRecompiler::IR::DescriptorValue> images,
-                  std::span<const uint8_t> bindless, uint64_t frame) {
+                  std::span<const uint8_t> bindless, uint64_t frame, BufferCache& buffers) {
 	auto& state = GetState();
 	if (frame != state.frame && frame % 120 == 0) {
 		CheckArmFile();
@@ -228,7 +263,7 @@ void NoteTextures(std::span<const ShaderRecompiler::IR::DescriptorValue> images,
 		state.frame_bindings = 0;
 		if (state.heavy_frames >= HeavyFrames) {
 			state.done = true;
-			Map(state);
+			Map(state, buffers);
 			return;
 		}
 	}

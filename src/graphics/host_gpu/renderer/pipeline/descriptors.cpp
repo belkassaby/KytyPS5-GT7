@@ -3335,7 +3335,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			bindless[i] = program.info.images[i].bindless ? 1 : 0;
 		}
 		RenderMapping::NoteTextures(snapshot.images, bindless,
-		                            m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed));
+		                            m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+		                            m_context.GetBufferCache());
 	}
 	// Diagnostics: KYTY_WATCH_SHADER=<hash>[,<hash>...] logs the buffer and texture descriptors
 	// these shaders are bound with (first few uses of each; KYTY_WATCH_SHADER_EVERY=<n> adds every

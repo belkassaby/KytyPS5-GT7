@@ -16,12 +16,16 @@ struct DescriptorValue;
 // places get a value-filtered write watch (Common::GuestWatch::ArmExpecting), so the code that
 // writes those descriptors (texture creation, streaming, the per-frame tables) is logged with its
 // callers.
+namespace Libs::Graphics {
+class BufferCache;
+} // namespace Libs::Graphics
+
 namespace Libs::Graphics::RenderMapping {
 
 [[nodiscard]] bool Enabled();
 // GPU thread: the T#s one draw or dispatch stage binds (`bindless`: which of them are bindless).
 void NoteTextures(std::span<const ShaderRecompiler::IR::DescriptorValue> images,
-                  std::span<const uint8_t> bindless, uint64_t frame);
+                  std::span<const uint8_t> bindless, uint64_t frame, BufferCache& buffers);
 
 } // namespace Libs::Graphics::RenderMapping
 
