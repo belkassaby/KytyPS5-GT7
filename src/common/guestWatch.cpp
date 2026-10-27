@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <mutex>
 #include <string>
@@ -100,6 +101,22 @@ constexpr const char* RegisterNames[16] = {"rax", "rbx", "rcx", "rdx", "rsi", "r
 	return false;
 }
 
+// Whether another line may be logged for writes by the code at `pc` (at most `limit` each, for
+// up to 256 code addresses; later ones are not logged).
+[[nodiscard]] bool TakePcLine(uint64_t pc, uint32_t limit) {
+	static std::array<std::atomic<uint64_t>, 256> pcs {};
+	static std::array<std::atomic<uint32_t>, 256> lines {};
+	for (size_t i = 0; i < pcs.size(); i++) {
+		uint64_t expected = 0;
+		if (pcs[i].load(std::memory_order_relaxed) == pc ||
+		    pcs[i].compare_exchange_strong(expected, pc, std::memory_order_relaxed) ||
+		    expected == pc) {
+			return lines[i].fetch_add(1, std::memory_order_relaxed) < limit;
+		}
+	}
+	return false;
+}
+
 LONG WINAPI Handler(PEXCEPTION_POINTERS pointers) {
 	if (pointers->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
 		return EXCEPTION_CONTINUE_SEARCH;
@@ -118,7 +135,17 @@ LONG WINAPI Handler(PEXCEPTION_POINTERS pointers) {
 	}
 	context.Dr6 &= ~uint64_t {0xf};
 	const auto hit = g_hits.fetch_add(1, std::memory_order_relaxed) + 1;
-	if (g_lines.load(std::memory_order_relaxed) >= MaxLines) {
+	// GT7 render mapping (KYTY_GUEST_WATCH_PER_PC=<n>): at most n lines for each writing code
+	// address, and up to 400 lines in all, so one busy writer (a memset) does not use them up.
+	static const uint32_t per_pc = [] {
+		const char* value = std::getenv("KYTY_GUEST_WATCH_PER_PC");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	const uint32_t max_lines = per_pc != 0 ? 400u : MaxLines;
+	if (per_pc != 0 && !TakePcLine(static_cast<uint64_t>(context.Rip), per_pc)) {
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	if (g_lines.load(std::memory_order_relaxed) >= max_lines) {
 		if (hit % 1000 == 0) {
 			Log::Write(fmt::format("GuestWatch: {} hits so far\n", hit));
 		}
