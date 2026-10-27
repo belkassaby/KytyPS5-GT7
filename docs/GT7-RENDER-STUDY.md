@@ -121,3 +121,28 @@ range).
 
 **Next:** watch the stack table before the next race loads with `KYTY_GUEST_WATCH_TSHARP=1`
 (only writes that leave a T#-shaped value are logged), to find the code that fills it.
+
+## Texture package headers and the per-draw record builder
+
+- In another session the busiest mipmapped T#s were again "nowhere": the stack table at
+  `0x7e0058…` is live only for part of each frame, so it is not their home.
+- Texture `0x12b837e000`'s T# was found at **`0x12b72fae40` and `0x12b72fb060`** (`0x220` apart),
+  **in GPU texture memory just below the texture's own data**, readable, not GPU-written: most
+  likely the header of a texture package with prebuilt T#s. That memory was **unmapped when the
+  race ended** (per-race texture loading).
+- A value-filtered watch on a per-frame table caught its writer: GT7's **`0x900188ad0`**
+  (callers `0x9001842c0` (16 KB) ← `0x90056f0d0` ← `0x90035cd50`). It takes an 88-byte record from
+  a per-frame linear allocator (`0x90000acf0`: size `0x58`, alignment `0x40`) and fills it with two
+  32-byte T#s copied **through pointers** (`[r15]` and `*[rbp-0x48]`) and two dwords: a per-draw
+  texture record built each frame from persistent descriptors.
+- The search stops at 16 places per T#, in address order, so the per-frame copies (`0x1000…`)
+  could hide the package headers (`0x12…`) of busier textures; that explains the earlier
+  "per-frame copies only" results.
+
+**So far:** texture T#s live in **per-race texture package headers** next to the texture data, and
+`0x900188ad0` copies them into per-draw records every frame. A fast path could key textures by
+header address (stable for a race) instead of rediscovering them per draw.
+
+**Next:** find what writes the package headers when a race loads (the file loader, so the T#s
+are prebuilt in GT7's files, or engine code that patches them), by watching header addresses
+before the load (the guest-memory check must accept unmapped addresses in the GPU memory range).
