@@ -1,5 +1,6 @@
 #include "kernel/fileSystem.h"
 
+#include "common/fileReadLog.h"
 #include "common/archive.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -805,6 +806,8 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 
 	LOGF("\tRead %u bytes (pos = %" PRId64 ") from: %s\n", bytes_read, offset,
 	     Common::PathToString(file->real_name).c_str());
+	Common::FileReadLog::Record(reinterpret_cast<uint64_t>(buf), bytes_read,
+	                            Common::PathToString(file->real_name), static_cast<uint64_t>(offset));
 
 	return bytes_read;
 }

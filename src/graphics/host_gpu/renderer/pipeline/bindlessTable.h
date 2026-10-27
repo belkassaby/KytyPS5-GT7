@@ -253,6 +253,7 @@ public:
 
 private:
 	[[nodiscard]] bool AllocateRegion(Heap& heap, uint32_t entries);
+	void               WatchNewHeap(const Heap& heap);
 public:
 
 private:

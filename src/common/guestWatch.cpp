@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <mutex>
 #include <string>
@@ -50,6 +51,7 @@ constexpr uint32_t MaxCodeDumps = 8;
 
 std::mutex                                      g_mutex; // arming
 std::array<std::atomic<uint64_t>, MaxWatches>   g_watches {};
+std::array<std::atomic<uint64_t>, MaxWatches>   g_expected {}; // 0: log every write
 std::atomic<uint32_t>                           g_count {0};
 std::atomic<uint64_t>                           g_hits {0};
 std::atomic<uint32_t>                           g_lines {0};
@@ -100,6 +102,22 @@ constexpr const char* RegisterNames[16] = {"rax", "rbx", "rcx", "rdx", "rsi", "r
 	return false;
 }
 
+// Whether another line may be logged for writes by the code at `pc` (at most `limit` each, for
+// up to 256 code addresses; later ones are not logged).
+[[nodiscard]] bool TakePcLine(uint64_t pc, uint32_t limit) {
+	static std::array<std::atomic<uint64_t>, 256> pcs {};
+	static std::array<std::atomic<uint32_t>, 256> lines {};
+	for (size_t i = 0; i < pcs.size(); i++) {
+		uint64_t expected = 0;
+		if (pcs[i].load(std::memory_order_relaxed) == pc ||
+		    pcs[i].compare_exchange_strong(expected, pc, std::memory_order_relaxed) ||
+		    expected == pc) {
+			return lines[i].fetch_add(1, std::memory_order_relaxed) < limit;
+		}
+	}
+	return false;
+}
+
 LONG WINAPI Handler(PEXCEPTION_POINTERS pointers) {
 	if (pointers->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
 		return EXCEPTION_CONTINUE_SEARCH;
@@ -117,8 +135,40 @@ LONG WINAPI Handler(PEXCEPTION_POINTERS pointers) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 	context.Dr6 &= ~uint64_t {0xf};
+	// GT7 render mapping (KYTY_GUEST_WATCH_TSHARP=1): only writes that leave what looks like a T#'s
+	// first 8 bytes there (a base address from 0x1000000000 to 0x1fffffffff, and the high format
+	// bits GT7's textures use), so a watch on reused memory (a stack) logs only descriptor writes.
+	static const bool tsharp_only = std::getenv("KYTY_GUEST_WATCH_TSHARP") != nullptr;
+	if (tsharp_only) {
+		const auto address = g_watches[which].load(std::memory_order_relaxed);
+		if (!Readable(address, 8)) {
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+		const auto value = *reinterpret_cast<const uint64_t*>(address);
+		const auto base  = (value & 0xffffffffffull) << 8u;
+		if (base < 0x1000000000ull || base >= 0x2000000000ull || (value >> 60u) != 0xcu) {
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+	}
+	// A watch armed with an expected value (ArmExpecting) logs only writes that leave it there.
+	if (const auto expected = g_expected[which].load(std::memory_order_relaxed); expected != 0) {
+		const auto address = g_watches[which].load(std::memory_order_relaxed);
+		if (!Readable(address, 8) || *reinterpret_cast<const uint64_t*>(address) != expected) {
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+	}
 	const auto hit = g_hits.fetch_add(1, std::memory_order_relaxed) + 1;
-	if (g_lines.load(std::memory_order_relaxed) >= MaxLines) {
+	// GT7 render mapping (KYTY_GUEST_WATCH_PER_PC=<n>): at most n lines for each writing code
+	// address, and up to 400 lines in all, so one busy writer (a memset) does not use them up.
+	static const uint32_t per_pc = [] {
+		const char* value = std::getenv("KYTY_GUEST_WATCH_PER_PC");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	const uint32_t max_lines = per_pc != 0 ? 400u : MaxLines;
+	if (per_pc != 0 && !TakePcLine(static_cast<uint64_t>(context.Rip), per_pc)) {
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	if (g_lines.load(std::memory_order_relaxed) >= max_lines) {
 		if (hit % 1000 == 0) {
 			Log::Write(fmt::format("GuestWatch: {} hits so far\n", hit));
 		}
@@ -243,7 +293,55 @@ uint32_t Arm(const uint64_t* addresses, uint32_t count, const char* reason) {
 	return armed;
 }
 
+uint32_t Replace(const uint64_t* addresses, uint32_t count, const char* reason) {
+	{
+		std::scoped_lock lock(g_mutex);
+		g_count.store(0, std::memory_order_release);
+		g_lines.store(0, std::memory_order_relaxed);
+		for (auto& expected: g_expected) {
+			expected.store(0, std::memory_order_relaxed);
+		}
+	}
+	return Arm(addresses, count, reason);
+}
+
+uint32_t ArmExpecting(uint64_t address, const char* reason) {
+	address &= ~uint64_t {7};
+	if (!Readable(address, 8)) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("GuestWatch: 0x{:x} is not readable; not armed ({})\n", address, reason));
+		return 0;
+	}
+	const auto value = *reinterpret_cast<const uint64_t*>(address);
+	if (value == 0) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("GuestWatch: 0x{:x} holds 0; not armed ({})\n", address, reason));
+		return 0;
+	}
+	{
+		std::scoped_lock lock(g_mutex);
+		const auto       watches = g_count.load(std::memory_order_relaxed);
+		if (watches >= MaxWatches) {
+			return 0;
+		}
+		// The slot Arm gives the address next.
+		g_expected[watches].store(value, std::memory_order_relaxed);
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "GuestWatch: 0x{:x} holds {:016x}; only writes that leave that value are logged\n", address,
+	    value));
+	return Arm(&address, 1, reason);
+}
+
 #else
+
+uint32_t ArmExpecting(uint64_t /*address*/, const char* reason) {
+	return Arm(nullptr, 0, reason);
+}
+
+uint32_t Replace(const uint64_t* /*addresses*/, uint32_t /*count*/, const char* reason) {
+	return Arm(nullptr, 0, reason);
+}
 
 uint32_t Arm(const uint64_t* /*addresses*/, uint32_t /*count*/, const char* reason) {
 	Log::WriteToConsoleAndLog(

@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/guestWatch.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -637,7 +638,36 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 		m_heaps.pop_back();
 		return nullptr;
 	}
+	WatchNewHeap(heap);
 	return &heap;
+}
+
+// GT7 port, render mapping (KYTY_MAP_HEAP_WATCH=1): each new guest texture heap is logged, and the
+// first four get a hardware write watch on the T# of one entry (Common::GuestWatch), logging only
+// writes of the T# it holds now, so the guest code that builds heap entries (material setup,
+// texture streaming) is logged with its callers.
+void BindlessTable::WatchNewHeap(const Heap& heap) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MAP_HEAP_WATCH");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled || heap.base == 0) {
+		return;
+	}
+	static uint32_t watched = 0;
+	LOGF("Heap map: heap %zu base=0x%016" PRIx64 " table_offset=0x%x stride=%u binding=%u "
+	     "guest_entries=%u\n",
+	     m_heaps.size() - 1, heap.base, heap.table_offset, heap.table_stride, heap.binding,
+	     heap.guest_entries);
+	if (watched >= 4) {
+		return;
+	}
+	// Entry 1's T# (entry 0 is often a default the game never rewrites).
+	const uint64_t address = heap.base + heap.table_offset + heap.table_stride;
+	const auto     reason  = fmt::format("heap 0x{:x} entry 1", heap.base);
+	if (Common::GuestWatch::ArmExpecting(address, reason.c_str()) != 0) {
+		watched++;
+	}
 }
 
 uint32_t BindlessTable::AllocateSlot(uint32_t binding) {

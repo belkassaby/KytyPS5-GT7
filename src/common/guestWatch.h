@@ -10,7 +10,9 @@
 // general registers, and the main program's return addresses found on the stack. The first hit at
 // each code address (eight of them) also logs the 512 code bytes from 0x180 before it ("GuestWatch
 // code <address> +<offset>:", 32 a line), to disassemble. At most 48 hits are logged; then a count
-// every 1000 hits.
+// every 1000 hits. KYTY_GUEST_WATCH_PER_PC=<n> (GT7 render mapping) logs at most n hits for each
+// writing code address instead, up to 400 in all. KYTY_GUEST_WATCH_TSHARP=1 logs only writes that
+// leave what looks like a GT7 T# (memory reused for other data, such as a stack, stays quiet).
 namespace Common::GuestWatch {
 
 // Once the main program is loaded: its image, for relative code addresses.
@@ -20,6 +22,15 @@ void SetProgram(uint64_t base, uint64_t size);
 // up to 4 in all). Any thread; the calling thread itself is not watched. `reason` goes to the log.
 // Returns how many threads were armed.
 uint32_t Arm(const uint64_t* addresses, uint32_t count, const char* reason);
+
+// GT7 render mapping: arms one watch that logs only the writes leaving the value the address
+// holds now (a descriptor rebuilt every frame is caught by the code that rebuilds it, not by the
+// other users of the same scratch memory). Returns how many threads were armed.
+uint32_t ArmExpecting(uint64_t address, const char* reason);
+
+// GT7 render mapping: drops every watch and arms plain ones on these addresses instead (at most
+// 4). Returns how many threads were armed.
+uint32_t Replace(const uint64_t* addresses, uint32_t count, const char* reason);
 
 } // namespace Common::GuestWatch
 
