@@ -32,7 +32,7 @@ namespace {
 constexpr uint64_t HeavyBindings = 2000;          // a frame binding at least this many T#s
 constexpr uint64_t HeavyFrames   = 300;           // in a row before the search (~15 s in a race)
 constexpr size_t   Searched      = 8;             // the busiest T#s searched for
-constexpr size_t   MaxPlaces     = 16;            // places logged for each
+constexpr size_t   MaxPlaces     = 64;            // places logged for each
 constexpr uint64_t GuestBegin    = 0x400000000ull;
 constexpr uint64_t GuestEnd      = 0x10000000000ull;
 constexpr uint64_t ChunkBytes    = 1u << 20u;
@@ -190,12 +190,12 @@ void Map(State& state, BufferCache& buffers) {
 			     gpu_dirty ? "GPU-written (not downloaded)" : "CPU copy current",
 			     writers.empty() ? "-" : writers.c_str());
 		}
-		// One watch for each of the four busiest T#s found in readable memory: the place found
-		// first (the lowest address).
-		for (const auto& place: places[k]) {
-			if (armed < 4 && !place.protected_) {
+		// One watch for each of the four busiest T#s found in readable memory: the place with the
+		// highest address (a texture package header in GPU memory lies above the per-frame tables).
+		for (auto place = places[k].rbegin(); place != places[k].rend(); ++place) {
+			if (armed < 4 && !place->protected_) {
 				const auto reason = fmt::format("T# of texture 0x{:x}", base);
-				if (Common::GuestWatch::ArmExpecting(place.address, reason.c_str()) != 0) {
+				if (Common::GuestWatch::ArmExpecting(place->address, reason.c_str()) != 0) {
 					armed++;
 				}
 				break;
@@ -225,7 +225,10 @@ void CheckArmFile() {
 	unsigned long long    value = 0;
 	while (addresses.size() < 4 && std::fscanf(file, "%llx", &value) == 1) {
 		// A watch on the emulator's own memory fires inside its allocator: guest memory only.
-		if (LibKernel::Memory::TryClampRangeSize(value, 8) == 8) {
+		// The GPU memory range (0x1000000000 to 0x1fffffffff) holds no emulator memory, so an
+		// address there is taken even while unmapped (a texture package the next race loads).
+		if (LibKernel::Memory::TryClampRangeSize(value, 8) == 8 ||
+		    (value >= 0x1000000000ull && value < 0x2000000000ull)) {
 			addresses.push_back(value);
 		} else {
 			LOGF("Texture map: 0x%llx is not guest memory; not watched\n", value);
