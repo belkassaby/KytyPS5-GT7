@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -159,6 +160,27 @@ void Map(State& /*state*/) {
 
 #endif
 
+// _mapping/arm.txt (in the working directory): hex addresses, up to four, that replace every
+// watch with plain ones (Common::GuestWatch::Replace); the file is deleted once read. Lets the
+// watches be moved while the game runs (before a race loads, onto the T# homes found in the last).
+void CheckArmFile() {
+	constexpr const char* Path = "_mapping/arm.txt";
+	FILE*                 file = std::fopen(Path, "r");
+	if (file == nullptr) {
+		return;
+	}
+	std::vector<uint64_t> addresses;
+	unsigned long long    value = 0;
+	while (addresses.size() < 4 && std::fscanf(file, "%llx", &value) == 1) {
+		addresses.push_back(value);
+	}
+	std::fclose(file);
+	std::remove(Path);
+	LOGF("Texture map: %s asks for %zu watches\n", Path, addresses.size());
+	Common::GuestWatch::Replace(addresses.data(), static_cast<uint32_t>(addresses.size()),
+	                            "_mapping/arm.txt");
+}
+
 } // namespace
 
 bool Enabled() {
@@ -172,6 +194,9 @@ bool Enabled() {
 void NoteTextures(std::span<const ShaderRecompiler::IR::DescriptorValue> images,
                   std::span<const uint8_t> bindless, uint64_t frame) {
 	auto& state = GetState();
+	if (frame != state.frame && frame % 120 == 0) {
+		CheckArmFile();
+	}
 	if (state.done) {
 		return;
 	}

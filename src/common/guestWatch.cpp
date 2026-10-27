@@ -278,6 +278,18 @@ uint32_t Arm(const uint64_t* addresses, uint32_t count, const char* reason) {
 	return armed;
 }
 
+uint32_t Replace(const uint64_t* addresses, uint32_t count, const char* reason) {
+	{
+		std::scoped_lock lock(g_mutex);
+		g_count.store(0, std::memory_order_release);
+		g_lines.store(0, std::memory_order_relaxed);
+		for (auto& expected: g_expected) {
+			expected.store(0, std::memory_order_relaxed);
+		}
+	}
+	return Arm(addresses, count, reason);
+}
+
 uint32_t ArmExpecting(uint64_t address, const char* reason) {
 	address &= ~uint64_t {7};
 	if (!Readable(address, 8)) {
@@ -309,6 +321,10 @@ uint32_t ArmExpecting(uint64_t address, const char* reason) {
 #else
 
 uint32_t ArmExpecting(uint64_t /*address*/, const char* reason) {
+	return Arm(nullptr, 0, reason);
+}
+
+uint32_t Replace(const uint64_t* /*addresses*/, uint32_t /*count*/, const char* reason) {
 	return Arm(nullptr, 0, reason);
 }
 

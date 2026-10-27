@@ -27,6 +27,10 @@ uint32_t Arm(const uint64_t* addresses, uint32_t count, const char* reason);
 // other users of the same scratch memory). Returns how many threads were armed.
 uint32_t ArmExpecting(uint64_t address, const char* reason);
 
+// GT7 render mapping: drops every watch and arms plain ones on these addresses instead (at most
+// 4). Returns how many threads were armed.
+uint32_t Replace(const uint64_t* addresses, uint32_t count, const char* reason);
+
 } // namespace Common::GuestWatch
 
 #endif // EMULATOR_SRC_COMMON_GUESTWATCH_H_
