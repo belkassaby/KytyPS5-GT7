@@ -33,6 +33,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderMapping.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -3327,6 +3328,15 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	const DiagShaderScope diag_shader_scope(program.shader_hash);
+	if (RenderMapping::Enabled()) {
+		thread_local std::vector<uint8_t> bindless;
+		bindless.assign(program.info.images.size(), 0);
+		for (size_t i = 0; i < program.info.images.size(); i++) {
+			bindless[i] = program.info.images[i].bindless ? 1 : 0;
+		}
+		RenderMapping::NoteTextures(snapshot.images, bindless,
+		                            m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed));
+	}
 	// Diagnostics: KYTY_WATCH_SHADER=<hash>[,<hash>...] logs the buffer and texture descriptors
 	// these shaders are bound with (first few uses of each; KYTY_WATCH_SHADER_EVERY=<n> adds every
 	// n-th use, up to 8 more), with the shaders that last wrote each buffer.
