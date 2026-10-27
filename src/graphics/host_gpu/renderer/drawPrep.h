@@ -60,6 +60,10 @@ public:
 	void Add(uint64_t address, const void* data, uint32_t size);
 	// GPU thread: every range is still clean for a backing read and holds the recorded bytes.
 	[[nodiscard]] bool Validate() const;
+	// GT7 port: starts loading into the cache what Validate will read (its own records and bytes,
+	// and the guest bytes it compares them with), a draw ahead: those were just written by other
+	// cores (the scanner, the game), and their cache misses were most of Validate's time.
+	void Prefetch() const;
 	[[nodiscard]] size_t RangeCount() const { return m_ranges.size(); }
 
 private:
