@@ -246,3 +246,25 @@ One Northern Isle race, registry fed by APR reads into the GPU memory range:
 - With the texture step at about 1.4 µs of a draw's 9.6 µs, a registry covering a third of the
   bindings would save in the order of 0.3 to 0.5 µs a draw (3 to 5 %): useful only together with
   the larger per-draw costs (the shader resource walk, about 2.6 µs).
+
+## Resource walk: where the check's time goes, and a prefetch
+
+The GPU thread takes each stage's resource walk from the draw-prep scanner, which made it ahead
+on another thread, and checks the bytes it read are unchanged (`ReadSet::Validate`). Northern Isle
+races, GPU phases line:
+
+| | take | check (`Validate`) | a take in all | a draw | a dispatch |
+|---|---|---|---|---|---|
+| before | 0.14 us | 0.56–0.57 us | 0.86–0.89 us | 11.3–12.8 us | 8.3–8.8 us |
+| clean-page memo (`KYTY_CLEAN_PAGE_MEMO=1`) | 0.14 us | 0.53–0.55 us | 0.84–0.86 us | | |
+| prefetch (`KYTY_DRAW_PREP_PREFETCH`, on) | 0.25 us | 0.37–0.39 us | 0.75–0.79 us | 10.0–10.8 us | 7.7–7.9 us |
+
+- A check looks at **13 to 14 pages for 250 to 290 bytes**: almost all of its time is per page.
+- The **clean-page memo** (an answer per page kept until the GPU-written ranges or the mapping
+  table change) kept 87 % of its answers, drew nothing wrongly, and saved almost nothing: the
+  lookups were not the cost. It stays, off by default.
+- The cost is **cache misses on bytes other cores just wrote** (the scanner's copies, the game's
+  tables). **Prefetching** the next packet's prepared stages (their records and bytes, and the
+  guest bytes they will be compared with) when the GPU thread takes the current packet's cut the
+  check by about a third, and draws and dispatches by about 10 %. Race frame rate: median 21.6 fps
+  (mean 20.9) over 67 samples, against about 20 in earlier sessions; an A/B in one session is next.
