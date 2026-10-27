@@ -13,9 +13,13 @@ param(
     # pass -SkipShaders 3a2026af8161d470, or better update the driver.
     [string]$SkipShaders = '',
     [switch]$Dev,
+    # The build folder under _Build to run from (-Dev is windows-noqt-dev, build-gt7-prof.bat's
+    # is windows-noqt-prof).
+    [string]$Build = '',
     [string[]]$Extra = @()
 )
-$exe = Join-Path $PSScriptRoot $(if ($Dev) { '_Build\windows-noqt-dev\kyty_emulator.exe' } else { '_Build\windows-noqt\kyty_emulator.exe' })
+if (-not $Build) { $Build = if ($Dev) { 'windows-noqt-dev' } else { 'windows-noqt' } }
+$exe = Join-Path $PSScriptRoot "_Build\$Build\kyty_emulator.exe"
 $arguments = @(
     '--game', $Game,
     '--screen-width', $Width, '--screen-height', $Height,
