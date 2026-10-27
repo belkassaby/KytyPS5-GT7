@@ -272,3 +272,38 @@ races, GPU phases line:
   or two each): prefetch on 21.6 fps median (mean 20.9, 69 samples), draws 11.6 us and dispatches
   7.9 us on average over the heavy lines; off 20.2 fps median (mean 20.2, 58 samples), draws
   12.5 us, dispatches 8.1 us. About **+4 to 7 % frame rate**: the prefetch stays on by default.
+
+## Audit: the GPU thread's direct reads of guest memory
+
+Dispatches that write buffers make those pages no-access at once, on the GPU thread (about 0.45
+`VirtualProtect` calls of 2.6 us a dispatch in a race, 2.8 % of the GPU thread), because
+`PageManager` says "the GPU thread's own reads of those pages (indirect arguments, scans) must fault
+for the download". Deferring them to the `GpuProtect` worker, as write-watch protections already
+are, is safe only if no GPU-thread read relies on that fault. Every place the GPU thread reads guest
+memory through a raw pointer:
+
+**Relies on the fault** (would read stale bytes if the protection were late):
+
+| Where | What |
+|---|---|
+| `pm4Handlers.cpp` `CpOpCondExec` | COND_EXEC's condition dword |
+| `graphicsRun.cpp` `SetPredication` (ops 1 and 3) | occlusion query results and Z-pass count |
+| `graphicsRun.cpp` `GuestGpu::ReadLabel` (when no pending label) | WAIT_REG_MEM and other label reads |
+| `graphicsRun.cpp` `DrawIndirectMulti` | the draw count and each draw's arguments |
+| `graphicsRun.cpp` `NumInstances` | DRAW_INDEX_INDIRECT's instance count |
+| `graphicsRun.cpp` `DispatchIndirect` (only with `KYTY_INDIRECT_THREADS_ON_CPU=1`) | dispatch arguments |
+| `pipelineCache.cpp` `ReadShaderGuestMemory`, `ReadShaderGuestMemoryRaw` | an SRT walk's read of GPU-owned bytes, after the backing-store paths decline (by design: "takes the tracked-page fault") |
+
+**Already checked, independent of the protection:** the SRT walks' page cache and backing reads
+(`FindGpuCleanBacking`, `TryReadBufferBacking`: the GPU-written ranges), the scanner-result checks,
+`BindSharedMemory`'s indirect arguments (`ReadMemory` first), the stream upload and the CPU-side DMA
+copy (`IsRegionGpuModified` on both sides). **Writes** (labels, WRITE_DATA, fills, the DMA copy's
+destination) already wait for deferred protections. **Not guest data:** the command scheduler's
+allocations; the shader-code pattern check; frame-graph and mapping diagnostics.
+
+**What deferring would take:** route those seven reads through one helper that consults the
+GPU-written ranges and downloads first (as `BindSharedMemory` does with `ReadMemory`), so none of
+them depends on a fault; then mark GPU writes' no-access protections deferrable. Game threads are
+already covered (a submission waits for deferred protections, and a page newly written by the GPU
+still holds its current bytes until that submission runs). Expected gain: at most the 2.8 % the
+protections take.
