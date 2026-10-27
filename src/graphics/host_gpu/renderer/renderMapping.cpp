@@ -123,7 +123,16 @@ std::vector<std::vector<uint64_t>> Search(const std::vector<Key>& keys, uint64_t
 }
 
 void Map(State& state) {
-	std::vector<std::pair<Key, uint64_t>> busiest(state.uses.begin(), state.uses.end());
+	std::vector<std::pair<Key, uint64_t>> busiest;
+	// Mipmapped textures only (KYTY_MAP_TEXTURES_ALL=1: any): the busiest single-level ones are
+	// render targets, whose T#s live only in the per-frame tables. A T#'s last mip level is
+	// dword 3, bits 16 to 19.
+	static const bool all = std::getenv("KYTY_MAP_TEXTURES_ALL") != nullptr;
+	for (const auto& [key, uses]: state.uses) {
+		if (all || ((key.dwords[3] >> 16u) & 0xfu) != 0) {
+			busiest.emplace_back(key, uses);
+		}
+	}
 	std::ranges::sort(busiest, [](const auto& a, const auto& b) { return a.second > b.second; });
 	busiest.resize(std::min(busiest.size(), Searched));
 	std::vector<Key> keys;

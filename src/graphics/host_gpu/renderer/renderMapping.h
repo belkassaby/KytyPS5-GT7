@@ -11,7 +11,8 @@ struct DescriptorValue;
 // GT7 port, render mapping (KYTY_MAP_TEXTURES=1, diagnostics): finds where the game keeps the
 // texture descriptors (T#s) its draws use. The GPU thread counts the non-bindless T#s it binds;
 // once frames have been heavy (2,000 bindings or more) for 15 s, the busiest T#s are searched for
-// in all of the guest's readable memory, each place is logged ("Texture map:"), and up to four
+// (mipmapped ones: render targets have one level) in all of the guest's readable memory, each
+// place is logged ("Texture map:"), and up to four
 // places get a value-filtered write watch (Common::GuestWatch::ArmExpecting), so the code that
 // writes those descriptors (texture creation, streaming, the per-frame tables) is logged with its
 // callers.
