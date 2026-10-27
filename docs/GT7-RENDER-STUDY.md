@@ -83,3 +83,22 @@ texture creation and streaming code; and repeat for the per-draw constant and ve
   draw preparation and validation. A write watch armed there fired inside the host allocator and
   ended the session with an uncaught C++ exception; the search and `_mapping/arm.txt` now keep
   to guest-mapped memory (`TryClampRangeSize`).
+
+## Mipmapped (car and track) textures
+
+- Searching guest memory for the eight busiest **mipmapped** T#s (render targets have one level)
+  found **seven of them nowhere** in CPU-readable guest memory. The eighth sat at `0x1000000160`,
+  which a watch during the next race load showed to be per-frame scratch as well (command buffer
+  headers `c0023f00`, floats, `memset`, `memcpy`).
+- So GT7's material texture descriptors have **no persistent home the CPU can read**. They are
+  either in memory the GPU writes (Kyty keeps GPU-written pages from CPU access, so the search
+  skips them: the tables would be built on the GPU, GPU-driven rendering, which fits the ~1,200
+  compute dispatches a frame), or the shaders assemble them from parts.
+- **Consequence for a game-aware fast path:** the CPU side never holds the full list of material
+  textures, so hooking CPU code cannot take over texture tracking by itself. What remains
+  hookable on the CPU are the draw calls, the prebuilt state blocks and the render targets.
+
+**Next, if continued:** confirm the GPU-written explanation by logging, for one of those T#s,
+the address the SRT walk read it from and whether the GPU wrote it (the buffer cache knows), and
+find the compute shader that writes it (`KYTY_GPU_WRITERS=1` names the last GPU writer of a
+range).
