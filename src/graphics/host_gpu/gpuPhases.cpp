@@ -426,6 +426,10 @@ void ReportIfDue(uint64_t frames) {
 	    " | program gets {} x {:.2f} us: key {:.2f}, {}, {}", count(Phase::ProgramGet),
 	    each(Phase::ProgramGet, Phase::ProgramGet), each(Phase::ProgramKey, Phase::ProgramGet),
 	    counted("scanned", Phase::ProgramScanned), counted("walks", Phase::ProgramWalk));
+	// GT7 port: what a take of the scanner's result costs, by part (per take).
+	line += fmt::format(" (scanned: take {:.2f}, validate {:.2f})",
+	                    each(Phase::ScannedTake, Phase::ProgramScanned),
+	                    each(Phase::ScannedValidate, Phase::ProgramScanned));
 	line += fmt::format(" | {}, {}, {}, {}, {}", counted("draw bda", Phase::DrawBda),
 	                    counted("dispatch bda", Phase::DispatchBda),
 	                    counted("buffer syncs", Phase::BufferSync),

@@ -4216,7 +4216,11 @@ struct PipelineCache::ProgramCache {
 	// from the same program, user data and shader base and its bytes are unchanged and clean.
 	bool TakeScanned(SourceEntry& entry, ShaderType stage,
 	                 const ShaderRecompiler::IR::SrtRuntime& runtime, uint64_t hash) {
-		auto* result = DrawPrep::Take(static_cast<uint32_t>(stage));
+		DrawPrep::StageResult* result = nullptr;
+		{
+			const GpuPhases::Scope phase(GpuPhases::Phase::ScannedTake);
+			result = DrawPrep::Take(static_cast<uint32_t>(stage));
+		}
 		if (result == nullptr) {
 			return false;
 		}
@@ -4243,7 +4247,12 @@ struct PipelineCache::ProgramCache {
 			DrawPrep::Add(DrawPrep::Counter::MissInputs);
 			return false;
 		}
-		if (!result->reads.Validate()) {
+		bool valid = false;
+		{
+			const GpuPhases::Scope phase(GpuPhases::Phase::ScannedValidate);
+			valid = result->reads.Validate();
+		}
+		if (!valid) {
 			DrawPrep::Add(DrawPrep::Counter::MissReads);
 			return false;
 		}
