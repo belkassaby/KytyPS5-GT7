@@ -174,3 +174,21 @@ before the load (the guest-memory check must accept unmapped addresses in the GP
   the source pointer and the record) would let it skip rediscovering textures per draw. Who writes
   the headers at load (file loader or engine) is still open: the headers move between races, so
   it needs a watch armed from the T# search of the same load, or on the copy that reads the file.
+
+## T#s come prebuilt in the texture package files (file reads, KYTY_MAP_TEXTURES=1)
+
+- With the file-read log (`Common::FileReadLog`: every APR read and pread, by the guest memory it
+  filled) and matching on a T#'s first 8 bytes, texture `0x12b8136000`'s T# was found in its
+  package header at `0x12b70b4060`, filled by a read of **`contents/K/6/61AOB`** (0x9245e0 bytes
+  into `0x12b7086000`). The file holds, at offset `0x2f060`, **`00000000 cb500000 83ffc1ff
+  905c0fac`**; memory holds `12b81360 cb500000 83ffc1ff 905c0fac`. **The T# is prebuilt in the
+  package file with its base address left 0**, and dword 0 (`0x12b8136000 >> 8`) is filled in after
+  the read: format, size and swizzle come straight from the file.
+- Other homes of the busiest T#s: a **CPU-side material table** in game memory at `0xec07…`
+  (objects 0x1240 bytes apart, each with T#s; that memory had earlier held a file buffer, so the
+  file bytes listed for it are stale) and **engine texture objects in the `0xe4…` heap** (five
+  places for texture `0x1285082000`).
+
+**Next:** `KYTY_MAP_TSHARP_TEMPLATES=1` scans file reads into the GPU memory range for T#
+templates (dword 0 zero, GT7's format bits) and watches the first four, so the code that fills
+in the base address (the texture loader) is logged.
