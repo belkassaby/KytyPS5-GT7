@@ -267,4 +267,8 @@ races, GPU phases line:
   tables). **Prefetching** the next packet's prepared stages (their records and bytes, and the
   guest bytes they will be compared with) when the GPU thread takes the current packet's cut the
   check by about a third, and draws and dispatches by about 10 %. Race frame rate: median 21.6 fps
-  (mean 20.9) over 67 samples, against about 20 in earlier sessions; an A/B in one session is next.
+  (mean 20.9) over 67 samples, against about 20 in earlier sessions.
+- **A/B** (the same build, `KYTY_DRAW_PREP_PREFETCH=0` against the default, a Northern Isle race
+  or two each): prefetch on 21.6 fps median (mean 20.9, 69 samples), draws 11.6 us and dispatches
+  7.9 us on average over the heavy lines; off 20.2 fps median (mean 20.2, 58 samples), draws
+  12.5 us, dispatches 8.1 us. About **+4 to 7 % frame rate**: the prefetch stays on by default.
