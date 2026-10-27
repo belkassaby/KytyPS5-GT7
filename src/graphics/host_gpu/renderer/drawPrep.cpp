@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/drawPrep.h"
 
+#include "graphics/host_gpu/gpuPhases.h"
+
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/pm4.h"
@@ -165,6 +167,8 @@ bool ReadSet::Validate() const {
 		while (left != 0) {
 			const uint64_t page    = address & ~(PageSize - 1u);
 			const uint64_t in_page = std::min<uint64_t>(left, page + PageSize - address);
+			GpuPhases::Count(GpuPhases::Phase::ValidatePages, 1);
+			GpuPhases::Count(GpuPhases::Phase::ValidateBytes, in_page);
 			if (const auto* backing = map(page); backing != nullptr) {
 				if (std::memcmp(backing + (address - page), expected, in_page) != 0) {
 					return false;

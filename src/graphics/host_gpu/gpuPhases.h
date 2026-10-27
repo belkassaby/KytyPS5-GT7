@@ -66,6 +66,8 @@ enum class Phase : uint32_t {
 	ProgramWalk,    // its own descriptor walk (MaterializeResources), when it had no result
 	ScannedTake,     // inside ProgramScanned: DrawPrep::Take (GT7 port, fast path study)
 	ScannedValidate, // inside ProgramScanned: the check of the bytes the scanner read
+	ValidatePages,   // (a count only) pages ScannedValidate looked at
+	ValidateBytes,   // (a count only) bytes ScannedValidate compared
 	BufferSync,     // BufferCache::SynchronizeBuffer
 	Protect,        // page protection changes (PageManager)
 	Flush,          // a command buffer ended and a new one begun (CommandScheduler::Flush)
