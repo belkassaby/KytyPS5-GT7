@@ -33,6 +33,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/rendererLock.h"
+#include "graphics/host_gpu/renderer/stateRepeat.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -2228,7 +2229,22 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
+	const bool repeats = StateRepeat::Enabled();
+	uint64_t   repeat_start = 0;
+	if (repeats) {
+		StateRepeat::BeginDraw(&buffer.GetRegisters(), sizeof(HW::Context), &buffer.GetShaders(),
+		                       sizeof(HW::Shader), &buffer.GetUserConfig(), sizeof(HW::UserConfig));
+		repeat_start = GpuPhases::Now();
+	}
 	RefreshShaders(buffer, draw, color_output_mask, state);
+	if (repeats) {
+		uint64_t signature = state.ps_active ? state.programs.pixel.id : 0;
+		for (const auto& program: state.programs.vertex) {
+			signature = signature * 0x9E3779B97F4A7C15ull + program.id;
+		}
+		StateRepeat::NoteStep(StateRepeat::Step::Programs, signature,
+		                      GpuPhases::Now() - repeat_start);
+	}
 	LogDrawCensus(buffer, draw, state);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
 		OcclusionQueries::SkippedDraw(m_context, buffer.GetRegisters().GetDbCountControl());
@@ -2256,6 +2272,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	{
 		const GpuPhases::Scope phase(GpuPhases::Phase::DrawTargets);
+		if (repeats) {
+			repeat_start = GpuPhases::Now();
+		}
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 			if ((mrt_mask & (1u << slot)) != 0) {
 				ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
@@ -2269,6 +2288,29 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 		}
 		ResolveRenderDepthTarget(buffer, state.depth_info);
+		if (repeats) {
+			const auto mix = [](uint64_t signature, uint64_t value) {
+				return signature * 0x9E3779B97F4A7C15ull + value;
+			};
+			const auto view = [&](const auto& info) {
+				return mix(mix(mix(mix(static_cast<uint64_t>(info.image_id.index) << 32u |
+				                           info.image_id.generation,
+				                       info.desc.view_info.base_level),
+				                   info.desc.view_info.base_layer),
+				               info.desc.view_info.layer_count),
+				           static_cast<uint64_t>(info.desc.view_info.format));
+			};
+			uint64_t signature = state.color_count;
+			for (uint32_t i = 0; i < state.color_count; i++) {
+				signature = mix(mix(signature, view(state.color_info[i])),
+				                state.color_info[i].target_slot);
+			}
+			signature = mix(signature, view(state.depth_info));
+			StateRepeat::NoteStep(StateRepeat::Step::Targets, signature,
+			                      GpuPhases::Now() - repeat_start);
+			StateRepeat::NoteStep(StateRepeat::Step::ImageSet,
+			                      m_context.GetTextureCache().ImageSetGeneration(), 0);
+		}
 	}
 	if (state.depth_info.unsupported) {
 		if (FrameGraph::Logging()) {
@@ -2907,12 +2949,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	PipelineCache::Pipeline* deferred_pipeline = nullptr;
+	const bool               repeats           = StateRepeat::Enabled();
+	uint64_t                 repeat_start      = repeats ? GpuPhases::Now() : 0;
 	{
 		const GpuPhases::Scope phase(GpuPhases::Phase::DrawPipeline);
 		deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
 		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages,
 		    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
 		    primitive_restart_enable, state.programs, defer);
+	}
+	if (repeats) {
+		StateRepeat::NoteStep(StateRepeat::Step::Pipeline,
+		                      reinterpret_cast<uint64_t>(deferred_pipeline),
+		                      GpuPhases::Now() - repeat_start);
 	}
 	if (deferred_pipeline == nullptr) {
 		OcclusionQueries::SkippedDraw(m_context, buffer.GetRegisters().GetDbCountControl());
@@ -2924,10 +2973,26 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& pipeline = *deferred_pipeline;
 	vk::ImageAspectFlags feedback_aspects;
 	GpuPhases::Scope     rendering_phase(GpuPhases::Phase::DrawRendering);
+	if (repeats) {
+		repeat_start = GpuPhases::Now();
+	}
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
 	rendering_phase.End();
+	if (repeats) {
+		uint64_t signature = rendering.width | static_cast<uint64_t>(rendering.height) << 32u;
+		for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
+			signature = signature * 0x9E3779B97F4A7C15ull +
+			            reinterpret_cast<uint64_t>(
+			                static_cast<VkImageView>(rendering.color_attachments[i].image_view));
+		}
+		signature = signature * 0x9E3779B97F4A7C15ull +
+		            reinterpret_cast<uint64_t>(static_cast<VkImageView>(
+		                rendering.depth_stencil_attachment.image_view));
+		StateRepeat::NoteStep(StateRepeat::Step::Rendering, signature,
+		                      GpuPhases::Now() - repeat_start);
+	}
 	if (FrameGraph::Logging() && state.depth_info.image_id) {
 		// What the depth attachment's rendering starts with (an HTile clear among them).
 		const auto& ds = rendering.depth_stencil_attachment;
