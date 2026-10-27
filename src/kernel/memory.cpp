@@ -1530,11 +1530,13 @@ const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 // page), and the per-page lookups behind FindGpuCleanBacking were most of their 0.57 us. On the
 // GPU thread an answer is kept, by page, until the GPU-written ranges or the mapping table change;
 // while a fast readback is still to land, every page is asked about as before.
-// KYTY_CLEAN_PAGE_MEMO=0 asks every time.
+// Off by default (KYTY_CLEAN_PAGE_MEMO=1 turns it on): in a race it kept 87 % of its answers and
+// drew nothing wrongly, but the checks took 0.55 us as before. Their time is in the cache misses of
+// bytes other cores just wrote (the scanner's copies, the game's tables), not in these lookups.
 const uint8_t* FindGpuCleanPage(uint64_t page) {
 	static const bool memo_enabled = [] {
 		const char* value = std::getenv("KYTY_CLEAN_PAGE_MEMO");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	if (!memo_enabled || g_guest_address_space == nullptr || g_gpu_resources == nullptr ||
 	    t_gpu_read_delegate || !Graphics::GuestGpu::IsGpuThread()) {

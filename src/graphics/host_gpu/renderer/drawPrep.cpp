@@ -8,6 +8,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <immintrin.h>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -199,6 +200,25 @@ bool ReadSet::Validate() const {
 	return true;
 }
 
+void ReadSet::Prefetch() const {
+	constexpr uint64_t Line = 64;
+	const auto         touch = [](const void* pointer) {
+		_mm_prefetch(static_cast<const char*>(pointer), _MM_HINT_T0);
+	};
+	const auto touch_range = [&](uint64_t begin, uint64_t size) {
+		for (uint64_t line = begin & ~(Line - 1u); line < begin + size; line += Line) {
+			touch(reinterpret_cast<const void*>(line));
+		}
+	};
+	touch_range(reinterpret_cast<uint64_t>(m_ranges.data()), m_ranges.size() * sizeof(Range));
+	touch_range(reinterpret_cast<uint64_t>(m_bytes.data()), m_bytes.size());
+	// The guest bytes, at their guest addresses: the same memory as the backing Validate reads (a
+	// prefetch of a page without access is dropped, not faulted).
+	for (const auto& range: m_ranges) {
+		touch_range(range.address, range.size);
+	}
+}
+
 void SetCurrent(const Key& key) {
 	t_current     = key;
 	t_has_current = true;
@@ -328,6 +348,19 @@ StageResult* Take(uint32_t stage) {
 		return nullptr;
 	}
 	t_found     = &front;
+	// The next packet's prepared stages, a draw ahead (KYTY_DRAW_PREP_PREFETCH=0: not).
+	static const bool prefetch = [] {
+		const char* value = std::getenv("KYTY_DRAW_PREP_PREFETCH");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (prefetch && pending.size() > 1) {
+		const auto& next = *pending[1];
+		for (uint32_t i = 0; i < next.stage_count; i++) {
+			if (next.stages[i].ok) {
+				next.stages[i].reads.Prefetch();
+			}
+		}
+	}
 	t_found_key = *key;
 	for (uint32_t i = 0; i < front.stage_count; i++) {
 		auto& result = front.stages[i];
