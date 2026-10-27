@@ -192,3 +192,36 @@ before the load (the guest-memory check must accept unmapped addresses in the GP
 **Next:** `KYTY_MAP_TSHARP_TEMPLATES=1` scans file reads into the GPU memory range for T#
 templates (dword 0 zero, GT7's format bits) and watches the first four, so the code that fills
 in the base address (the texture loader) is logged.
+
+## The texture loader's relocation (KYTY_MAP_TSHARP_TEMPLATES=1)
+
+Watches on the first T# template of the first texture packages read at boot (`contents/H/H/PTE7Q`,
+`W/U/PVUBV`, `Z/L/6T7DF`) caught the base address being filled in, both times by
+**`0x900688100`** (272 bytes), which relocates a texture package object (`rdi`):
+
+- `[rdi+0x1c]` (word): the number of textures; `[rdi+0x20]`: an array of **0x48-byte texture
+  records**, each starting with the **prebuilt 32-byte T# from the file**, with a chunk index (word)
+  at `+0x36`.
+- `[rdi+0x28]`: an array of **0x30-byte memory chunk records**; `+0x28` of each is the GPU address
+  the chunk's data was placed at.
+- For each texture: `address = chunks[record.chunk].address`; T# dword 0 = `address >> 8`, T# byte
+  4 = `address >> 40` (the 40-bit base field); `record+0x1c` = 0.
+
+Callers: `0x900688fe0` (2.7 KB; most likely "finish loading a package") ← `0x90033e810` ←
+`0x90068a820` (12 KB) ← `0x90068a6d0` ← `0x90057c680` ← `0x90057c440`.
+
+## Texture side: the whole path
+
+1. A texture package (`contents/…`) is read (APR) into GPU memory; its header holds an array of
+   0x48-byte texture records with **prebuilt T#s** (base address 0) and a chunk table.
+2. **`0x900688100` relocates it**: the GPU address of each texture's chunk goes into its T#.
+3. Engine objects keep pointers to those T#s (CPU-side material tables at `0xec07…`, texture
+   objects in the `0xe4…` heap).
+4. Every frame, `0x900188ad0` and other copiers copy T#s **through those pointers** into per-draw
+   records in per-frame scratch memory, which the shaders' resource tables point at and Kyty walks
+   for every draw.
+
+**For a fast path:** hooking `0x900688100` (or its caller) gives every texture of every package,
+with its final T#, once, when it loads; the per-draw records then only carry pointers into those
+packages. Kyty could register textures at load and key its per-draw lookups by package record,
+instead of decoding and validating T#s each draw.
