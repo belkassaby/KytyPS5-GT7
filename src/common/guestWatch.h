@@ -22,6 +22,11 @@ void SetProgram(uint64_t base, uint64_t size);
 // Returns how many threads were armed.
 uint32_t Arm(const uint64_t* addresses, uint32_t count, const char* reason);
 
+// GT7 render mapping: arms one watch that logs only the writes leaving the value the address
+// holds now (a descriptor rebuilt every frame is caught by the code that rebuilds it, not by the
+// other users of the same scratch memory). Returns how many threads were armed.
+uint32_t ArmExpecting(uint64_t address, const char* reason);
+
 } // namespace Common::GuestWatch
 
 #endif // EMULATOR_SRC_COMMON_GUESTWATCH_H_

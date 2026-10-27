@@ -51,6 +51,7 @@ constexpr uint32_t MaxCodeDumps = 8;
 
 std::mutex                                      g_mutex; // arming
 std::array<std::atomic<uint64_t>, MaxWatches>   g_watches {};
+std::array<std::atomic<uint64_t>, MaxWatches>   g_expected {}; // 0: log every write
 std::atomic<uint32_t>                           g_count {0};
 std::atomic<uint64_t>                           g_hits {0};
 std::atomic<uint32_t>                           g_lines {0};
@@ -134,6 +135,13 @@ LONG WINAPI Handler(PEXCEPTION_POINTERS pointers) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 	context.Dr6 &= ~uint64_t {0xf};
+	// A watch armed with an expected value (ArmExpecting) logs only writes that leave it there.
+	if (const auto expected = g_expected[which].load(std::memory_order_relaxed); expected != 0) {
+		const auto address = g_watches[which].load(std::memory_order_relaxed);
+		if (!Readable(address, 8) || *reinterpret_cast<const uint64_t*>(address) != expected) {
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+	}
 	const auto hit = g_hits.fetch_add(1, std::memory_order_relaxed) + 1;
 	// GT7 render mapping (KYTY_GUEST_WATCH_PER_PC=<n>): at most n lines for each writing code
 	// address, and up to 400 lines in all, so one busy writer (a memset) does not use them up.
@@ -270,7 +278,39 @@ uint32_t Arm(const uint64_t* addresses, uint32_t count, const char* reason) {
 	return armed;
 }
 
+uint32_t ArmExpecting(uint64_t address, const char* reason) {
+	address &= ~uint64_t {7};
+	if (!Readable(address, 8)) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("GuestWatch: 0x{:x} is not readable; not armed ({})\n", address, reason));
+		return 0;
+	}
+	const auto value = *reinterpret_cast<const uint64_t*>(address);
+	if (value == 0) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("GuestWatch: 0x{:x} holds 0; not armed ({})\n", address, reason));
+		return 0;
+	}
+	{
+		std::scoped_lock lock(g_mutex);
+		const auto       watches = g_count.load(std::memory_order_relaxed);
+		if (watches >= MaxWatches) {
+			return 0;
+		}
+		// The slot Arm gives the address next.
+		g_expected[watches].store(value, std::memory_order_relaxed);
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "GuestWatch: 0x{:x} holds {:016x}; only writes that leave that value are logged\n", address,
+	    value));
+	return Arm(&address, 1, reason);
+}
+
 #else
+
+uint32_t ArmExpecting(uint64_t /*address*/, const char* reason) {
+	return Arm(nullptr, 0, reason);
+}
 
 uint32_t Arm(const uint64_t* /*addresses*/, uint32_t /*count*/, const char* reason) {
 	Log::WriteToConsoleAndLog(
