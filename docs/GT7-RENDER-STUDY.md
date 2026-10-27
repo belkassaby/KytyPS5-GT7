@@ -225,3 +225,24 @@ Callers: `0x900688fe0` (2.7 KB; most likely "finish loading a package") ← `0x9
 with its final T#, once, when it loads; the per-draw records then only carry pointers into those
 packages. Kyty could register textures at load and key its per-draw lookups by package record,
 instead of decoding and validating T#s each draw.
+
+## Texture fast path, stage 1: how many bindings are package textures (KYTY_TEXTURE_REGISTRY=1)
+
+One Northern Isle race, registry fed by APR reads into the GPU memory range:
+
+- 79 packages, 3,493 T# templates registered.
+- About 3 million texture bindings every 10 s (non-bindless). Of them:
+  - **~5.5 % matched a registered package template** (150 to 270 distinct textures);
+  - **~27 % are mipmapped but matched no template** (520 to 850 distinct): most likely packages
+    read into CPU memory first (reads into `0xec07…` were seen) and copied or decompressed into
+    GPU memory by game code, which the read-based registry never sees;
+  - **~67 % are single-level images**: render targets and other runtime images, which no package
+    holds.
+- **Consequence:** a load-time texture registry can cover at most about a third of the bindings
+  (all mipmapped ones), and only if it learns packages from the loader itself (`0x900688100` sees
+  every package object, whatever path its bytes took) rather than from file reads. The other two
+  thirds are render targets, which need a registry of their own (the engine creates them once; the
+  busiest T#s live in the per-frame tables and the game's `.bss`).
+- With the texture step at about 1.4 µs of a draw's 9.6 µs, a registry covering a third of the
+  bindings would save in the order of 0.3 to 0.5 µs a draw (3 to 5 %): useful only together with
+  the larger per-draw costs (the shader resource walk, about 2.6 µs).
