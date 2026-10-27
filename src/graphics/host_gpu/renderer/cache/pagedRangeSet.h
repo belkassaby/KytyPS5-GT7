@@ -31,6 +31,7 @@ public:
 	}
 
 	void Add(uint64_t address, uint64_t size) {
+		m_version++;
 		m_ranges.Add(address, size);
 		if (size == 0 || size > UINT64_MAX - address) {
 			return;
@@ -40,6 +41,7 @@ public:
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {
+		m_version++;
 		m_ranges.Subtract(address, size);
 		if (size == 0 || size > UINT64_MAX - address || m_chunks.empty()) {
 			return;
@@ -72,6 +74,7 @@ public:
 	}
 
 	void Clear() {
+		m_version++;
 		m_ranges.Clear();
 		m_chunks.clear();
 	}
@@ -109,6 +112,9 @@ public:
 		m_ranges.ForEach(std::forward<Func>(func));
 	}
 	[[nodiscard]] bool            Empty() const { return m_ranges.Empty(); }
+	// GT7 port: bumped by every Add, Subtract and Clear, so an answer about a page can be kept
+	// until the set changes (LibKernel::Memory::FindGpuCleanPage).
+	[[nodiscard]] uint64_t Version() const noexcept { return m_version; }
 	[[nodiscard]] const RangeSet& Ranges() const noexcept { return m_ranges; }
 
 	// Diagnostics and tests: whether the page holding `address` is marked.
@@ -217,6 +223,7 @@ private:
 	}
 
 	RangeSet                                                        m_ranges;
+	uint64_t                                                        m_version = 0;
 	std::unordered_map<uint64_t, std::unique_ptr<Chunk>, ChunkHash> m_chunks;
 
 	inline static std::atomic<bool> s_index_off {false};

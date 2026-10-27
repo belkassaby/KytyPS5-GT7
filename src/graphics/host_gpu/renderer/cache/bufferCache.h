@@ -169,6 +169,10 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool              IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// GT7 port, GPU thread: changes whenever the GPU-written ranges do; and whether a fast
+	// readback is still to land (HasGpuDirtyBytes then also asks the readback queue).
+	[[nodiscard]] uint64_t          GpuDirtyVersion() const noexcept;
+	[[nodiscard]] bool              FastReadbacksPending() const;
 	// The same, under the dirty-range lock: for a GPU-read delegate (Memory::SetGpuReadDelegate).
 	[[nodiscard]] bool              HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size);
 	// Round 152, GPU thread, without the dirty-range lock: the fast readbacks' copies of bytes in

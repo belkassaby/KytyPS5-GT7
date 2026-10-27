@@ -3456,6 +3456,14 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	        m_readback_queue->PendingIn(vaddr, vaddr + size).Valid());
 }
 
+uint64_t BufferCache::GpuDirtyVersion() const noexcept {
+	return m_gpu_modified_ranges.Version();
+}
+
+bool BufferCache::FastReadbacksPending() const {
+	return m_readback_queue != nullptr && m_readback_queue->AnyPending();
+}
+
 void BufferCache::FinishFastReadbacks(uint64_t vaddr, uint64_t size) {
 	if (m_readback_queue == nullptr || size == 0 || !m_readback_queue->AnyPending()) {
 		return;

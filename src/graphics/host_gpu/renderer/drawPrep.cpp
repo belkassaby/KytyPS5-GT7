@@ -156,7 +156,7 @@ bool ReadSet::Validate() const {
 			}
 		}
 		auto& slot = pages[next++ % pages.size()];
-		slot       = {page, LibKernel::Memory::FindGpuCleanBacking(page, PageSize)};
+		slot       = {page, LibKernel::Memory::FindGpuCleanPage(page)};
 		return slot.backing;
 	};
 	thread_local std::vector<uint8_t> current;

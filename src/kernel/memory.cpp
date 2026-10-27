@@ -1525,6 +1525,42 @@ const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->FindBacking(vaddr, size);
 }
 
+// GT7 port: the checks of the draw-prep scanner's results ask about ~14 pages each (~20 bytes a
+// page), and the per-page lookups behind FindGpuCleanBacking were most of their 0.57 us. On the
+// GPU thread an answer is kept, by page, until the GPU-written ranges or the mapping table change;
+// while a fast readback is still to land, every page is asked about as before.
+// KYTY_CLEAN_PAGE_MEMO=0 asks every time.
+const uint8_t* FindGpuCleanPage(uint64_t page) {
+	static const bool memo_enabled = [] {
+		const char* value = std::getenv("KYTY_CLEAN_PAGE_MEMO");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!memo_enabled || g_guest_address_space == nullptr || g_gpu_resources == nullptr ||
+	    t_gpu_read_delegate || !Graphics::GuestGpu::IsGpuThread()) {
+		return FindGpuCleanBacking(page, 4096);
+	}
+	auto& buffers = GetGpuResources().GetBufferCache();
+	if (buffers.FastReadbacksPending()) {
+		return FindGpuCleanBacking(page, 4096);
+	}
+	struct Entry {
+		uint64_t       page         = UINT64_MAX;
+		uint64_t       dirty        = 0;
+		uint64_t       maps         = 0;
+		const uint8_t* backing      = nullptr;
+	};
+	thread_local std::array<Entry, 256> memo {};
+	const auto dirty = buffers.GpuDirtyVersion();
+	const auto maps  = g_guest_address_space->MapsGeneration();
+	auto&      entry = memo[(page >> 12u) & 255u];
+	if (entry.page == page && entry.dirty == dirty && entry.maps == maps) {
+		return entry.backing;
+	}
+	const auto* backing = FindGpuCleanBacking(page, 4096);
+	entry               = {page, dirty, maps, backing};
+	return backing;
+}
+
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return !MaybeGpuDirtyForClean(vaddr, size) && TryReadBacking(vaddr, data, size);
 }

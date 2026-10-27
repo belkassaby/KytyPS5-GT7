@@ -235,6 +235,11 @@ public:
 		    });
 	}
 
+	// Changes whenever the mapping table does (GT7 port: FindGpuCleanPage keeps answers until then).
+	[[nodiscard]] uint64_t MapsGeneration() const {
+		return m_maps_generation.load(std::memory_order_acquire);
+	}
+
 	// The backing bytes of [vaddr, vaddr + size) when one mapping holds all of them, else nullptr.
 	[[nodiscard]] const uint8_t* FindBacking(uint64_t vaddr, uint64_t size) {
 		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
@@ -950,6 +955,8 @@ public:
 	[[nodiscard]] const uint8_t* FindBacking(uint64_t vaddr, uint64_t size) {
 		return m_backing->FindBacking(vaddr, size);
 	}
+
+	[[nodiscard]] uint64_t MapsGeneration() const { return m_backing->MapsGeneration(); }
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!Owns(vaddr, size)) {
