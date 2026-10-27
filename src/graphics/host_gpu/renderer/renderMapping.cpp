@@ -85,7 +85,8 @@ struct Place {
 	bool     protected_ = false; // found through the backing store: the page has no CPU access
 };
 
-// Every 8-byte-aligned place in guest memory whose 16 bytes are one of `keys`. Readable pages are
+// Every 8-byte-aligned place in guest memory whose first 8 bytes (base address and format) are one
+// of `keys`' (the other 8 can differ by use: LOD clamp, swizzle). Readable pages are
 // copied with ReadProcessMemory (a protection the tracker changes meanwhile makes the copy fail
 // instead of faulting this thread); pages without CPU access (GPU-written, or read-watched) are
 // read from the guest's backing store.
@@ -95,6 +96,12 @@ std::vector<std::vector<Place>> Search(const std::vector<Key>& keys, uint64_t& s
 	scanned           = 0;
 	scanned_protected = 0;
 	static std::vector<uint64_t> chunk(ChunkBytes / 8 + 1);
+	// GT7's per-frame scratch tables lie low in this range and hold many copies of each T#: at most
+	// ScratchPlaces of them, so the places above (texture packages, heap objects) are reached.
+	constexpr uint64_t ScratchBegin  = 0x1000000000ull;
+	constexpr uint64_t ScratchEnd    = 0x1100000000ull;
+	constexpr size_t   ScratchPlaces = 8;
+	std::vector<size_t> scratch(keys.size(), 0);
 	const auto match = [&](uint64_t at, uint64_t got, bool protected_) {
 		const auto count = got / 8 - 1;
 		for (uint64_t i = 0; i < count && i < ChunkBytes / 8; i++) {
@@ -102,12 +109,16 @@ std::vector<std::vector<Place>> Search(const std::vector<Key>& keys, uint64_t& s
 			for (size_t k = 0; k < keys.size(); k++) {
 				uint64_t want = 0;
 				std::memcpy(&want, keys[k].dwords.data(), 8);
+				const auto place = at + i * 8;
 				// Guest memory only: the emulator keeps its own copies of the T#s it binds in its
 				// heap, which lies in the same address range.
-				if (first == want && std::memcmp(&chunk[i + 1], &keys[k].dwords[2], 8) == 0 &&
-				    places[k].size() < MaxPlaces && IsGuest(at + i * 8)) {
-					places[k].push_back({at + i * 8, protected_});
+				if (first != want || places[k].size() >= MaxPlaces || !IsGuest(place)) {
+					continue;
 				}
+				if (place >= ScratchBegin && place < ScratchEnd && scratch[k]++ >= ScratchPlaces) {
+					continue;
+				}
+				places[k].push_back({place, protected_});
 			}
 		}
 	};
@@ -213,7 +224,14 @@ void Map(State& state, BufferCache& buffers) {
 		for (const auto& place: places[k]) {
 			const bool gpu_dirty = buffers.HasGpuDirtyBytes(place.address, 32);
 			const auto writers   = BufferCache::GpuWritersOf(place.address, 32);
-			LOGF("Texture map:   0x%" PRIx64 " %s, %s, last GPU writers: %s%s\n", place.address,
+			std::array<uint32_t, 4> here {};
+			const auto here_text =
+			    LibKernel::Memory::TryReadBacking(place.address, here.data(), sizeof(here))
+			        ? fmt::format("{:08x} {:08x} {:08x} {:08x}{}", here[0], here[1], here[2], here[3],
+			                      here == d ? "" : " (differs from the bound T#)")
+			        : std::string("?");
+			LOGF("Texture map:   0x%" PRIx64 " holds %s; %s, %s, last GPU writers: %s%s\n",
+			     place.address, here_text.c_str(),
 			     place.protected_ ? "protected" : "readable",
 			     gpu_dirty ? "GPU-written (not downloaded)" : "CPU copy current",
 			     writers.empty() ? "-" : writers.c_str(), FromFile(place.address, d).c_str());
