@@ -135,6 +135,21 @@ LONG WINAPI Handler(PEXCEPTION_POINTERS pointers) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 	context.Dr6 &= ~uint64_t {0xf};
+	// GT7 render mapping (KYTY_GUEST_WATCH_TSHARP=1): only writes that leave what looks like a T#'s
+	// first 8 bytes there (a base address from 0x1000000000 to 0x1fffffffff, and the high format
+	// bits GT7's textures use), so a watch on reused memory (a stack) logs only descriptor writes.
+	static const bool tsharp_only = std::getenv("KYTY_GUEST_WATCH_TSHARP") != nullptr;
+	if (tsharp_only) {
+		const auto address = g_watches[which].load(std::memory_order_relaxed);
+		if (!Readable(address, 8)) {
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+		const auto value = *reinterpret_cast<const uint64_t*>(address);
+		const auto base  = (value & 0xffffffffffull) << 8u;
+		if (base < 0x1000000000ull || base >= 0x2000000000ull || (value >> 60u) != 0xcu) {
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+	}
 	// A watch armed with an expected value (ArmExpecting) logs only writes that leave it there.
 	if (const auto expected = g_expected[which].load(std::memory_order_relaxed); expected != 0) {
 		const auto address = g_watches[which].load(std::memory_order_relaxed);

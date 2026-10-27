@@ -102,3 +102,22 @@ texture creation and streaming code; and repeat for the per-draw constant and ve
 the address the SRT walk read it from and whether the GPU wrote it (the buffer cache knows), and
 find the compute shader that writes it (`KYTY_GPU_WRITERS=1` names the last GPU writer of a
 range).
+
+## Correction: the `0x7e…` addresses (search with protected pages, KYTY_GPU_WRITERS=1)
+
+- `0x7e…` is **guest memory** after all (Kyty's guest-mapping check accepts it): the region where
+  Kyty puts the **guest threads' stacks** (`stack_addr = 0x7e0f84000`, 1 MB each). The earlier
+  note calling it the emulator's heap was wrong; the Kyty and Windows code that wrote there was
+  Kyty working on the game's behalf (or the thread's own calls reusing the stack).
+- With protected pages searched too, the eight busiest mipmapped T#s of this session were all in
+  CPU-readable memory, **none GPU-written** (no GPU writer recorded): per-frame tables around
+  `0x1000608…` and a **table of 32-byte T#s on a thread's stack** at `0x7e0058fd8`, `…ff8`,
+  `0x7e0059018`, `…038`, `…058` (no thread GT7 created has its stack there: most likely the main
+  thread's). The earlier "nowhere" result (another session, another eight T#s) does not show the
+  T#s are built on the GPU; that hypothesis is withdrawn.
+- Value-filtered watches on that stack table saw **no rewrite** during the race: it is filled once,
+  at race load, in a function that stays active, and copied from into the per-frame tables. Its
+  writer is the CPU-side point a fast path would hook.
+
+**Next:** watch the stack table before the next race loads with `KYTY_GUEST_WATCH_TSHARP=1`
+(only writes that leave a T#-shaped value are logged), to find the code that fills it.
