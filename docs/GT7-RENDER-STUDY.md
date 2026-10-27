@@ -45,3 +45,29 @@ instructions in the code segment. Measured over the menus and a Northern Isle ra
   `0x900016370`; find the engine's texture and buffer creation functions (from the `sceKernel`
   memory and `sceAgc` resource registration calls around them); then prototype a fast path for
   one draw function with the rest left to the command processor.
+
+## Texture heaps (KYTY_MAP_HEAP_WATCH=1)
+
+- A Northern Isle race registers **29 guest texture heaps** with the bindless table, each of
+  **31 entries of 188 bytes**, the T# at entry offset `0x9c` (`Heap map:` lines).
+- They lie in **per-frame scratch memory**: a plain write watch on one entry was hit by about 150
+  code addresses (a `memset` from GT7's job workers, `memcpy`s, physics floats, command buffer
+  words). GT7 builds these tables again each frame.
+- With `GuestWatch::ArmExpecting` (only writes that leave the T# the entry held), the one writer is
+  `0x902df3b1e` in **`0x902df2ee0`** (3.2 KB), which writes a whole record at `rcx`: two 4x4
+  float matrices (`+0x00`, `+0x40`), seven float parameters (`+0x80` to `+0x98`) and, at `+0x9c`,
+  the **32-byte T# copied from `[rax]`, a persistent texture object**. Its callers: `0x900265890`
+  ← `0x9000420f0` ← `0x900041ec0` ← `0x9000459b0` ← `0x9000430f0`.
+- The record shape (two transforms, parameters, one texture) looks like a list of **projected
+  textures** (decals, light cookies or headlight projections) rather than the general material
+  system. Every entry 1 watched held the same T# (`cb5000001282ae10`, a texture at
+  `0x1282ae1000`), likely a default.
+
+**So far:** the texture descriptors GT7's shaders read live in persistent engine texture objects
+and are copied into per-frame tables. A fast path keyed on those texture objects (found through
+`[rax]` in `0x902df2ee0`) could track textures once instead of per draw.
+
+**Next:** trace `rax` back in `0x902df2ee0` to the texture object and its type; watch a texture
+object's T# (it changes only when the texture streams in or is replaced) to find the engine's
+texture creation and streaming code; and repeat for the per-draw constant and vertex buffers
+(the V# side).
