@@ -1,4 +1,5 @@
 #include "libs/agc.h"
+#include "libs/agcCallSites.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -100,6 +101,17 @@ void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_b
 namespace Gen5 {
 
 LIB_NAME("Graphics5", "Graphics5");
+
+// GT7 port: KYTY_AGC_CALLSITES=1 records the guest call sites of every Agc function here.
+#undef PRINT_NAME
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define PRINT_NAME()                                                                               \
+	if (PRINT_NAME_ENABLED) {                                                                      \
+		Libs::PrintName(g_library, g_module, __func__);                                              \
+	}                                                                                              \
+	if (AgcCallSites::Enabled()) {                                                                 \
+		AgcCallSites::Record(__func__, __builtin_return_address(0), __builtin_frame_address(0));      \
+	}
 
 struct RegisterDefaults {
 	ShaderRegister** tbl0                = nullptr;
