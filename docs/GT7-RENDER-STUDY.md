@@ -146,3 +146,31 @@ header address (stable for a race) instead of rediscovering them per draw.
 **Next:** find what writes the package headers when a race loads (the file loader, so the T#s
 are prebuilt in GT7's files, or engine code that patches them), by watching header addresses
 before the load (the guest-memory check must accept unmapped addresses in the GPU memory range).
+
+## Last cycle: package headers move, a persistent texture object
+
+- With up to 64 places per T#, race 1 found texture `0x12b8336000`'s T# at `0x12b72b3e40` and
+  `0x12b72b4060`: package headers just below the texture data again, at **different addresses**
+  than the session before (the texture moved too), and **texture `0x127efd2000`'s T# in GT7's
+  heap at `0xe417d43210`**.
+- Watches armed on those three addresses before race 2's load (T#-shaped writes only) logged
+  **nothing**: race 2 put its texture packages elsewhere (the old header addresses read as zero),
+  and the heap object **kept the same T# across both races**. That texture's object is loaded
+  once (at boot or in the menus) and reused, not reloaded per race.
+- Two more per-frame copiers of T#s: `memcpy` from `0x90004d3a5` and `0x902de0f3f` (called from
+  `0x902deb912`).
+
+## Summary of the texture side
+
+- Material and track texture T#s are **prebuilt and stored with the textures**: in per-race
+  texture package headers in GPU memory just below the texture data (moved between races) and, for
+  textures kept across races, in engine objects in the game heap (`0xe4…`).
+- Every frame, CPU code (`0x900188ad0` and others) copies them **through pointers** into per-draw
+  records in per-frame scratch memory, which is what Kyty walks for each draw. None of it is
+  GPU-written.
+- **For a fast path:** the per-draw copies point back at a small set of persistent descriptors
+  whose addresses are stable for a race (headers) or longer (heap objects). Keying Kyty's texture
+  tracking by those source addresses (hooking `0x900188ad0` and the other copiers, which see both
+  the source pointer and the record) would let it skip rediscovering textures per draw. Who writes
+  the headers at load (file loader or engine) is still open: the headers move between races, so
+  it needs a watch armed from the T# search of the same load, or on the copy that reads the file.
