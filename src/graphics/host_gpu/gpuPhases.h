@@ -68,6 +68,11 @@ enum class Phase : uint32_t {
 	ScannedValidate, // inside ProgramScanned: the check of the bytes the scanner read
 	ValidatePages,   // (a count only) pages ScannedValidate looked at
 	ValidateBytes,   // (a count only) bytes ScannedValidate compared
+	MemoHit,         // (a count only) FindGpuCleanPage answers kept from before
+	MemoDirty,       // (a count only) asked again: the GPU-written ranges changed
+	MemoMaps,        // (a count only) asked again: the mapping table changed
+	MemoNew,         // (a count only) asked again: a page not in the memo
+	MemoReadback,    // (a count only) asked as before: a fast readback still to land
 	BufferSync,     // BufferCache::SynchronizeBuffer
 	Protect,        // page protection changes (PageManager)
 	Flush,          // a command buffer ended and a new one begun (CommandScheduler::Flush)

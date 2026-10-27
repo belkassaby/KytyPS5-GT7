@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
@@ -1541,6 +1542,7 @@ const uint8_t* FindGpuCleanPage(uint64_t page) {
 	}
 	auto& buffers = GetGpuResources().GetBufferCache();
 	if (buffers.FastReadbacksPending()) {
+		Graphics::GpuPhases::Count(Graphics::GpuPhases::Phase::MemoReadback, 1);
 		return FindGpuCleanBacking(page, 4096);
 	}
 	struct Entry {
@@ -1554,8 +1556,13 @@ const uint8_t* FindGpuCleanPage(uint64_t page) {
 	const auto maps  = g_guest_address_space->MapsGeneration();
 	auto&      entry = memo[(page >> 12u) & 255u];
 	if (entry.page == page && entry.dirty == dirty && entry.maps == maps) {
+		Graphics::GpuPhases::Count(Graphics::GpuPhases::Phase::MemoHit, 1);
 		return entry.backing;
 	}
+	Graphics::GpuPhases::Count(entry.page != page   ? Graphics::GpuPhases::Phase::MemoNew
+	                           : entry.dirty != dirty ? Graphics::GpuPhases::Phase::MemoDirty
+	                                                  : Graphics::GpuPhases::Phase::MemoMaps,
+	                           1);
 	const auto* backing = FindGpuCleanBacking(page, 4096);
 	entry               = {page, dirty, maps, backing};
 	return backing;

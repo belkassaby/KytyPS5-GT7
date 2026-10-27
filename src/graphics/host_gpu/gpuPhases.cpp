@@ -439,6 +439,10 @@ void ReportIfDue(uint64_t frames) {
 	                        ? static_cast<double>(count(Phase::ValidateBytes)) /
 	                              static_cast<double>(count(Phase::ScannedValidate))
 	                        : 0.0);
+	line += fmt::format(" (clean-page memo: {} kept, asked again {} for GPU writes, {} for "
+	                    "mappings, {} new; {} during readbacks)",
+	                    count(Phase::MemoHit), count(Phase::MemoDirty), count(Phase::MemoMaps),
+	                    count(Phase::MemoNew), count(Phase::MemoReadback));
 	line += fmt::format(" | {}, {}, {}, {}, {}", counted("draw bda", Phase::DrawBda),
 	                    counted("dispatch bda", Phase::DispatchBda),
 	                    counted("buffer syncs", Phase::BufferSync),
