@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <cstring>
 
 namespace Libs::Graphics::HW {
 
@@ -933,6 +934,26 @@ public:
 	void SetAlphaToMaskEnable(bool value) { m_sh_regs.alpha_to_mask_enable = value; }
 
 	void SetScShaderControl(uint32_t value) { m_sh_regs.m_paScShaderControl = value; }
+
+	// GT7 port, target reuse: whether the registers a draw's render and depth targets are resolved
+	// from (RenderExecutor::ResolveRenderColorTarget / ResolveRenderDepthTarget) hold what they
+	// hold in `other`, byte for byte (a value written differently is never taken as the same).
+	[[nodiscard]] bool SameTargetRegisters(const Context& other) const {
+		const auto same = [](const auto& a, const auto& b) {
+			return std::memcmp(&a, &b, sizeof(a)) == 0;
+		};
+		return m_render_target_mask == other.m_render_target_mask &&
+		       same(m_render_targets, other.m_render_targets) &&
+		       same(m_depth_render_target, other.m_depth_render_target) &&
+		       same(m_render_control, other.m_render_control) &&
+		       same(m_depth_control, other.m_depth_control) &&
+		       same(m_stencil_control, other.m_stencil_control) &&
+		       same(m_stencil_mask, other.m_stencil_mask) &&
+		       same(m_depth_clear_value, other.m_depth_clear_value) &&
+		       same(m_depth_bounds_min, other.m_depth_bounds_min) &&
+		       same(m_depth_bounds_max, other.m_depth_bounds_max) &&
+		       m_stencil_clear_value == other.m_stencil_clear_value;
+	}
 
 private:
 	float    m_line_width            = 1.0f;

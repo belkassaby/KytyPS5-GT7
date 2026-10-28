@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/stateRepeat.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
@@ -2066,6 +2067,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	                                "CX")) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
+	StateRepeat::NoteCxBlock(reinterpret_cast<uint64_t>(indirect_buffer), indirect_num_dw);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.

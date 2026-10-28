@@ -33,6 +33,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/rendererLock.h"
+#include "graphics/host_gpu/renderer/stateRepeat.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -656,6 +657,34 @@ struct DrawRenderState {
 	ShaderPixelInputInfo  ps_input_info;
 	PipelineCache::GraphicsPrograms programs;
 };
+
+// GT7 port, target reuse (KYTY_STATE_REUSE, on by default; 0 turns it off): a draw's render and
+// depth targets are a function of its target registers (HW::Context::SameTargetRegisters), the
+// color targets its pixel shader writes and its slice offset; FindImage then gives the same image
+// for them while the texture cache's image set does not change. In a GT7 race ~96 % of draws have
+// the targets of the draw before (KYTY_STATE_REPEAT): those take its resolved targets, with what
+// FindImage and ResolveRender*Target do to a found image done again (TextureCache::RefindTarget,
+// BindRenderTarget). What AcquireRenderTargets does with them later is not skipped.
+[[nodiscard]] static bool StateReuseOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_STATE_REUSE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
+struct TargetMemo {
+	bool             valid            = false;
+	HW::Context      registers;
+	uint32_t         mrt_mask         = 0;
+	uint32_t         slice_offset     = 0;
+	uint64_t         image_generation = 0;
+	RenderDepthInfo  depth_info;
+	RenderColorInfo  color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint32_t         color_count                              = 0;
+};
+// GPU thread (draws are made there).
+static thread_local TargetMemo t_target_memo;
 
 // Round 82 (from the GTA V fork, 12bb591a's AcquireDrawRenderState): a draw state is ~36 KB, most
 // of it the input infos of the three vertex stages, and value-initializing one on the stack for
@@ -2228,7 +2257,22 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
+	const bool repeats = StateRepeat::Enabled();
+	uint64_t   repeat_start = 0;
+	if (repeats) {
+		StateRepeat::BeginDraw(&buffer.GetRegisters(), sizeof(HW::Context), &buffer.GetShaders(),
+		                       sizeof(HW::Shader), &buffer.GetUserConfig(), sizeof(HW::UserConfig));
+		repeat_start = GpuPhases::Now();
+	}
 	RefreshShaders(buffer, draw, color_output_mask, state);
+	if (repeats) {
+		uint64_t signature = state.ps_active ? state.programs.pixel.id : 0;
+		for (const auto& program: state.programs.vertex) {
+			signature = signature * 0x9E3779B97F4A7C15ull + program.id;
+		}
+		StateRepeat::NoteStep(StateRepeat::Step::Programs, signature,
+		                      GpuPhases::Now() - repeat_start);
+	}
 	LogDrawCensus(buffer, draw, state);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
 		OcclusionQueries::SkippedDraw(m_context, buffer.GetRegisters().GetDbCountControl());
@@ -2256,19 +2300,91 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	{
 		const GpuPhases::Scope phase(GpuPhases::Phase::DrawTargets);
-		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-			if ((mrt_mask & (1u << slot)) != 0) {
-				ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
-				                         render_target_slice_offset, slot);
-				if (state.color_info[state.color_count].image_id) {
-					state.color_count++;
-				}
+		if (repeats) {
+			repeat_start = GpuPhases::Now();
+		}
+		auto&      cache    = m_context.GetTextureCache();
+		auto&      memo     = t_target_memo;
+		const auto& regs    = buffer.GetRegisters();
+		bool       reused   = false;
+		if (StateReuseOn() && memo.valid && memo.mrt_mask == mrt_mask &&
+		    memo.slice_offset == render_target_slice_offset &&
+		    memo.image_generation == cache.ImageSetGeneration() &&
+		    memo.registers.SameTargetRegisters(regs)) {
+			reused = true;
+			for (uint32_t i = 0; i < memo.color_count && reused; i++) {
+				reused = cache.TargetStillRegistered(memo.color_info[i].image_id);
+			}
+			if (reused && memo.depth_info.image_id) {
+				reused = cache.TargetStillRegistered(memo.depth_info.image_id);
 			}
 		}
-		if (draw.IsIndexed()) {
-			LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
+		if (reused) {
+			for (uint32_t i = 0; i < memo.color_count; i++) {
+				const auto& target = memo.color_info[i];
+				cache.RefindTarget(target.image_id, target.desc, target.guest_array_layer);
+				BindRenderTarget(target.image_id);
+			}
+			if (memo.depth_info.image_id) {
+				cache.RefindTarget(memo.depth_info.image_id, memo.depth_info.desc,
+				                   memo.depth_info.guest_array_layer);
+				BindRenderTarget(memo.depth_info.image_id);
+			}
+			std::copy(std::begin(memo.color_info), std::end(memo.color_info),
+			          std::begin(state.color_info));
+			state.color_count = memo.color_count;
+			state.depth_info  = memo.depth_info;
+		} else {
+			for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+				if ((mrt_mask & (1u << slot)) != 0) {
+					ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
+					                         render_target_slice_offset, slot);
+					if (state.color_info[state.color_count].image_id) {
+						state.color_count++;
+					}
+				}
+			}
+			if (draw.IsIndexed()) {
+				LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
+			}
+			ResolveRenderDepthTarget(buffer, state.depth_info);
+			// A depth state the host cannot draw with is left to the full path each time (its
+			// report counts each draw).
+			memo.valid = StateReuseOn() && !state.depth_info.unsupported;
+			if (memo.valid) {
+				memo.registers        = regs;
+				memo.mrt_mask         = mrt_mask;
+				memo.slice_offset     = render_target_slice_offset;
+				memo.image_generation = cache.ImageSetGeneration();
+				std::copy(std::begin(state.color_info), std::end(state.color_info),
+				          std::begin(memo.color_info));
+				memo.color_count = state.color_count;
+				memo.depth_info  = state.depth_info;
+			}
 		}
-		ResolveRenderDepthTarget(buffer, state.depth_info);
+		if (repeats) {
+			const auto mix = [](uint64_t signature, uint64_t value) {
+				return signature * 0x9E3779B97F4A7C15ull + value;
+			};
+			const auto view = [&](const auto& info) {
+				return mix(mix(mix(mix(static_cast<uint64_t>(info.image_id.index) << 32u |
+				                           info.image_id.generation,
+				                       info.desc.view_info.base_level),
+				                   info.desc.view_info.base_layer),
+				               info.desc.view_info.layer_count),
+				           static_cast<uint64_t>(info.desc.view_info.format));
+			};
+			uint64_t signature = state.color_count;
+			for (uint32_t i = 0; i < state.color_count; i++) {
+				signature = mix(mix(signature, view(state.color_info[i])),
+				                state.color_info[i].target_slot);
+			}
+			signature = mix(signature, view(state.depth_info));
+			StateRepeat::NoteStep(StateRepeat::Step::Targets, signature,
+			                      GpuPhases::Now() - repeat_start);
+			StateRepeat::NoteStep(StateRepeat::Step::ImageSet,
+			                      m_context.GetTextureCache().ImageSetGeneration(), 0);
+		}
 	}
 	if (state.depth_info.unsupported) {
 		if (FrameGraph::Logging()) {
@@ -2907,12 +3023,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	PipelineCache::Pipeline* deferred_pipeline = nullptr;
+	const bool               repeats           = StateRepeat::Enabled();
+	uint64_t                 repeat_start      = repeats ? GpuPhases::Now() : 0;
 	{
 		const GpuPhases::Scope phase(GpuPhases::Phase::DrawPipeline);
 		deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
 		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages,
 		    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
 		    primitive_restart_enable, state.programs, defer);
+	}
+	if (repeats) {
+		StateRepeat::NoteStep(StateRepeat::Step::Pipeline,
+		                      reinterpret_cast<uint64_t>(deferred_pipeline),
+		                      GpuPhases::Now() - repeat_start);
 	}
 	if (deferred_pipeline == nullptr) {
 		OcclusionQueries::SkippedDraw(m_context, buffer.GetRegisters().GetDbCountControl());
@@ -2924,10 +3047,26 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& pipeline = *deferred_pipeline;
 	vk::ImageAspectFlags feedback_aspects;
 	GpuPhases::Scope     rendering_phase(GpuPhases::Phase::DrawRendering);
+	if (repeats) {
+		repeat_start = GpuPhases::Now();
+	}
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
 	rendering_phase.End();
+	if (repeats) {
+		uint64_t signature = rendering.width | static_cast<uint64_t>(rendering.height) << 32u;
+		for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
+			signature = signature * 0x9E3779B97F4A7C15ull +
+			            reinterpret_cast<uint64_t>(
+			                static_cast<VkImageView>(rendering.color_attachments[i].image_view));
+		}
+		signature = signature * 0x9E3779B97F4A7C15ull +
+		            reinterpret_cast<uint64_t>(static_cast<VkImageView>(
+		                rendering.depth_stencil_attachment.image_view));
+		StateRepeat::NoteStep(StateRepeat::Step::Rendering, signature,
+		                      GpuPhases::Now() - repeat_start);
+	}
 	if (FrameGraph::Logging() && state.depth_info.image_id) {
 		// What the depth attachment's rendering starts with (an HTile clear among them).
 		const auto& ds = rendering.depth_stencil_attachment;

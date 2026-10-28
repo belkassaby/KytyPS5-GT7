@@ -4101,6 +4101,23 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 	return result;
 }
 
+bool TextureCache::TargetStillRegistered(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	const auto*      image = m_slot_images.try_get(id);
+	return image != nullptr && image->registered && !image->info.data.Empty();
+}
+
+void TextureCache::RefindTarget(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer) {
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		image.tick_accessed_last = m_scheduler.CurrentTick();
+		TouchImage(image);
+	}
+	DescribeUintArrayImage(id, desc);
+	MaterializeColorClear(id, desc, metadata_base_layer);
+}
+
 void TextureCache::UpdateImage(ImageId id) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
