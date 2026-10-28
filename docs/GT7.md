@@ -65,6 +65,27 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 28, 2026, second build)
+
+No shaders are compiled again after this update. Thanks to SakuraLainMaid for both changes
+([#35](https://github.com/usa-ratt/KytyPS5-GT7/pull/35),
+[#33](https://github.com/usa-ratt/KytyPS5-GT7/pull/33)).
+
+- **Smoother on cards with less video memory.** When video memory gets full, the emulator throws
+  away buffers it hasn't used for a while. It used to make the graphics thread wait for the GPU
+  first. Now that happens in the background. In SakuraLainMaid's test on a 6 GB card at 1440p,
+  the wait had taken about 37 ms of each frame in a race.
+- **The game's GPU work is sent before the clean-up,** so the game no longer waits for the
+  results of its own GPU work behind the clean-up's image copies.
+- **Two optional settings** for cards with little video memory. `KYTY_VMA_BLOCK_MB=64` makes
+  the emulator reserve video memory in smaller blocks (on the 6 GB card at 1440p, video memory
+  use went from about 6.0 to 4.35 GB). `KYTY_HOLD_COMPILING=1` keeps the last frame on the screen
+  while many draws wait for new pipelines to compile (for up to 5 seconds), instead of showing
+  frames with parts missing.
+- On an RTX 5090 the frame rate is unchanged: 27.2 fps both ways in a test race at Tokyo.
+- For people who build the emulator themselves: setting up an existing build folder again no
+  longer fails on the ZArchive download.
+
 ## What's new (October 28, 2026)
 
 No shaders are compiled again after this update.
