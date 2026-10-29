@@ -24,6 +24,8 @@
 #include "kernel/pthread.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
+#include "loader/gt7DrawCounts.h"
+#include "loader/gt7TextureCounts.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
 #include "loader/symbolDatabase.h"
@@ -1599,6 +1601,8 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		// Diagnostics: code addresses relative to the main program (KYTY_FIND_CONSTANTS).
 		Common::GuestWatch::SetProgram(m_programs.front()->base_vaddr,
 		                               m_programs.front()->base_size);
+		Gt7DrawCounts::Install(m_programs.front()->base_vaddr);
+		Gt7TextureCounts::Install(m_programs.front()->base_vaddr);
 	}
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);

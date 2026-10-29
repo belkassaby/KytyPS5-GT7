@@ -21,6 +21,9 @@ namespace Common::PerfStats {
 
 [[nodiscard]] bool Enabled();
 
+// Frames presented since the start, while the counters count (for other per-frame reports).
+[[nodiscard]] uint64_t PresentsTotal();
+
 // The GPU thread's time: waiting for work (the guest has submitted nothing), waiting on a blocked
 // queue, and processing; HostGpuWait is the part of processing it spent waiting for the host GPU.
 enum class GpuThread : uint32_t { Idle, Blocked, Busy, HostGpuWait, Count };

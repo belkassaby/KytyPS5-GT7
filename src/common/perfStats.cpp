@@ -484,8 +484,11 @@ void AddDispatchSlow() {
 	g_counters.dispatches.fetch_add(1, std::memory_order_relaxed);
 }
 
+std::atomic<uint64_t> g_presents_total {0};
+
 void AddPresentSlow() {
 	g_counters.presents.fetch_add(1, std::memory_order_relaxed);
+	g_presents_total.fetch_add(1, std::memory_order_relaxed);
 }
 
 void AddDownloadSlow(uint64_t bytes) {
@@ -627,6 +630,10 @@ void AddLockWaitSlow(uint32_t lock, uint64_t nanoseconds) {
 }
 
 } // namespace Detail
+
+uint64_t PresentsTotal() {
+	return Detail::g_presents_total.load(std::memory_order_relaxed);
+}
 
 void SetSpinLocks(bool spin) {
 	Detail::g_spin_locks.store(spin, std::memory_order_relaxed);
