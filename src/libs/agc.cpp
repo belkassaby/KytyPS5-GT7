@@ -24,6 +24,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/gt7NativeDraws.h"
 
 #include <algorithm>
 #include <array>
@@ -2603,6 +2604,18 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count
 	EXIT_NOT_IMPLEMENTED((reinterpret_cast<uint64_t>(index_addr) & 1u) != 0);
 
 	buf->DbgDump();
+
+	// GT7 port, native path: the engine identity of this draw, just before it
+	if (::Loader::Gt7NativeDraws::Enabled()) {
+		::Loader::Gt7NativeDraws::Identity identity;
+		if (::Loader::Gt7NativeDraws::ForDraw(
+		        reinterpret_cast<uint64_t>(__builtin_return_address(0)), &identity)) {
+			if (auto* marker = buf->AllocateDW(::Loader::Gt7NativeDraws::MarkerDwords);
+			    marker != nullptr) {
+				::Loader::Gt7NativeDraws::WriteMarker(marker, identity);
+			}
+		}
+	}
 
 	auto* cmd = buf->AllocateDW(6);
 

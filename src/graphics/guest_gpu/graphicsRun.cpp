@@ -30,6 +30,7 @@
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
+#include "loader/gt7NativeDraws.h"
 
 #include <algorithm>
 #include <array>
@@ -1407,6 +1408,10 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
+	}
+	if (::Loader::Gt7NativeDraws::Enabled()) {
+		const auto& ps = GetShCtx().GetPs().ps_user_sgpr;
+		::Loader::Gt7NativeDraws::OnDraw(ps.value, ps.count);
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 	CompleteDraw();

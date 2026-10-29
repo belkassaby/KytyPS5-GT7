@@ -155,6 +155,7 @@ uint32_t CpOpDispatchReset(CommandProcessor&, uint32_t, const uint32_t*, uint32_
 uint32_t CpOpWaitRegMem32(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpWaitFlipDone(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpPushMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpGt7Draw(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpPopMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpWaitRegMem64(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpFlip(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);

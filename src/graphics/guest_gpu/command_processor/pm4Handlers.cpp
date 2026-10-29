@@ -16,6 +16,7 @@
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
+#include "loader/gt7NativeDraws.h"
 
 #include <algorithm>
 #include <array>
@@ -2389,6 +2390,15 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 		LOGF("Push marker: %s\n", str);
 	}
 
+	return dw_num + 1;
+}
+
+// GT7 port, native path: the engine identity of the draw that follows.
+KYTY_CP_OP_PARSER(CpOpGt7Draw) {
+	KYTY_PROFILER_FUNCTION();
+
+	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
+	::Loader::Gt7NativeDraws::OnMarker(buffer, dw_num + 1);
 	return dw_num + 1;
 }
 

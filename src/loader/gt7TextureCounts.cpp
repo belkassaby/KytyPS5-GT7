@@ -7,6 +7,7 @@
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"
 #include "loader/gt7GuestHook.h"
+#include "loader/gt7MaterialRegistry.h"
 
 #include <algorithm>
 #include <array>
@@ -249,6 +250,30 @@ std::atomic<uint64_t>  g_watch_ctx {0};
 std::atomic<uint64_t>  g_watch_table {0};
 bool                   g_watch_armed = false; // reporter thread only
 
+// What the pixel stage's SGPRs 2-3 (its texture table) point at, per draw whose stage-1 user data
+// changed: a material block (Gt7MaterialRegistry), a copy of one gt7_BindMaterial made in the
+// command buffer (g_copies: this window's copies, by destination), or other memory (by region).
+std::atomic<uint64_t>                  g_table_in_block {0};
+std::atomic<uint64_t>                  g_table_in_copy {0};
+std::atomic<uint64_t>                  g_table_other {0};
+std::unordered_map<uint64_t, uint64_t> g_copies;        // window mutex
+std::unordered_map<uint64_t, uint64_t> g_other_regions; // address >> 32, window mutex
+
+void ClassifyTable(uint64_t table) {
+	Gt7MaterialRegistry::Block block;
+	if (Gt7MaterialRegistry::Find(table, 8, &block)) {
+		g_table_in_block.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	std::scoped_lock lock(g_window_mutex);
+	if (g_copies.contains(table)) {
+		g_table_in_copy.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	g_table_other.fetch_add(1, std::memory_order_relaxed);
+	g_other_regions[table >> 32u]++;
+}
+
 uint32_t CountTsharps(const uint8_t* bytes, uint32_t size, uint32_t step,
                       std::vector<std::pair<uint32_t, uint64_t>>* hits) {
 	uint32_t found = 0;
@@ -282,6 +307,10 @@ KYTY_SYSV_ABI void OnCommit(const uint8_t* ctx) {
 		g_stage_changed[s].fetch_add(1, std::memory_order_relaxed);
 		std::array<uint32_t, 32> user {};
 		std::memcpy(user.data(), stage + 0x18, sizeof(user));
+		if (s == 1 && Gt7MaterialRegistry::Enabled()) {
+			ClassifyTable(user[2] | (static_cast<uint64_t>(user[3]) << 32u));
+			Gt7MaterialRegistry::CheckImmutabilityStep(16);
+		}
 		direct.clear();
 		uint32_t via = 0;
 		{
@@ -401,8 +430,12 @@ bool WatchMode(const char* mode) {
 	return value != nullptr && std::strcmp(value, mode) == 0;
 }
 
-KYTY_SYSV_ABI void OnBlockCopy(void* /*dst*/, const uint8_t* block, uint32_t size) {
+KYTY_SYSV_ABI void OnBlockCopy(void* dst, const uint8_t* block, uint32_t size) {
 	ScanBlock(g_copy_scan, block, size);
+	{
+		std::scoped_lock lock(g_window_mutex);
+		g_copies[reinterpret_cast<uint64_t>(dst)] = reinterpret_cast<uint64_t>(block);
+	}
 	if (!WatchMode("material") || block == nullptr) {
 		return;
 	}
@@ -510,6 +543,48 @@ void Report() {
 		ReportScan(g_buffer_scan, frames);
 		ReportCommits(frames);
 		ReportScan(g_copy_scan, frames);
+		if (Gt7MaterialRegistry::Enabled()) {
+			static uint64_t last_block = 0, last_copy = 0, last_other = 0;
+			const auto      in_block = g_table_in_block.load(std::memory_order_relaxed);
+			const auto      in_copy  = g_table_in_copy.load(std::memory_order_relaxed);
+			const auto      other    = g_table_other.load(std::memory_order_relaxed);
+			std::vector<std::pair<uint64_t, uint64_t>> regions;
+			{
+				std::scoped_lock lock(g_window_mutex);
+				regions.assign(g_other_regions.begin(), g_other_regions.end());
+				g_other_regions.clear();
+				g_copies.clear();
+			}
+			std::ranges::sort(regions, [](const auto& a, const auto& b) { return a.second > b.second; });
+			std::string list;
+			for (size_t i = 0; i < std::min<size_t>(regions.size(), 5); i++) {
+				list += fmt::format(" 0x{:x}xxxxxxxx {:.0f}", regions[i].first,
+				                    static_cast<double>(regions[i].second) / frames);
+			}
+			const auto totals = Gt7MaterialRegistry::GetTotals();
+			Log::WriteUnmuted(fmt::format(
+			    "Material registry: {} sets, {} blocks registered ({} live) | a frame, the pixel "
+			    "stage's texture table (SGPRs 2-3) is: a material block {:.0f}, a copy of one "
+			    "{:.0f}, other {:.0f} (by region:{})\n",
+			    totals.sets, totals.blocks, totals.live,
+			    static_cast<double>(in_block - last_block) / frames,
+			    static_cast<double>(in_copy - last_copy) / frames,
+			    static_cast<double>(other - last_other) / frames, list));
+			last_block = in_block;
+			last_copy  = in_copy;
+			last_other = other;
+			const auto check = Gt7MaterialRegistry::CheckImmutability();
+			std::string busiest;
+			for (uint32_t i = 0; i < check.offset_count; i++) {
+				busiest += fmt::format(" +0x{:x} {}", check.offsets[i].first, check.offsets[i].second);
+			}
+			Log::WriteUnmuted(fmt::format(
+			    "Material immutability: pass {}: {} blocks compared with their bytes after load ({} "
+			    "first seen in it, {} unmapped): {} differ, {} changed since the pass before "
+			    "(changed offsets, blocks:{})\n",
+			    check.passes, check.checked, check.baselined, check.unmapped, check.changed,
+			    check.changed_now, busiest));
+		}
 		if (std::vector<uint64_t> slots; !g_slots_armed && WatchMode("material")) {
 			{
 				std::scoped_lock lock(g_slots_mutex);

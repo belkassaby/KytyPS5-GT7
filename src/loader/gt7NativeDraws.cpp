@@ -1,0 +1,228 @@
+#include "loader/gt7NativeDraws.h"
+
+#include "common/abi.h"
+#include "common/logging/log.h"
+#include "common/perfStats.h"
+#include "common/virtualMemory.h"
+#include "graphics/guest_gpu/pm4.h"
+#include "kernel/memory.h"
+#include "loader/gt7GuestHook.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <thread>
+#include <unordered_set>
+
+#include <fmt/format.h>
+
+namespace Loader::Gt7NativeDraws {
+
+namespace Pm4 = Libs::Graphics::Pm4;
+
+namespace {
+
+constexpr uint64_t BindMaterial     = 0x11800; // gt7_BindMaterial(set, material, package, shaders, ...)
+constexpr uint64_t MeshDraw         = 0x5fb0;  // gt7_DrawMeshClusters(mesh, ...)
+constexpr uint64_t MeshDrawSize     = 9124;
+constexpr uint64_t DrawIndex        = 0xa1400; // gt7_DrawIndex
+constexpr uint64_t DrawIndexSize    = 434;
+constexpr uint64_t MaterialBlock    = 0x18; // GT7Material's constant block
+constexpr auto     ReportEvery      = std::chrono::seconds(10);
+
+// push rbp; mov rbp, rsp; push r15; push r14; push r13; push r12; push rbx; sub rsp, 0x138
+constexpr std::array<uint8_t, 20> BindMoved = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+                                               0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48,
+                                               0x81, 0xec, 0x38, 0x01, 0x00, 0x00};
+// the same with sub rsp, 0x6e8
+constexpr std::array<uint8_t, 20> MeshMoved = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+                                               0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48,
+                                               0x81, 0xec, 0xe8, 0x06, 0x00, 0x00};
+
+bool     g_enabled   = false;
+uint64_t g_main_base = 0;
+
+// Game threads: the engine state the next draw marker carries.
+thread_local Identity t_identity;
+
+// GPU thread: the marker waiting for its draw.
+bool     g_pending = false;
+Identity g_pending_identity;
+
+std::atomic<uint64_t> g_markers_written {0};
+std::atomic<uint64_t> g_markers {0};        // seen by the command processor
+std::atomic<uint64_t> g_orphans {0};        // replaced by another marker before a draw
+std::atomic<uint64_t> g_draws {0};          // indexed draws
+std::atomic<uint64_t> g_marked {0};         // ... with a marker
+std::atomic<uint64_t> g_block_match {0};    // ... whose pixel stage's SGPRs 2-3 are the block
+std::atomic<uint64_t> g_no_block {0};       // ... whose material had no block
+std::atomic<uint64_t> g_with_mesh {0};
+std::unordered_set<uint64_t> g_materials;   // this window's (GPU thread)
+
+template <typename T>
+T Read(uint64_t address) {
+	T value {};
+	std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(T));
+	return value;
+}
+
+KYTY_SYSV_ABI void OnBindMaterial(uint64_t set, uint64_t material, uint64_t /*package*/,
+                                  uint64_t shaders) {
+	t_identity.set      = set;
+	t_identity.material = material;
+	t_identity.block    = material != 0 ? Read<uint64_t>(material + MaterialBlock) : 0;
+	t_identity.shaders  = shaders;
+}
+
+KYTY_SYSV_ABI void OnMeshDraw(uint64_t mesh) {
+	t_identity.mesh = mesh;
+}
+
+void Report() {
+	uint64_t last[8]       = {};
+	uint64_t last_presents = Common::PerfStats::PresentsTotal();
+	for (;;) {
+		std::this_thread::sleep_for(ReportEvery);
+		const uint64_t now[8] = {g_markers_written.load(), g_markers.load(), g_orphans.load(),
+		                         g_draws.load(),           g_marked.load(),  g_block_match.load(),
+		                         g_no_block.load(),        g_with_mesh.load()};
+		const auto presents = Common::PerfStats::PresentsTotal();
+		const auto frames   = static_cast<double>(std::max<uint64_t>(presents - last_presents, 1));
+		double     d[8];
+		for (int i = 0; i < 8; i++) {
+			d[i] = static_cast<double>(now[i] - last[i]) / frames;
+			last[i] = now[i];
+		}
+		last_presents = presents;
+		Log::WriteUnmuted(fmt::format(
+		    "Native draws: a frame: {:.0f} markers written, {:.0f} seen ({:.0f} without a draw) | "
+		    "{:.0f} indexed draws, {:.0f} marked ({:.1f}%): {:.0f} with the pixel stage's texture "
+		    "table at the material's block, {:.0f} whose material has no block, {:.0f} with a mesh "
+		    "| {} materials in the window\n",
+		    d[0], d[1], d[2], d[3], d[4], d[3] == 0 ? 0.0 : 100.0 * d[4] / d[3], d[5], d[6], d[7],
+		    g_materials.size()));
+		// read on this thread while the GPU thread may insert: a count only, cleared rarely
+		if (g_materials.size() > 1u << 16u) {
+			g_materials.clear();
+		}
+	}
+}
+
+} // namespace
+
+bool Enabled() {
+	return g_enabled;
+}
+
+bool ForDraw(uint64_t guest_return_address, Identity* identity) {
+	const auto offset = guest_return_address - g_main_base;
+	const bool engine = (offset >= MeshDraw && offset < MeshDraw + MeshDrawSize) ||
+	                    (offset >= DrawIndex && offset < DrawIndex + DrawIndexSize);
+	if (!engine || t_identity.material == 0) {
+		return false;
+	}
+	t_identity.sequence++;
+	*identity = t_identity;
+	g_markers_written.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+void WriteMarker(uint32_t* packet, const Identity& identity) {
+	packet[0] = KYTY_PM4(MarkerDwords, Pm4::IT_NOP, Pm4::R_GT7_DRAW);
+	const uint64_t fields[5] = {identity.set, identity.material, identity.block, identity.shaders,
+	                            identity.mesh};
+	for (int i = 0; i < 5; i++) {
+		packet[1 + i * 2] = static_cast<uint32_t>(fields[i]);
+		packet[2 + i * 2] = static_cast<uint32_t>(fields[i] >> 32u);
+	}
+	packet[11] = identity.sequence;
+}
+
+void OnMarker(const uint32_t* payload, uint32_t dwords) {
+	g_markers.fetch_add(1, std::memory_order_relaxed);
+	if (dwords < MarkerDwords - 1) {
+		return;
+	}
+	if (g_pending) {
+		g_orphans.fetch_add(1, std::memory_order_relaxed);
+	}
+	const auto field = [&](int i) {
+		return payload[i * 2] | (static_cast<uint64_t>(payload[i * 2 + 1]) << 32u);
+	};
+	g_pending_identity = {field(0), field(1), field(2), field(3), field(4), payload[10]};
+	g_pending          = true;
+}
+
+void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count) {
+	g_draws.fetch_add(1, std::memory_order_relaxed);
+	if (!g_pending) {
+		return;
+	}
+	g_pending = false;
+	const auto& id = g_pending_identity;
+	g_marked.fetch_add(1, std::memory_order_relaxed);
+	if (id.mesh != 0) {
+		g_with_mesh.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (g_materials.size() <= 1u << 16u) {
+		g_materials.insert(id.material);
+	}
+	if (id.block == 0) {
+		g_no_block.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	if (count >= 4) {
+		const uint64_t table = ps_user_sgprs[2] | (static_cast<uint64_t>(ps_user_sgprs[3]) << 32u);
+		if (table == id.block) {
+			g_block_match.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+}
+
+void Install(uint64_t main_base) {
+	const char* enabled = std::getenv("KYTY_GT7_NATIVE");
+	if (enabled == nullptr || enabled[0] != '1') {
+		return;
+	}
+	auto* bind = reinterpret_cast<uint8_t*>(main_base + BindMaterial);
+	auto* mesh = reinterpret_cast<uint8_t*>(main_base + MeshDraw);
+	if (std::memcmp(bind, BindMoved.data(), BindMoved.size()) != 0) {
+		Log::WriteToConsoleAndLog("Native draws: not installed (gt7_BindMaterial differs from GT7 "
+		                          "v01.710's)\n");
+		return;
+	}
+	const auto page = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    main_base, 0x4000, Common::VirtualMemory::Mode::ExecuteReadWrite, "gt7_native_draws", false);
+	if (page == 0) {
+		Log::WriteToConsoleAndLog("Native draws: not installed (no memory for the stubs)\n");
+		return;
+	}
+	Gt7GuestHook::Emitter b {reinterpret_cast<uint8_t*>(page)};
+	const auto bind_stub = b.Here();
+	b.CallHost(reinterpret_cast<const void*>(&OnBindMaterial)); // rdi, rsi, rdx, rcx
+	b.Return(BindMoved, main_base + BindMaterial);
+	// KYTY_DRAW_COUNTS hooks the same entry: then the mesh is left out
+	const bool mesh_free = std::memcmp(mesh, MeshMoved.data(), MeshMoved.size()) == 0;
+	uint64_t   mesh_stub = 0;
+	if (mesh_free) {
+		Gt7GuestHook::Emitter m {reinterpret_cast<uint8_t*>(page + 0x200)};
+		mesh_stub = m.Here();
+		m.CallHost(reinterpret_cast<const void*>(&OnMeshDraw)); // rdi: the mesh
+		m.Return(MeshMoved, main_base + MeshDraw);
+	}
+	Common::VirtualMemory::FlushInstructionCache(page, 0x400);
+	Gt7GuestHook::PatchEntry(bind, BindMoved.size(), bind_stub);
+	if (mesh_free) {
+		Gt7GuestHook::PatchEntry(mesh, MeshMoved.size(), mesh_stub);
+	}
+	g_main_base = main_base;
+	g_enabled   = true;
+	std::thread(Report).detach();
+	Log::WriteToConsoleAndLog(fmt::format("Native draws: installed on gt7_BindMaterial{}\n",
+	                                      mesh_free ? " and gt7_DrawMeshClusters" : ""));
+}
+
+} // namespace Loader::Gt7NativeDraws
