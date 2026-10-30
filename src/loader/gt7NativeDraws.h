@@ -56,6 +56,12 @@ void NoteTemplate(uint64_t programs, uint64_t pipeline);
 [[nodiscard]] bool CurrentMarked();
 void               AddCommitSteps(const uint64_t* nanoseconds);
 
+// Prepare-ahead stage 2, measured first (RenderExecutor::ResolveTexture for a marked draw's pixel
+// stage): the descriptor key and its lookup, the memo check on a hit, the slow path, BindImage,
+// for a "Native resolve:" line.
+void AddResolveSteps(uint64_t key_ns, uint64_t memo_ns, uint64_t slow_ns, uint64_t bind_ns,
+                     uint32_t images, uint32_t hits, uint32_t slows);
+
 // Milestone 2 (the renderer, GPU thread, while a draw executes): the draw's material when its
 // pixel stage's texture table is that material's block, else 0. With it the pixel stage's texture
 // and sampler bindings are kept per (material, program) and reused while their descriptors and

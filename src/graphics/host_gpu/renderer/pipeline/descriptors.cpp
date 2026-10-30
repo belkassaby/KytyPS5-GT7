@@ -1006,6 +1006,22 @@ static bool RejectBindlessTexture(const char* what, uint64_t address) {
 	return true;
 }
 
+// GT7 native path, prepare-ahead stage 2, measured first: ResolveTexture's steps for the pixel
+// stage of marked draws (PrepareBindings turns it on): the descriptor key and its cache lookup
+// (what a worker could do), the memo's check on a hit, the slow path, and BindImage.
+struct Gt7ResolveLaps {
+	bool     on = false;
+	uint64_t key_ns = 0, memo_ns = 0, slow_ns = 0, bind_ns = 0;
+	uint32_t images = 0, hits = 0, slows = 0;
+};
+thread_local Gt7ResolveLaps t_gt7_resolve;
+
+static uint64_t Gt7Now() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value,
                                               bool                                         memo) {
@@ -1026,16 +1042,23 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		return {id, nullptr, std::move(desc)};
 	}
 
-	auto&      cache     = TextureDescCache();
-	const bool use_cache = TextureDescCacheEnabled();
-	const auto key       = use_cache ? MakeTextureDescKey(resource, value) : TextureDescKey {};
+	auto&          cache     = TextureDescCache();
+	const bool     use_cache = TextureDescCacheEnabled();
+	const uint64_t gt7_start = t_gt7_resolve.on ? Gt7Now() : 0;
+	const auto     key       = use_cache ? MakeTextureDescKey(resource, value) : TextureDescKey {};
 	// The texture memo (TextureMemo): a draw's or a dispatch's plain sampled binding.
 	const bool use_memo = memo && use_cache && TextureMemoEligible(resource) && TextureMemoEnabled();
 	if (use_memo) {
 		g_texture_memo_counts.lookups++;
 	}
 	if (use_cache) {
-		if (auto* found = FindTextureDesc(key); found != nullptr) {
+		auto* found = FindTextureDesc(key);
+		const uint64_t gt7_found = t_gt7_resolve.on ? Gt7Now() : 0;
+		if (t_gt7_resolve.on) {
+			t_gt7_resolve.images++;
+			t_gt7_resolve.key_ns += gt7_found - gt7_start;
+		}
+		if (found != nullptr) {
 			auto& entry = *found;
 			if (use_memo && MemoCurrent(entry.memo, entry.desc, texture_cache)) {
 				// The image FindImage would find: RebindImages checks it is unchanged before it
@@ -1048,6 +1071,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 					binding.desc.view_info.base_level = entry.memo.base_level;
 					binding.desc.view_info.base_layer = entry.memo.base_layer;
 					binding.memo_view                 = entry.memo.view;
+					if (t_gt7_resolve.on) {
+						t_gt7_resolve.hits++;
+						t_gt7_resolve.memo_ns += Gt7Now() - gt7_found;
+					}
 					return binding;
 				}
 				g_texture_memo_counts.miss_image++;
@@ -1063,6 +1090,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
                 resource, descriptor, entry.desc, entry.shader_conversion, entry.pixel_format,
                 entry.view_format, entry.size, use_memo ? &same_backing : nullptr);
 			KeepForMemo(binding, use_memo, same_backing, generation, stamp, range, texture_cache);
+			if (t_gt7_resolve.on) {
+				t_gt7_resolve.slows++;
+				t_gt7_resolve.slow_ns += Gt7Now() - gt7_found;
+			}
 			return binding;
 		}
 	}
@@ -3591,6 +3622,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			}
 		}
 	}
+	t_gt7_resolve = {};
+	t_gt7_resolve.on = pixel && ::Loader::Gt7NativeDraws::CurrentMarked();
 	for (uint32_t i = 0; !gt7_hit && i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
 		if (hiz_off &&
@@ -3614,10 +3647,20 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			const auto id = m_context.GetTextureCache().FindImage(desc);
 			binding       = {id, nullptr, std::move(desc)};
 		}
+		const uint64_t gt7_bind = t_gt7_resolve.on ? Gt7Now() : 0;
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+		if (t_gt7_resolve.on) {
+			t_gt7_resolve.bind_ns += Gt7Now() - gt7_bind;
+		}
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
+	}
+	if (t_gt7_resolve.on) {
+		const auto& r = t_gt7_resolve;
+		::Loader::Gt7NativeDraws::AddResolveSteps(r.key_ns, r.memo_ns, r.slow_ns, r.bind_ns, r.images,
+		                                         r.hits, r.slows);
+		t_gt7_resolve.on = false;
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	// KYTY_BISECT lit:big: whether a sampler samples a depth image 4096 or more texels wide. One

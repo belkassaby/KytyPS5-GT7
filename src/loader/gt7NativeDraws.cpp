@@ -168,6 +168,26 @@ void ReportMutations() {
 std::array<std::atomic<uint64_t>, 5> g_commit_ns {};
 std::atomic<uint64_t>                g_commit_calls {0};
 
+// ResolveTexture's steps for marked draws' pixel stages (AddResolveSteps)
+std::array<std::atomic<uint64_t>, 8> g_resolve {}; // key, memo, slow, bind ns; images, hits, slows, stages
+
+void ReportResolve() {
+	static std::array<uint64_t, 8> last {};
+	double d[8];
+	for (int i = 0; i < 8; i++) {
+		const auto now = g_resolve[i].load();
+		d[i]           = static_cast<double>(now - last[i]);
+		last[i]        = now;
+	}
+	const auto stages = std::max(d[7], 1.0);
+	Log::WriteUnmuted(fmt::format(
+	    "Native resolve: {:.0f} marked pixel stages, {:.1f} images each ({:.1f} memo hits, {:.1f} slow) | "
+	    "a stage: key and lookup {:.2f} us, memo checks {:.2f} us, slow path {:.2f} us, BindImage "
+	    "{:.2f} us\n",
+	    d[7], d[4] / stages, d[5] / stages, d[6] / stages, d[0] / 1000.0 / stages,
+	    d[1] / 1000.0 / stages, d[2] / 1000.0 / stages, d[3] / 1000.0 / stages));
+}
+
 void ReportCommit() {
 	static std::array<uint64_t, 5> last {};
 	static uint64_t                last_calls = 0;
@@ -240,6 +260,7 @@ void Report() {
 		    td[0] / frames, td[5] / frames, pct(1), pct(2), pct(3), pct(4),
 		    td[7] == 0 ? 0.0 : td[6] / 1000.0 / td[7], td[9] == 0 ? 0.0 : td[8] / 1000.0 / td[9]));
 		ReportCommit();
+		ReportResolve();
 		ReportMutations();
 	}
 }
@@ -354,6 +375,14 @@ void OnDrawDone(uint64_t renderer_ns) {
 
 bool CurrentMarked() {
 	return g_current_marked;
+}
+
+void AddResolveSteps(uint64_t key_ns, uint64_t memo_ns, uint64_t slow_ns, uint64_t bind_ns,
+                     uint32_t images, uint32_t hits, uint32_t slows) {
+	const uint64_t values[8] = {key_ns, memo_ns, slow_ns, bind_ns, images, hits, slows, 1};
+	for (int i = 0; i < 8; i++) {
+		g_resolve[i].fetch_add(values[i], std::memory_order_relaxed);
+	}
 }
 
 void AddCommitSteps(const uint64_t* nanoseconds) {
