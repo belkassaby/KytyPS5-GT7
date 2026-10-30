@@ -223,3 +223,24 @@ What it changes and what not: the scanner prepared these walks ahead already, so
 work per stage is the same (take, check the bytes, apply). The point is the source: each marked
 draw's shader resources now come from GT7's render thread, from engine state, checked at the
 draw, which is what N4's records need.
+
+## N4, first piece: a record's textures found on the render thread (2026-10-30)
+
+With `KYTY_GT7_NATIVE_RECORDS=use`: a marked draw's pixel stage teaches the render threads its
+program's image resources (by state key and material) and the texture descriptions it made (by
+descriptor, `MakeTextureDescKey`); the render thread, for each image of its prepared snapshot,
+finds the description and asks the texture cache for the registered image with that backing
+(`TextureCache::LookupImage`: read-only, under the cache's lock, FindImage's first step only);
+the GPU thread compares with the image each binding got. Race, 10 s windows of 235,000 to
+260,000 marked pixel stages, 2.5 to 2.9 million images:
+
+| | |
+|---|---|
+| the image the GPU thread bound | **77.6 to 78.5 %** |
+| another image | **0.00 %** |
+| no description learned for the descriptor | 6.7 to 7.1 % (descriptors new to the frame: the light grids, at a new address each draw) |
+| no registered image with that backing | 14.6 to 15.7 % (images the GPU thread finds through overlap resolution, the shadow maps among them, or makes at the draw) |
+| frame rate | 15.9 median, as without |
+
+Never a wrong image. The 22 % the render thread cannot name are the cases the texture
+investigations found (light grids, shadow maps): they stay with the GPU thread, per image.

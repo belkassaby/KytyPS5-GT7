@@ -978,6 +978,14 @@ TextureDescKey MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   r
 	return key;
 }
 
+// GT7 native backend N4, first piece (gt7NativeWalk.h): what the GPU thread teaches the render
+// threads, and the texture cache they look up in.
+std::shared_mutex g_gt7_n4_mutex;
+std::unordered_map<TextureDescKey, ImageInfo, TextureDescKeyHash> g_gt7_n4_descs;
+std::unordered_map<uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::IR::ImageResource>>>
+                           g_gt7_n4_programs;
+std::atomic<TextureCache*> g_gt7_n4_texture_cache {nullptr};
+
 bool TextureDescCacheEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_TEXTURE_DESC_CACHE");
@@ -3821,6 +3829,35 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		t_gt7_resolve.on = false;
 		ReportGt7Slow();
 	}
+	// GT7 native backend N4, first piece: a marked draw's pixel stage teaches the render threads
+	// its program's images and their descriptions, and checks the images its record found.
+	if (pixel && ::Loader::Gt7NativeDraws::RecordsUse() && ::Loader::Gt7NativeDraws::CurrentMarked()) {
+		g_gt7_n4_texture_cache.store(&m_context.GetTextureCache(), std::memory_order_release);
+		const uint64_t key   = ::Loader::Gt7NativeDraws::CurrentLearnedKey(1);
+		const auto     count = std::min<size_t>(program.info.images.size(), prepared.images.size());
+		{
+			std::unique_lock lock(g_gt7_n4_mutex);
+			if (key != 0 && !g_gt7_n4_programs.contains(key)) {
+				g_gt7_n4_programs.emplace(
+				    key, std::make_shared<const std::vector<ShaderRecompiler::IR::ImageResource>>(
+				             program.info.images));
+			}
+			if (g_gt7_n4_descs.size() > (1u << 18u)) {
+				g_gt7_n4_descs.clear();
+			}
+			for (size_t i = 0; i < count && i < snapshot.images.size(); i++) {
+				g_gt7_n4_descs.try_emplace(
+				    MakeTextureDescKey(program.info.images[i], snapshot.images[i]),
+				    prepared.images[i].desc.info);
+			}
+		}
+		std::array<uint32_t, 32> ids {};
+		const auto               n = static_cast<uint32_t>(std::min<size_t>(count, ids.size()));
+		for (uint32_t i = 0; i < n; i++) {
+			ids[i] = prepared.images[i].image_id.index;
+		}
+		::Loader::Gt7NativeDraws::CompareRecordImages(ids.data(), n);
+	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	// KYTY_BISECT lit:big: whether a sampler samples a depth image 4096 or more texels wide. One
 	// sampler can serve smaller depth images too (samplers are shared by their S#), which then
@@ -4884,5 +4921,46 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		                             nullptr);
 	}
 }
+
+namespace Gt7NativeWalk {
+
+uint32_t ResolveImages(uint64_t key, const ShaderRecompiler::IR::ResourceSnapshot& resources,
+                       uint32_t* ids, uint8_t* states, uint32_t max) {
+	auto* cache = g_gt7_n4_texture_cache.load(std::memory_order_acquire);
+	std::shared_ptr<const std::vector<ShaderRecompiler::IR::ImageResource>> images;
+	std::array<ImageInfo, 32>                                               infos;
+	std::array<bool, 32>                                                    known {};
+	uint32_t                                                                count = 0;
+	{
+		std::shared_lock lock(g_gt7_n4_mutex);
+		const auto       it = g_gt7_n4_programs.find(key);
+		if (cache == nullptr || it == g_gt7_n4_programs.end()) {
+			return 0;
+		}
+		images = it->second;
+		count  = static_cast<uint32_t>(
+            std::min<size_t>({images->size(), resources.images.size(), max, infos.size()}));
+		for (uint32_t i = 0; i < count; i++) {
+			const auto found =
+			    g_gt7_n4_descs.find(MakeTextureDescKey((*images)[i], resources.images[i]));
+			if (found != g_gt7_n4_descs.end()) {
+				infos[i] = found->second;
+				known[i] = true;
+			}
+		}
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		if (!known[i]) {
+			states[i] = 2;
+			continue;
+		}
+		const auto id = cache->LookupImage(infos[i]);
+		states[i]     = id ? 1 : 3;
+		ids[i]        = id.index;
+	}
+	return count;
+}
+
+} // namespace Gt7NativeWalk
 
 } // namespace Libs::Graphics

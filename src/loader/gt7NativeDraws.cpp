@@ -32,6 +32,7 @@ namespace Loader::Gt7NativeDraws {
 
 // N3 step 3 (defined with the public functions below, used by the report and the draws).
 void ReportUse();
+void ReportImages();
 void FreeRecordStages();
 
 namespace Pm4 = Libs::Graphics::Pm4;
@@ -217,6 +218,10 @@ struct Record {
 	// Step 3: the stages prepared for the GPU thread to take (owned by the record until the GPU
 	// thread's draw ends; it frees them).
 	Libs::Graphics::DrawPrep::StageResult* prepared[2] {};
+	// N4: the pixel stage's images as the render thread found them (Gt7NativeWalk::ResolveImages).
+	uint32_t image_ids[32] {};
+	uint8_t  image_states[32] {};
+	uint8_t  image_count = 0;
 };
 struct RecordRing {
 	std::unique_ptr<uint8_t[]> bytes {new uint8_t[RingBytes]};
@@ -263,6 +268,11 @@ void WalkRecord(Record& record) {
 				record.prepared[s]   = prepared;
 				record.walk_state[s] = 1;
 				record.walk_hash[s]  = Libs::Graphics::Gt7NativeWalk::Hash(prepared->resources);
+				if (s == 1) {
+					record.image_count = static_cast<uint8_t>(Libs::Graphics::Gt7NativeWalk::ResolveImages(
+					    LearnedKey(t_identity.state, t_identity.material, 1), prepared->resources,
+					    record.image_ids, record.image_states, 32));
+				}
 			} else {
 				delete prepared;
 				record.walk_state[s] = 2;
@@ -926,6 +936,7 @@ void Report() {
 		}
 		if (RecordsUseEnabled()) {
 			ReportUse();
+			ReportImages();
 		}
 		ReportCommit();
 		ReportResolve();
@@ -1113,6 +1124,61 @@ void FreeRecordStages() {
 		delete prepared;
 		prepared = nullptr;
 	}
+}
+
+uint64_t CurrentLearnedKey(uint32_t stage) {
+	const auto& id = g_current_identity;
+	return g_current_marked && id.state != 0 ? LearnedKey(id.state, id.material, stage) : 0;
+}
+
+// N4: images compared, the same, another, and why the render thread had none.
+std::atomic<uint64_t> g_n4_draws {0}, g_n4_no_record {0}, g_n4_images {0}, g_n4_same {0},
+    g_n4_other {0}, g_n4_no_desc {0}, g_n4_not_found {0}, g_n4_not_learned {0};
+
+void CompareRecordImages(const uint32_t* image_ids, uint32_t count) {
+	g_n4_draws.fetch_add(1, std::memory_order_relaxed);
+	auto* record = CurrentRecord();
+	if (record == nullptr) {
+		g_n4_no_record.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	if (record->image_count == 0) {
+		g_n4_not_learned.fetch_add(count, std::memory_order_relaxed);
+		return;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		g_n4_images.fetch_add(1, std::memory_order_relaxed);
+		if (i >= record->image_count || record->image_states[i] == 2) {
+			g_n4_no_desc.fetch_add(1, std::memory_order_relaxed);
+		} else if (record->image_states[i] == 3) {
+			g_n4_not_found.fetch_add(1, std::memory_order_relaxed);
+		} else if (record->image_ids[i] == image_ids[i]) {
+			g_n4_same.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			g_n4_other.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+}
+
+void ReportImages() {
+	static std::array<uint64_t, 8> last {};
+	const std::array<uint64_t, 8>  now = {g_n4_draws.load(),   g_n4_no_record.load(),
+	                                      g_n4_images.load(),  g_n4_same.load(),
+	                                      g_n4_other.load(),   g_n4_no_desc.load(),
+	                                      g_n4_not_found.load(), g_n4_not_learned.load()};
+	std::array<double, 8>          d {};
+	for (size_t i = 0; i < now.size(); i++) {
+		d[i]    = static_cast<double>(now[i] - last[i]);
+		last[i] = now[i];
+	}
+	const double images = std::max(1.0, d[2]);
+	Log::WriteUnmuted(fmt::format(
+	    "Native records N4 images (10 s): {:.0f} marked pixel stages ({:.0f} without a record), "
+	    "{:.0f} images: {:.2f}% the image the GPU thread bound, {:.2f}% another, {:.2f}% no "
+	    "description learned, {:.2f}% no image with that backing | {:.0f} images of programs not "
+	    "learned yet\n",
+	    d[0], d[1], d[2], 100.0 * d[3] / images, 100.0 * d[4] / images, 100.0 * d[5] / images,
+	    100.0 * d[6] / images, d[7]));
 }
 
 void ReportUse() {

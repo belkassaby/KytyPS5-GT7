@@ -3857,6 +3857,24 @@ void NoteUnplacedBinding(const TextureCache::ImageDesc& desc, const ImageInfo& f
 
 } // namespace
 
+ImageId TextureCache::LookupImage(const ImageInfo& info) {
+	if (info.data.Empty()) {
+		return {};
+	}
+	std::scoped_lock lock {m_lock};
+	ImageId          result {};
+	if (const auto* owners = m_image_page_table.Find(info.data.address >> ImagePageTable::kPageBits);
+	    owners != nullptr) {
+		owners->ForEach([&](ImageId id) {
+			const auto* image = m_slot_images.try_get(id);
+			if (image != nullptr && image->registered && SameBacking(image->info, info, false)) {
+				result = id;
+			}
+		});
+	}
+	return result;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_backing) {
 	if (same_backing != nullptr) {
 		*same_backing = false;

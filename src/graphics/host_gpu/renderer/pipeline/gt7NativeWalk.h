@@ -44,6 +44,15 @@ void ReadStats(uint64_t* reads, uint64_t* read_ns, uint64_t* probe_ns, uint64_t*
 [[nodiscard]] bool Prepare(const Learned& learned, const uint32_t* user_data, uint32_t stage,
                            DrawPrep::StageResult* result);
 
+// N4, first piece: a record's pixel stage images on the render thread. The GPU thread teaches
+// the pixel program's image resources (by the learned key) and the texture descriptions it made
+// (by descriptor); the render thread finds, for each image of a prepared snapshot, the registered
+// image a read-only texture cache lookup gives (TextureCache::LookupImage). `states`: 1 found
+// (`ids` holds its index), 2 no description learned for the descriptor, 3 no registered image with
+// that backing. The count, or 0 when the program's images are not learned.
+uint32_t ResolveImages(uint64_t key, const ShaderRecompiler::IR::ResourceSnapshot& resources,
+                       uint32_t* ids, uint8_t* states, uint32_t max);
+
 // Both sides: a hash of a snapshot's buffers, images, samplers and flattened SRT.
 [[nodiscard]] uint64_t Hash(const ShaderRecompiler::IR::ResourceSnapshot& snapshot);
 

@@ -80,6 +80,9 @@ public:
 
 	// `same_backing`, when given, says whether the image is one that was there with the same
 	// backing (SameBacking), as it was: no overlap had to be resolved and no image was made.
+	// GT7 native backend N4 (any thread): the registered image with the same backing as `info`,
+	// or an invalid id. Nothing is made, merged or touched: FindImage's first step only.
+	[[nodiscard]] ImageId LookupImage(const ImageInfo& info);
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
 	                                      bool* same_backing = nullptr);
 	void                        UpdateImage(ImageId id);

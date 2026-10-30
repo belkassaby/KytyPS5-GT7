@@ -73,6 +73,10 @@ void NoteTemplate(uint64_t programs, uint64_t pipeline);
 // N3 step 3 (KYTY_GT7_NATIVE_RECORDS=use): the record's prepared stage (ShaderType `stage`: the
 // pixel stage, or the vertex one) for ProgramCache to take in place of its walk, or null.
 [[nodiscard]] bool                                RecordsUse();
+// N4, GPU thread: the learned key of the current marked draw's stage (0 vertex, 1 pixel), or 0;
+// and the images its bindings got, compared with the ones its record found.
+[[nodiscard]] uint64_t CurrentLearnedKey(uint32_t stage);
+void                   CompareRecordImages(const uint32_t* image_ids, uint32_t count);
 [[nodiscard]] Libs::Graphics::DrawPrep::StageResult* TakeRecordStage(uint32_t stage);
 void OnStageWalk(uint32_t stage, const Libs::Graphics::Gt7NativeWalk::Learned& learned,
                  uint64_t hash);
