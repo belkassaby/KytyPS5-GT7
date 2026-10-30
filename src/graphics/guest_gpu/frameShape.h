@@ -29,6 +29,12 @@ void NoteCx(const void* processor, uint32_t reg, uint32_t value);
 void NoteSh(const void* processor, uint32_t reg, uint32_t value);
 void OnDraw(const void* processor);
 void OnDispatch(const void* processor);
+// Parallel execution slice 1, measured first: every packet the GPU thread's command processor
+// runs. Packets with no effect besides register state, draws and dispatches (register writes,
+// index and instance state, indirect buffers, markers) extend a chunk; any other packet (labels,
+// waits, DMA, event writes, cache actions) ends it. A "Chunks:" line every 10 s: chunks a frame,
+// commands by their chunk's length, and the packets that end chunks.
+void OnPacket(const void* processor, uint32_t opcode, uint32_t custom);
 
 } // namespace Libs::Graphics::FrameShape
 

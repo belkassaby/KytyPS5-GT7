@@ -4,6 +4,7 @@
 #include "common/perfStats.h"
 #include "graphics/guest_gpu/pm4.h"
 
+#include <algorithm>
 #include <array>
 #include <bitset>
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <string_view>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -52,6 +54,7 @@ struct ProcessorState {
 	uint64_t depth_base  = 0;
 	uint64_t run_target  = UINT64_MAX; // the target of the current run (color ^ depth << 1)
 	uint64_t run_draws   = 0;
+	uint64_t chunk_commands = 0; // draws and dispatches since the last packet with effects
 	bool     seen_submit = false;
 };
 
@@ -68,6 +71,11 @@ struct Totals {
 	// Draws (dispatches for the CS program) whose key register no packet of their submission
 	// wrote / of their indirect buffer (draws in one).
 	std::array<uint64_t, Keys> inherited_submission {}, inherited_buffer {};
+	// Slice 1: chunks of pure packets, commands by their chunk's length, and what ended them
+	// (opcode << 8 | custom code: chunks ended, commands in them).
+	uint64_t                                                 chunks = 0;
+	std::array<uint64_t, Buckets>                            commands_by_chunk {};
+	std::unordered_map<uint32_t, std::pair<uint64_t, uint64_t>> enders;
 	uint64_t                   in_buffer = 0, dispatches_in_buffer = 0;
 	uint32_t                   first_frame = 0, last_frame = 0;
 	std::chrono::steady_clock::time_point last {};
@@ -125,6 +133,21 @@ std::string Shares(const std::array<uint64_t, Buckets>& counts) {
 	return out;
 }
 
+std::string Enders(const Totals& t) {
+	std::vector<std::pair<uint32_t, std::pair<uint64_t, uint64_t>>> list(t.enders.begin(),
+	                                                                     t.enders.end());
+	std::sort(list.begin(), list.end(),
+	          [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+	std::string out;
+	for (size_t i = 0; i < list.size() && i < 12; i++) {
+		const auto key = list[i].first;
+		out += fmt::format("{}{:02x}{} {} ({} commands)", i == 0 ? "" : ", ", key >> 8u,
+		                   (key & 0xffu) != 0 ? fmt::format("/r{:02x}", key & 0xffu) : "",
+		                   list[i].second.first, list[i].second.second);
+	}
+	return out;
+}
+
 void ReportIfDue(uint32_t frame) {
 	auto&      t   = g_totals;
 	const auto now = std::chrono::steady_clock::now();
@@ -169,6 +192,10 @@ void ReportIfDue(uint32_t frame) {
 	    static_cast<double>(t.dispatches) / frames, static_cast<double>(t.target_runs) / frames,
 	    Shares(t.draws_by_submission), Shares(t.draws_by_buffer), Shares(t.draws_by_run), Shares(t.dispatches_by_submission),
 	    inherited));
+	Log::WriteUnmuted(fmt::format(
+	    "Chunks ({:.0f} frames): {:.1f} a frame with commands | commands by their chunk's: {} | "
+	    "ended by (opcode/custom code: chunks with commands, their commands): {}\n",
+	    frames, static_cast<double>(t.chunks) / frames, Shares(t.commands_by_chunk), Enders(t)));
 	t             = {};
 	t.last        = now;
 	t.first_frame = frame;
@@ -269,6 +296,7 @@ void OnDraw(const void* processor) {
 	auto& s = State(processor);
 	s.draws++;
 	s.buffer_draws++;
+	s.chunk_commands++;
 	g_totals.draws++;
 	g_totals.in_buffer += s.in_buffer ? 1 : 0;
 	const uint64_t target = s.color_base ^ (s.depth_base << 1u);
@@ -292,9 +320,58 @@ void OnDraw(const void* processor) {
 	               s.cx_buffer[Pm4::PA_CL_VPORT_XSCALE]);
 }
 
+void OnPacket(const void* processor, uint32_t opcode, uint32_t custom) {
+	bool pure = false;
+	switch (opcode) {
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_SET_CONFIG_REG:
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_INDIRECT_BUFFER: pure = true; break;
+		case Pm4::IT_NOP:
+			pure = custom == Pm4::R_ZERO || custom == Pm4::R_GT7_DRAW ||
+			       custom == Pm4::R_PUSH_MARKER || custom == Pm4::R_POP_MARKER ||
+			       custom == Pm4::R_DRAW_RESET || custom == Pm4::R_DISPATCH_RESET ||
+			       custom == Pm4::R_CONTEXT_STATE;
+			break;
+		default: break;
+	}
+	if (pure) {
+		return;
+	}
+	auto& s = State(processor);
+	if (s.chunk_commands != 0) {
+		g_totals.chunks++;
+		g_totals.commands_by_chunk[Bucket(s.chunk_commands)] += s.chunk_commands;
+		auto& ender = g_totals.enders[opcode << 8u | (opcode == Pm4::IT_NOP ? custom : 0u)];
+		ender.first++;
+		ender.second += s.chunk_commands;
+	}
+	s.chunk_commands = 0;
+}
+
 void OnDispatch(const void* processor) {
 	auto& s = State(processor);
 	s.dispatches++;
+	s.chunk_commands++;
 	g_totals.dispatches++;
 	g_totals.dispatches_in_buffer += s.in_buffer ? 1 : 0;
 	CountInherited(s, CsProgram, s.sh_submission[Pm4::COMPUTE_PGM_LO],

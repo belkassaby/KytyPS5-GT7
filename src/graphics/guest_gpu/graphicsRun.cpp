@@ -1278,6 +1278,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
+		if (FrameShape::Enabled()) {
+			FrameShape::OnPacket(this, opcode, KYTY_PM4_R(packet_header));
+		}
+
 		auto handler = g_cp_op_func[opcode];
 
 		if (handler == nullptr) {

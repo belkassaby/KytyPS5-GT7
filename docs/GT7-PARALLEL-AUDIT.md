@@ -114,3 +114,27 @@ not on the critical path.
 3. **Two executors**: alternate chunks on a second thread, with sections 1, 4 (image binding
    state), 5 (syncs ahead) and 6 made safe. Mutating draws end their chunk and run in order.
 4. Then N executors, and dispatches.
+
+## Slice 1, measured: chunks between packets with effects (2026-10-30, music rally race)
+
+`KYTY_FRAME_SHAPE=1`, "Chunks:" line (`FrameShape::OnPacket`): packets that only set state,
+draw or dispatch extend a chunk; any other ends it. About **540 chunks a frame** hold draws or
+dispatches (graphics stream and compute queues). Commands by their chunk's length: 1: 8 %,
+2-3: 2 %, 4-15: 7 %, 16-63: 21 to 27 %, 64-255: 21 to 33 %, 256 or more: 29 to 37 %.
+
+What ends them, a frame:
+
+| packet | chunks | commands each | what it is |
+|---|---|---|---|
+| `NOP` / `R_RELEASE_MEM` (0x10/r18) | ~210 | ~6 | an end-of-pipe label write or cache action |
+| `EVENT_WRITE` (0x46) | ~180 | ~9 | a cache flush or partial flush (a barrier) |
+| `WRITE_DATA` (0x37) | ~90 | 1 | a compute queue's dispatch, then a label |
+| `WAIT_REG_MEM_64` (0x93) | ~60 | ~40 | a wait on memory (another queue's label) |
+
+So the frame cannot be cut only where nothing happens: the releases and event writes come every
+6 to 9 commands. They are things an executor can do **in order inside its chunk**: a release is
+a label written when the work before it completes (Kyty records it against the command buffer's
+tick), an event write a barrier in the chunk's own command buffer. The hard boundaries are the
+**~60 waits a frame** (cross-queue dependencies), with ~40 commands each, plus the render target
+changes. Executors therefore replay release, event and write-data packets themselves; a chunk
+ends at a wait, at a render target change, or at a draw that creates or drops images.
