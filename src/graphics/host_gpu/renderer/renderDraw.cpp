@@ -44,6 +44,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "loader/gt7NativeDraws.h"
+#include "graphics/host_gpu/renderer/drawMutations.h"
 
 #include <algorithm>
 #include <array>
@@ -3058,6 +3059,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (repeats) {
 		repeat_start = GpuPhases::Now();
 	}
+	// the draw's recording starts here (DrawMutations: what follows is its record phase)
+	DrawMutations::t_phase = 1;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);

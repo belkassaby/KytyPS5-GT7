@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/drawMutations.h"
 
 #include <algorithm>
 #include <array>
@@ -309,6 +310,7 @@ vk::Sampler SamplerCache::FindOrCreate(const vk::SamplerCreateInfo& info) {
 		}
 	}
 	vk::Sampler vk_sampler = nullptr;
+	DrawMutations::Note(DrawMutations::NewSampler);
 	const auto  result     = m_graphics.device.createSampler(&info, nullptr, &vk_sampler);
 	if (result != vk::Result::eSuccess || vk_sampler == nullptr) {
 		// The nearest of the same discrete state, or else any of the same kind (compare and

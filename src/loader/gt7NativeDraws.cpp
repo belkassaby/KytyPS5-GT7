@@ -112,37 +112,53 @@ KYTY_SYSV_ABI void OnMeshDraw(uint64_t mesh) {
 	t_identity.mesh = mesh;
 }
 
-// Milestone 4, measured first: what marked draws changed in the renderer's shared state
-// (Libs::Graphics::DrawMutations), by kind, and how many changed nothing
+// Milestone 4: what marked draws wrote in the renderer's shared state
+// (Libs::Graphics::DrawMutations), by kind and phase (prepare, record), and how many wrote nothing
 namespace Mutations = Libs::Graphics::DrawMutations;
-std::array<std::atomic<uint64_t>, Mutations::Count> g_mutation_counts {};
-std::atomic<uint64_t>                               g_mutation_draws {0};
-std::atomic<uint64_t>                               g_pure_draws {0};
-std::atomic<uint64_t>                               g_pure_ns {0};
-std::atomic<uint64_t>                               g_impure_ns {0};
+std::array<std::array<std::atomic<uint64_t>, Mutations::Count>, 2> g_mutation_counts {};
+std::atomic<uint64_t> g_mutation_draws {0};
+std::atomic<uint64_t> g_prepare_pure {0}; // nothing written while preparing
+std::atomic<uint64_t> g_record_pure {0};  // nothing written while recording
+std::atomic<uint64_t> g_pure_draws {0};   // neither
+std::atomic<uint64_t> g_pure_ns {0};
+std::atomic<uint64_t> g_impure_ns {0};
 
 void ReportMutations() {
-	static std::array<uint64_t, Mutations::Count> last {};
-	static uint64_t last_draws = 0, last_pure = 0, last_pure_ns = 0, last_impure_ns = 0;
+	static std::array<std::array<uint64_t, Mutations::Count>, 2> last {};
+	static uint64_t last_draws = 0, last_prepare = 0, last_record = 0, last_pure = 0,
+	                last_pure_ns = 0, last_impure_ns = 0;
 	const auto draws = g_mutation_draws.load(), pure = g_pure_draws.load();
+	const auto prepare = g_prepare_pure.load(), record = g_record_pure.load();
 	const auto pure_ns = g_pure_ns.load(), impure_ns = g_impure_ns.load();
 	const auto n       = static_cast<double>(std::max<uint64_t>(draws - last_draws, 1));
 	const auto p       = static_cast<double>(pure - last_pure);
-	const char* names[Mutations::Count] = {"barrier", "render pass", "new image", "image upload",
-	                                       "new buffer", "buffer upload", "new pipeline"};
-	std::string kinds;
-	for (uint32_t i = 0; i < Mutations::Count; i++) {
-		const auto now = g_mutation_counts[i].load();
-		kinds += fmt::format("{}{} {:.1f}%", i == 0 ? "" : ", ", names[i],
-		                     100.0 * static_cast<double>(now - last[i]) / n);
-		last[i] = now;
+	const char* names[Mutations::Count] = {"barrier",      "render pass",   "new image",
+	                                       "image upload", "new buffer",    "buffer upload",
+	                                       "new pipeline", "program entry", "texture desc",
+	                                       "texture memo", "new sampler"};
+	std::string kinds[2];
+	for (uint32_t phase = 0; phase < 2; phase++) {
+		for (uint32_t i = 0; i < Mutations::Count; i++) {
+			const auto now = g_mutation_counts[phase][i].load();
+			const auto pct = 100.0 * static_cast<double>(now - last[phase][i]) / n;
+			if (pct >= 0.05) {
+				kinds[phase] += fmt::format(" {} {:.1f}%", names[i], pct);
+			}
+			last[phase][i] = now;
+		}
 	}
 	Log::WriteUnmuted(fmt::format(
-	    "Native mutations: {:.0f} marked draws: {:.1f}% changed no shared state ({:.2f} us each in "
-	    "the renderer; the others {:.2f} us) | draws with each kind: {}\n",
-	    n, 100.0 * p / n, p == 0 ? 0.0 : static_cast<double>(pure_ns - last_pure_ns) / 1000.0 / p,
-	    n - p == 0 ? 0.0 : static_cast<double>(impure_ns - last_impure_ns) / 1000.0 / (n - p), kinds));
+	    "Native mutations: {:.0f} marked draws: {:.1f}% wrote no shared state while preparing, "
+	    "{:.1f}% while recording, {:.1f}% at all ({:.2f} us each in the renderer; the others {:.2f} "
+	    "us) | preparing:{} | recording:{}\n",
+	    n, 100.0 * static_cast<double>(prepare - last_prepare) / n,
+	    100.0 * static_cast<double>(record - last_record) / n, 100.0 * p / n,
+	    p == 0 ? 0.0 : static_cast<double>(pure_ns - last_pure_ns) / 1000.0 / p,
+	    n - p == 0 ? 0.0 : static_cast<double>(impure_ns - last_impure_ns) / 1000.0 / (n - p),
+	    kinds[0], kinds[1]));
 	last_draws     = draws;
+	last_prepare   = prepare;
+	last_record    = record;
 	last_pure      = pure;
 	last_pure_ns   = pure_ns;
 	last_impure_ns = impure_ns;
@@ -275,7 +291,7 @@ void OnMarker(const uint32_t* payload, uint32_t dwords) {
 
 void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count) {
 	g_draws.fetch_add(1, std::memory_order_relaxed);
-	Mutations::t_mask = 0;
+	Mutations::Reset();
 	if (!g_pending) {
 		return;
 	}
@@ -305,17 +321,25 @@ void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count) {
 
 void OnDrawDone(uint64_t renderer_ns) {
 	if (g_current_marked) {
-		const auto mask = Mutations::t_mask;
+		const auto masks = Mutations::t_masks;
 		g_mutation_draws.fetch_add(1, std::memory_order_relaxed);
-		if (mask == 0) {
+		if (masks[0] == 0) {
+			g_prepare_pure.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (masks[1] == 0) {
+			g_record_pure.fetch_add(1, std::memory_order_relaxed);
+		}
+		if ((masks[0] | masks[1]) == 0) {
 			g_pure_draws.fetch_add(1, std::memory_order_relaxed);
 			g_pure_ns.fetch_add(renderer_ns, std::memory_order_relaxed);
 		} else {
 			g_impure_ns.fetch_add(renderer_ns, std::memory_order_relaxed);
 		}
-		for (uint32_t i = 0; i < Mutations::Count; i++) {
-			if ((mask >> i) & 1u) {
-				g_mutation_counts[i].fetch_add(1, std::memory_order_relaxed);
+		for (uint32_t phase = 0; phase < 2; phase++) {
+			for (uint32_t i = 0; i < Mutations::Count; i++) {
+				if ((masks[phase] >> i) & 1u) {
+					g_mutation_counts[phase][i].fetch_add(1, std::memory_order_relaxed);
+				}
 			}
 		}
 		g_marked_draw_ns.fetch_add(renderer_ns, std::memory_order_relaxed);

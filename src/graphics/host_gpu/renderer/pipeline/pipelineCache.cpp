@@ -3924,6 +3924,7 @@ struct PipelineCache::ProgramCache {
 		runtime.page_userdata = &cache;
 		runtime.page_shift    = 12;
 		std::lock_guard walk_lock(entry.walk_mutex);
+		DrawMutations::Note(DrawMutations::ProgramEntry);
 		return ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime,
 		                                                  entry.resources, entry.specialization);
 	}
@@ -3998,6 +3999,7 @@ struct PipelineCache::ProgramCache {
 		bool       ok             = false;
 		{
 			std::lock_guard walk_lock(entry.walk_mutex);
+			DrawMutations::Note(DrawMutations::ProgramEntry);
 			ok = ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime,
 			                                                entry.resources, entry.specialization);
 		}
@@ -4311,6 +4313,7 @@ struct PipelineCache::ProgramCache {
 			return true;
 		}
 		// Swapped, not moved: the entry's old buffers go back to the scanner with the result.
+		DrawMutations::Note(DrawMutations::ProgramEntry);
 		std::swap(entry.resources, result->resources);
 		std::swap(entry.specialization, result->specialization);
 		entry.specialization_hash       = result->specialization_hash;

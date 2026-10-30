@@ -41,6 +41,7 @@
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "loader/gt7NativeDraws.h"
+#include "graphics/host_gpu/renderer/drawMutations.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1347,6 +1348,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			cache.clear();
 			GetTextureDescFront().generation++;
 		}
+		DrawMutations::Note(DrawMutations::TextureDesc);
 		cache.emplace(key, TextureDescEntry {desc, pixel_format, view_format, size.size,
 		                                     shader_conversion});
 	}
@@ -1383,6 +1385,7 @@ void RenderExecutor::RecordTextureMemo(const ShaderRecompiler::IR::ImageResource
 		entry->memo = {};
 		return;
 	}
+	DrawMutations::Note(DrawMutations::TextureMemo);
 	entry->memo = {binding.image_id,
 	               binding.image_view,
 	               binding.memo_generation,
