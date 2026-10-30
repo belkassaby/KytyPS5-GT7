@@ -115,3 +115,21 @@ scenes: within noise).
 draws from register state the draw-prep scanner keeps; the GPU thread takes a prepared draw when
 its inputs still match and prepares it itself otherwise (and when preparing it would write shared
 state), with a verify mode. Then recording on workers (secondary command buffers).
+
+### Prepare-ahead stage 2, measured: where a pixel stage's texture resolve goes
+
+`Native resolve:` (commit 9a5b9308), music rally race: a marked draw's pixel stage binds 10.8
+images in about 2.0 us: key and lookup 0.50 us (what a worker could take as is), memo checks
+0.40 us for 7.3 hits, slow path 0.5 to 0.9 us for 3.5 images, BindImage 0.28 us.
+
+`Native slow path:` (commit 13e64088) says what the slow path is: **73 % depth-compare bindings**
+(shadow maps: a 1x1 placeholder, a 2048x2048 depth, two 8704x8704 cascades, all at fixed
+addresses) and **27 % light grids** (30x17, a new per-frame address every draw). Stale memos:
+0.3 %. The memo mechanics are fine; it is these two kinds.
+
+Making depth-compare bindings memo-eligible (tried 2026-10-30, not kept) gave 0 memo hits: the
+shadow maps' T#s never find their depth image by the same backing (`TextureCache::FindImage`);
+each lookup goes through overlap resolution, which the memo leaves out by design (an alias can
+age out with nothing registered). Keeping them would need the overlap result cached with its own
+validity. Per GT7-PARALLEL-RENDERER.md, the small per-draw wins stop here: the work moves to the
+parallel renderer, where these lookups belong to the serial resolve stage, keyed by identity.
