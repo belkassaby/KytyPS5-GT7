@@ -167,3 +167,34 @@ Order:
 4. **Descriptor contents ahead.** `CommitBindings`' writes prepared as data. The GPU thread keeps
    the image transitions.
 5. **Dispatches** the same way (compute has its own scanner).
+
+## Step 3.1, measured: prepare-ahead cannot reach the target (2026-10-30)
+
+A program get on the GPU thread is ~1.06 us (2.5 a draw): key 0.10, taking the scanner's walk
+0.69, the rest ~0.27. `KYTY_DRAW_PREP_READS=1` (not kept; a race) timed the byte check inside
+the take: **0.25 us** (16 ranges, ~330 bytes on ~6 pages), 3 to 5 % failing. None of the ranges
+lay in the command memory the GPU thread executes (GT7's embedded data is outside the packet
+ranges of its command buffer pieces). Making the check free would save ~0.6 us a draw (~6 %).
+
+The rest of the take is consuming the prepared result. That is the general limit of the
+prepare-ahead model: whatever a worker prepares, the GPU thread still takes, checks and applies,
+draw by draw, and that costs about as much as moderate preparation itself. Moving the remaining
+phases ahead the same way leaves the GPU thread at ~6 to 8 us a draw at best, not ~3.
+
+**What reaches the target is parallel execution.** Several executor threads each run whole
+draws for their own chunk of the frame, with no single thread touching every draw:
+
+- **Chunks**: render target runs (79 % of draws in runs of 256 or more) and stretches of
+  dispatches between barriers. The GPU thread splits the stream at chunk boundaries and hands
+  out (register state at the chunk's start, packet range); an executor replays the chunk's
+  packets on a command processor of its own, as the draw-prep scanner already does.
+- **Recording**: each chunk into its own command buffer (dynamic rendering, so a chunk begins and
+  ends its own rendering), submitted in stream order.
+- **Shared caches** (texture, buffer, pipeline, program, descriptors): safe for concurrent use,
+  with the mutations that order matters for (uploads, layout changes, GPU-write tracking, image
+  creation over existing memory) serialized in stream order. This is the bulk of the work.
+- **Dependencies between chunks** (one writes an image or buffer another reads): barriers
+  between their command buffers, planned from what each chunk writes.
+
+With N executors the GPU thread's ~45 ms of draws and ~15 ms of dispatches a frame divide by
+about N, less the serialized part.
