@@ -138,3 +138,19 @@ tick), an event write a barrier in the chunk's own command buffer. The hard boun
 **~60 waits a frame** (cross-queue dependencies), with ~40 commands each, plus the render target
 changes. Executors therefore replay release, event and write-data packets themselves; a chunk
 ends at a wait, at a render target change, or at a draw that creates or drops images.
+
+## Slice 1, done: chunks replayed from a snapshot (2026-10-30)
+
+`KYTY_REPLAY=1` (`CommandProcessor::ReplayChunk`, graphicsRun.cpp): the GPU thread's command
+processor records a chunk's pure packets, runs all but its draws, dispatches and GT7 identity
+markers, and at the chunk's end a second processor, started from a copy of its state at the
+chunk's start, runs the recorded packets (draw-prep keys restored, the scheduler's command buffer
+bound to the replay's registers); the main processor then takes the replay's state back.
+`KYTY_REPLAY_VERIFY=1` compares context and user config registers after each replay.
+
+Music rally race and menus: ~8,000 chunks replayed every 10 s (~3.2 million packets, ~750,000
+draws and dispatches), **0 states differing** in 24 windows, the picture unchanged. Race windows:
+16.3 fps median at 11.8 us a command, as without it.
+
+This is the executor's input: (register state at a chunk's start, its packets) is enough to run
+the chunk's draws and dispatches. Next, slice 2: a command buffer per chunk, stitched in order.

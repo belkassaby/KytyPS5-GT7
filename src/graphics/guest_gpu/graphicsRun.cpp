@@ -441,6 +441,116 @@ void CommandProcessor::Reset() {
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
 }
 
+void CommandProcessor::CopyStateFrom(const CommandProcessor& other) {
+	m_ctx                              = other.m_ctx;
+	m_saved_ctx                        = other.m_saved_ctx;
+	m_context_state_pushed             = other.m_context_state_pushed;
+	m_ucfg                             = other.m_ucfg;
+	m_sh_ctx                           = other.m_sh_ctx;
+	m_user_data_marker                 = other.m_user_data_marker;
+	m_index_type_and_size              = other.m_index_type_and_size;
+	m_index_buffer_size                = other.m_index_buffer_size;
+	m_index_base_addr                  = other.m_index_base_addr;
+	m_draw_indirect_args_base_addr     = other.m_draw_indirect_args_base_addr;
+	m_dispatch_indirect_args_base_addr = other.m_dispatch_indirect_args_base_addr;
+	m_num_instances                    = other.m_num_instances;
+	m_num_instances_args               = other.m_num_instances_args;
+	m_submit_id                        = other.m_submit_id;
+	m_synthetic_occlusion_counter      = other.m_synthetic_occlusion_counter;
+	m_predicate_skip                   = other.m_predicate_skip;
+}
+
+// Parallel execution slice 1 (CommandProcessor::ReplayChunk).
+static bool ReplayEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_REPLAY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+static bool ReplayVerify() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_REPLAY_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+namespace {
+struct ReplayCounts {
+	uint64_t chunks = 0, packets = 0, commands = 0, empty = 0, checks = 0, ctx_diff = 0,
+	         ucfg_diff = 0;
+	std::chrono::steady_clock::time_point last {};
+};
+ReplayCounts g_replay_counts;
+
+void ReportReplayIfDue() {
+	auto&      c   = g_replay_counts;
+	const auto now = std::chrono::steady_clock::now();
+	if (c.last.time_since_epoch().count() == 0) {
+		c.last = now;
+		return;
+	}
+	if (now - c.last < std::chrono::seconds(10)) {
+		return;
+	}
+	LOGF("Replay (10 s): %" PRIu64 " chunks replayed (%" PRIu64 " packets, %" PRIu64
+	     " draws and dispatches), %" PRIu64 " chunks without one | verify: %" PRIu64
+	     " checks, %" PRIu64 " context and %" PRIu64 " user config states differing\n",
+	     c.chunks, c.packets, c.commands, c.empty, c.checks, c.ctx_diff, c.ucfg_diff);
+	c      = {};
+	c.last = now;
+}
+} // namespace
+
+void CommandProcessor::ReplayChunk() {
+	auto packets          = std::move(m_replay_packets);
+	m_replay_packets      = {};
+	const bool commands   = m_replay_commands;
+	m_replay_commands     = false;
+	auto&      counts     = g_replay_counts;
+	if (!commands) {
+		// Nothing skipped: this processor ran every packet of the chunk itself.
+		counts.empty++;
+		m_replay_packets = std::move(packets);
+		m_replay_packets.clear();
+		return;
+	}
+	auto& replay = *m_replay;
+	// The scheduler's command buffer reads the registers it is bound to: the replay's meanwhile.
+	GetScheduler().Begin(replay.m_ctx, replay.m_ucfg, replay.m_sh_ctx);
+	for (const auto& recorded: packets) {
+		const auto opcode = (recorded.header >> 8u) & 0xffu;
+		if (recorded.has_key) {
+			DrawPrep::SetCurrent(recorded.key);
+		}
+		(void)g_cp_op_func[opcode](replay, recorded.header, recorded.packet + 1, recorded.remaining,
+		                           recorded.total);
+		counts.commands += FrameShape::IsCommandPacket(opcode, KYTY_PM4_R(recorded.header)) &&
+		                           !(opcode == Pm4::IT_NOP)
+		                       ? 1
+		                       : 0;
+	}
+	counts.chunks++;
+	counts.packets += packets.size();
+	if (ReplayVerify()) {
+		// This processor ran the same register writes; the draws change no context or user
+		// config register (index, instance and wave state are the processor's or the shader
+		// context's).
+		counts.checks++;
+		counts.ctx_diff +=
+		    std::memcmp(&replay.m_ctx, &m_ctx, sizeof(m_ctx)) != 0 ? 1 : 0;
+		counts.ucfg_diff +=
+		    std::memcmp(&replay.m_ucfg, &m_ucfg, sizeof(m_ucfg)) != 0 ? 1 : 0;
+	}
+	CopyStateFrom(replay);
+	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
+	m_replay_packets = std::move(packets);
+	m_replay_packets.clear();
+	ReportReplayIfDue();
+}
+
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
 	switch (operation) {
 		case ContextStateOperation::Clear: m_ctx.Reset(); break;
@@ -1173,6 +1283,15 @@ void CommandProcessor::SuspendPm4() {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	// A chunk still recorded when the slice ends (its end, a yield, a suspension) runs now.
+	struct ReplayAtEnd {
+		CommandProcessor& cp;
+		~ReplayAtEnd() {
+			if (!cp.m_replay_packets.empty()) {
+				cp.ReplayChunk();
+			}
+		}
+	} replay_at_end {*this};
 	const bool draw_prep = execution.m_prep_seq != 0 && DrawPrep::Enabled();
 	if (DrawPrep::Enabled() && !draw_prep) {
 		DrawPrep::ClearCurrent();
@@ -1280,6 +1399,43 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		if (FrameShape::Enabled()) {
 			FrameShape::OnPacket(this, opcode, KYTY_PM4_R(packet_header));
+		}
+
+		// Parallel execution slice 1 (ReplayChunk): a chunk's draws and dispatches are skipped
+		// here and run by the replay at the chunk's end.
+		if (ReplayEnabled()) {
+			const uint32_t custom = KYTY_PM4_R(packet_header);
+			if (FrameShape::IsPurePacket(opcode, custom)) {
+				if (opcode != Pm4::IT_INDIRECT_BUFFER) {
+					if (m_replay_packets.empty()) {
+						if (m_replay == nullptr) {
+							m_replay =
+							    std::make_unique<CommandProcessor>(m_renderer, m_interrupt_event_id);
+						}
+						m_replay->CopyStateFrom(*this);
+					}
+					ReplayPacket recorded {.packet    = packet,
+					                       .header    = packet_header & ~1u,
+					                       .remaining = remaining_dw,
+					                       .total     = total_dw};
+					if (draw_prep && DrawPrep::CountsAsDrawOrDispatch(opcode)) {
+						recorded.has_key = true;
+						recorded.key     = *DrawPrep::Current();
+					}
+					m_replay_packets.push_back(recorded);
+				}
+				if (FrameShape::IsCommandPacket(opcode, custom)) {
+					m_replay_commands = true;
+					cursor.offset_dw += KYTY_PM4_LEN(packet_header);
+					execution.m_made_progress = true;
+					execution.m_yield_packets++;
+					continue;
+				}
+			} else if (!m_replay_packets.empty()) {
+				ReplayChunk();
+				// A replayed draw cannot suspend the stream: its packet is behind the cursor.
+				EXIT_IF(execution.m_suspended);
+			}
 		}
 
 		auto handler = g_cp_op_func[opcode];

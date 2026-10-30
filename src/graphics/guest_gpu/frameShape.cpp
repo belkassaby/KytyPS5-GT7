@@ -320,8 +320,7 @@ void OnDraw(const void* processor) {
 	               s.cx_buffer[Pm4::PA_CL_VPORT_XSCALE]);
 }
 
-void OnPacket(const void* processor, uint32_t opcode, uint32_t custom) {
-	bool pure = false;
+bool IsPurePacket(uint32_t opcode, uint32_t custom) {
 	switch (opcode) {
 		case Pm4::IT_SET_SH_REG_INDIRECT:
 		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
@@ -331,6 +330,23 @@ void OnPacket(const void* processor, uint32_t opcode, uint32_t custom) {
 		case Pm4::IT_SET_UCONFIG_REG:
 		case Pm4::IT_SET_UCONFIG_REG_INDEX:
 		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_INDIRECT_BUFFER: return true;
+		case Pm4::IT_NOP:
+			return custom == Pm4::R_ZERO || custom == Pm4::R_PUSH_MARKER ||
+			       custom == Pm4::R_POP_MARKER || custom == Pm4::R_DRAW_RESET ||
+			       custom == Pm4::R_DISPATCH_RESET || custom == Pm4::R_CONTEXT_STATE ||
+			       IsCommandPacket(opcode, custom);
+		default: return IsCommandPacket(opcode, custom);
+	}
+}
+
+bool IsCommandPacket(uint32_t opcode, uint32_t custom) {
+	switch (opcode) {
 		case Pm4::IT_DRAW_INDIRECT:
 		case Pm4::IT_DRAW_INDEX_INDIRECT:
 		case Pm4::IT_DRAW_INDEX_2:
@@ -339,21 +355,14 @@ void OnPacket(const void* processor, uint32_t opcode, uint32_t custom) {
 		case Pm4::IT_DRAW_INDEX_OFFSET_2:
 		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
 		case Pm4::IT_DISPATCH_DIRECT:
-		case Pm4::IT_DISPATCH_INDIRECT:
-		case Pm4::IT_INDEX_TYPE:
-		case Pm4::IT_INDEX_BASE:
-		case Pm4::IT_INDEX_BUFFER_SIZE:
-		case Pm4::IT_NUM_INSTANCES:
-		case Pm4::IT_SET_BASE:
-		case Pm4::IT_INDIRECT_BUFFER: pure = true; break;
-		case Pm4::IT_NOP:
-			pure = custom == Pm4::R_ZERO || custom == Pm4::R_GT7_DRAW ||
-			       custom == Pm4::R_PUSH_MARKER || custom == Pm4::R_POP_MARKER ||
-			       custom == Pm4::R_DRAW_RESET || custom == Pm4::R_DISPATCH_RESET ||
-			       custom == Pm4::R_CONTEXT_STATE;
-			break;
-		default: break;
+		case Pm4::IT_DISPATCH_INDIRECT: return true;
+		case Pm4::IT_NOP: return custom == Pm4::R_GT7_DRAW;
+		default: return false;
 	}
+}
+
+void OnPacket(const void* processor, uint32_t opcode, uint32_t custom) {
+	const bool pure = IsPurePacket(opcode, custom);
 	if (pure) {
 		return;
 	}

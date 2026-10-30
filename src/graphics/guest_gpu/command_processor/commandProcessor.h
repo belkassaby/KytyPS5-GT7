@@ -3,10 +3,12 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <chrono>
+#include <memory>
 #include <cstdint>
 #include <source_location>
 #include <span>
@@ -93,6 +95,9 @@ public:
 
 	void Reset();
 	void ApplyContextStateOperation(ContextStateOperation operation);
+	// Parallel execution slice 1 (KYTY_REPLAY=1; docs/GT7-PARALLEL-AUDIT.md): the state a draw or
+	// dispatch reads (registers, index and instance state), copied from another processor.
+	void CopyStateFrom(const CommandProcessor& other);
 
 	void            BufferInit();
 	void            BufferFlush();
@@ -252,6 +257,24 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+
+	// Parallel execution slice 1 (KYTY_REPLAY=1): ProcessPm4 records a chunk's packets that only
+	// set state, draw or dispatch, running all but the draws and dispatches; at the chunk's end
+	// (a packet with other effects, or the end of the slice) a second processor, started from a
+	// copy of this one's state at the chunk's start, runs the recorded packets, draws included,
+	// and this one takes its state back. Still on the GPU thread: the executor's input, checked.
+	struct ReplayPacket {
+		const uint32_t* packet    = nullptr;
+		uint32_t        header    = 0;
+		uint32_t        remaining = 0;
+		uint32_t        total     = 0;
+		bool            has_key   = false;
+		DrawPrep::Key   key;
+	};
+	std::unique_ptr<CommandProcessor> m_replay;
+	std::vector<ReplayPacket>         m_replay_packets;
+	bool                              m_replay_commands = false; // a draw or dispatch recorded
+	void ReplayChunk();
 };
 
 } // namespace Libs::Graphics

@@ -35,6 +35,11 @@ void OnDispatch(const void* processor);
 // waits, DMA, event writes, cache actions) ends it. A "Chunks:" line every 10 s: chunks a frame,
 // commands by their chunk's length, and the packets that end chunks.
 void OnPacket(const void* processor, uint32_t opcode, uint32_t custom);
+// The packet classes OnPacket and the replay (KYTY_REPLAY) use: one that only sets state, draws or
+// dispatches; and of those, a draw, a dispatch or the GT7 identity marker (what the replay runs
+// and the main processor skips).
+[[nodiscard]] bool IsPurePacket(uint32_t opcode, uint32_t custom);
+[[nodiscard]] bool IsCommandPacket(uint32_t opcode, uint32_t custom);
 
 } // namespace Libs::Graphics::FrameShape
 
