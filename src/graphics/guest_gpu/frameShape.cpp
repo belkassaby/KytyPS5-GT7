@@ -345,6 +345,11 @@ bool IsPurePacket(uint32_t opcode, uint32_t custom) {
 	}
 }
 
+bool IsSoftPacket(uint32_t opcode, uint32_t custom) {
+	return opcode == Pm4::IT_EVENT_WRITE || opcode == Pm4::IT_RELEASE_MEM ||
+	       (opcode == Pm4::IT_NOP && custom == Pm4::R_RELEASE_MEM);
+}
+
 bool IsCommandPacket(uint32_t opcode, uint32_t custom) {
 	switch (opcode) {
 		case Pm4::IT_DRAW_INDIRECT:

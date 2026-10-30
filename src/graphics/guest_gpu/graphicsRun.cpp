@@ -459,6 +459,7 @@ void CommandProcessor::CopyStateFrom(const CommandProcessor& other) {
 	m_submit_id                        = other.m_submit_id;
 	m_synthetic_occlusion_counter      = other.m_synthetic_occlusion_counter;
 	m_predicate_skip                   = other.m_predicate_skip;
+	m_flip                             = other.m_flip;
 }
 
 // Parallel execution slice 1 (CommandProcessor::ReplayChunk).
@@ -488,6 +489,15 @@ static bool ChunkImagesEnabled() {
 	return on;
 }
 
+// Slice 3 (FrameShape::IsSoftPacket): releases and event writes run in the replay, inside chunks.
+static bool ReplaySoftEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_REPLAY_SOFT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
 static bool ReplayVerify() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_REPLAY_VERIFY");
@@ -499,7 +509,7 @@ static bool ReplayVerify() {
 namespace {
 struct ReplayCounts {
 	uint64_t chunks = 0, packets = 0, commands = 0, empty = 0, checks = 0, ctx_diff = 0,
-	         ucfg_diff = 0, lists = 0;
+	         ucfg_diff = 0, lists = 0, soft = 0;
 	std::chrono::steady_clock::time_point last {};
 };
 ReplayCounts g_replay_counts;
@@ -528,10 +538,11 @@ void ReportReplayIfDue() {
 	     images.verify_accesses - last_images.verify_accesses);
 	last_images = images;
 	LOGF("Replay (10 s): %" PRIu64 " chunks replayed (%" PRIu64 " packets, %" PRIu64
-	     " draws and dispatches; %" PRIu64 " in command lists), %" PRIu64
+	     " draws and dispatches, %" PRIu64 " releases and event writes; %" PRIu64
+	     " in command lists), %" PRIu64
 	     " chunks without one | verify: %" PRIu64
 	     " checks, %" PRIu64 " context and %" PRIu64 " user config states differing\n",
-	     c.chunks, c.packets, c.commands, c.lists, c.empty, c.checks, c.ctx_diff, c.ucfg_diff);
+	     c.chunks, c.packets, c.commands, c.soft, c.lists, c.empty, c.checks, c.ctx_diff, c.ucfg_diff);
 	c      = {};
 	c.last = now;
 }
@@ -574,6 +585,7 @@ void CommandProcessor::ReplayChunk() {
 		}
 		(void)g_cp_op_func[opcode](replay, recorded.header, recorded.packet + 1, recorded.remaining,
 		                           recorded.total);
+		counts.soft += FrameShape::IsSoftPacket(opcode, KYTY_PM4_R(recorded.header)) ? 1 : 0;
 		counts.commands += FrameShape::IsCommandPacket(opcode, KYTY_PM4_R(recorded.header)) &&
 		                           !(opcode == Pm4::IT_NOP)
 		                       ? 1
@@ -1460,7 +1472,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		// here and run by the replay at the chunk's end.
 		if (ReplayEnabled()) {
 			const uint32_t custom = KYTY_PM4_R(packet_header);
-			if (FrameShape::IsPurePacket(opcode, custom)) {
+			const bool     soft   = ReplaySoftEnabled() && FrameShape::IsSoftPacket(opcode, custom);
+			if (soft || FrameShape::IsPurePacket(opcode, custom)) {
 				if (opcode != Pm4::IT_INDIRECT_BUFFER) {
 					if (m_replay_packets.empty()) {
 						if (m_replay == nullptr) {
@@ -1479,7 +1492,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 					}
 					m_replay_packets.push_back(recorded);
 				}
-				if (FrameShape::IsCommandPacket(opcode, custom)) {
+				if (soft || FrameShape::IsCommandPacket(opcode, custom)) {
 					m_replay_commands = true;
 					cursor.offset_dw += KYTY_PM4_LEN(packet_header);
 					execution.m_made_progress = true;
