@@ -152,3 +152,23 @@ shadow only tracks what `gt7_SetUserData` writes. So the record's user data has 
 from GT7's **bind calls** as they write, per stage and SGPR: hooks on the writers the decompile
 names, building the render thread's own complete copy, checked against Kyty's SGPRs until it
 matches every draw.
+
+## N3 step 1, done: the engine's user data is exactly the draw's (2026-10-30)
+
+The mismatches were the comparison's: Kyty keeps, per stage, the highest SGPR ever written (with
+the stale values of other shaders above the current one's), while the hardware loads only the
+user SGPRs the shader declares (`RSRC2.USER_SGPR`). Compared on those, picking each record's
+stages by shader type (the header's byte at `+0x5a`: GT7 stage 1 is the PS, stage 0 the GS,
+stage 4 a GS in a few draws), race, 10 s windows of 610,000 to 720,000 stages (~7 SGPRs each):
+
+**100.00 % of stages, every SGPR as the engine's shadow, 0 differing.**
+
+Every SGPR writer found goes through the shadow (`gt7_BindTexture`, `gt7_BindSampler`, the
+material block, the constants' descriptor), and `gt7_WriteStageUserData` writes the changed ones
+from it. A GS-back or HS-back shader (types 6, 7; none among the marked draws) takes its 32
+through memory, with SGPRs 0-1 pointing at them (`gt7_SetBackUserDataPointer`).
+
+So the render thread holds, at each marker, the exact per-draw inputs of the vertex and pixel
+stages, in engine terms (which SGPR is which texture, sampler, block, table is known from the
+binds). Next, N3 step 2: the descriptor walk on the render thread from this user data, with each
+program's resource plan, checked against Kyty's walk of the same draw.

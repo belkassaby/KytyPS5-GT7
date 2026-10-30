@@ -177,12 +177,15 @@ struct RecordStage {
 };
 // N3 step 1: each stage's user-data SGPRs 0-31 from the engine's shadow (GT7StageBinding +0x18),
 // compared at the draw with the SGPRs Kyty's command processor holds.
-constexpr uint64_t StageUserData = 0x18;
+constexpr uint64_t StageUserData    = 0x18;
+constexpr uint64_t ShaderTypeOffset = 0x5a; // in the AGC shader header
 struct Record {
 	uint64_t    serial = 0;
 	RecordStage stages[2];
 	uint32_t    user[2][32] {};
 	bool        has_user[2] {};
+	uint8_t     user_type[2] {};  // the shader's type (ShaderBinaryType)
+	uint8_t     user_stage[2] {}; // the GT7 stage it came from
 };
 struct RecordRing {
 	std::unique_ptr<uint8_t[]> bytes {new uint8_t[RingBytes]};
@@ -225,14 +228,28 @@ uint64_t MakeRecord() {
 	auto*   base   = ring.bytes.get() + ring.head;
 	auto*   record = new (base) Record {};
 	record->serial = g_record_serials.fetch_add(1, std::memory_order_relaxed) + 1;
-	for (uint32_t s = 0; s < 2; s++) {
+	// The hardware stage is the shader's type (its header's byte at +0x5a), not the GT7 stage's
+	// index: the pixel stage is the one whose shader is a PS (1), the vertex stage the first GS
+	// (2, 4 or 6). A GS-back's (6) user data goes through memory (gt7_WriteStageUserData), not
+	// SGPRs: counted apart.
+	for (uint32_t s = 0; s < 6; s++) {
 		const uint8_t* stage  = t_ctx + CtxStages + s * CtxStageSize;
 		uint64_t       shader = 0;
 		std::memcpy(&shader, stage, sizeof(shader));
-		if (shader != 0) {
-			std::memcpy(record->user[s], stage + StageUserData, sizeof(record->user[s]));
-			record->has_user[s] = true;
+		if (shader == 0) {
+			continue;
 		}
+		const uint8_t type = *reinterpret_cast<const uint8_t*>(shader + ShaderTypeOffset);
+		const int     hw   = type == 1                           ? 1
+		                     : (type == 2 || type == 4 || type == 6) ? 0
+		                                                         : -1;
+		if (hw < 0 || record->has_user[hw]) {
+			continue;
+		}
+		std::memcpy(record->user[hw], stage + StageUserData, sizeof(record->user[hw]));
+		record->has_user[hw]   = true;
+		record->user_type[hw]  = type;
+		record->user_stage[hw] = static_cast<uint8_t>(s);
 	}
 	uint32_t offset = sizeof(Record);
 	for (uint32_t s = 0; s < 2; s++) {
@@ -260,6 +277,8 @@ std::atomic<uint64_t> g_n3_draws {0}, g_n3_stale {0}, g_n3_stages {0}, g_n3_addr
 // Step 1: stages compared, stages whose SGPRs all matched, SGPRs compared, and per SGPR index the
 // mismatches (vertex stage, pixel stage).
 std::atomic<uint64_t> g_user_stages {0}, g_user_stages_same {0}, g_user_sgprs {0};
+// by the shader's type (0..8) and GT7 stage (0..5): stages compared, all SGPRs the same
+std::array<std::array<std::atomic<uint64_t>, 6>, 9> g_user_by_type {}, g_user_same_by_type {};
 std::array<std::array<std::atomic<uint64_t>, 32>, 2> g_user_diff {};
 
 void CheckRecord(uint64_t record_address, uint64_t serial, const uint32_t* const sgprs[2],
@@ -297,8 +316,12 @@ void CheckRecord(uint64_t record_address, uint64_t serial, const uint32_t* const
 		}
 		g_user_stages.fetch_add(1, std::memory_order_relaxed);
 		g_user_sgprs.fetch_add(count, std::memory_order_relaxed);
+		const uint32_t type  = std::min<uint32_t>(record->user_type[s], 8);
+		const uint32_t index = std::min<uint32_t>(record->user_stage[s], 5);
+		g_user_by_type[type][index].fetch_add(1, std::memory_order_relaxed);
 		if (same) {
 			g_user_stages_same.fetch_add(1, std::memory_order_relaxed);
+			g_user_same_by_type[type][index].fetch_add(1, std::memory_order_relaxed);
 		}
 	}
 	for (uint32_t s = 0; s < 2; s++) {
@@ -355,6 +378,23 @@ void ReportRecords() {
 			last_diff[s][i] = now_diff;
 		}
 	}
+	static std::array<std::array<uint64_t, 6>, 9> last_by {}, last_same_by {};
+	std::string                                   by_type;
+	for (uint32_t t = 0; t < 9; t++) {
+		for (uint32_t i = 0; i < 6; i++) {
+			const uint64_t all  = g_user_by_type[t][i].load();
+			const uint64_t same = g_user_same_by_type[t][i].load();
+			if (all != last_by[t][i]) {
+				by_type += fmt::format(" type {} stage {}: {} ({:.1f}% same)", t, i, all - last_by[t][i],
+				                       100.0 * static_cast<double>(same - last_same_by[t][i]) /
+				                           static_cast<double>(all - last_by[t][i]));
+			}
+			last_by[t][i]      = all;
+			last_same_by[t][i] = same;
+		}
+	}
+	Log::WriteUnmuted(fmt::format("Native records N3 user data by shader type and GT7 stage:{}\n",
+	                              by_type.empty() ? " none" : by_type));
 	Log::WriteUnmuted(fmt::format(
 	    "Native records N3 user data (10 s): {:.0f} stages compared, {:.2f}% with every SGPR as "
 	    "the engine's shadow, {:.1f} SGPRs each | differing SGPRs (stage, index: count):{}\n",

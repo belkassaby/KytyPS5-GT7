@@ -1647,9 +1647,13 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		     args.base_vertex, args.first_instance);
 	}
 	if (::Loader::Gt7NativeDraws::Enabled()) {
-		const auto& ps = GetShCtx().GetPs().ps_user_sgpr;
-		const auto& gs = GetShCtx().GetVs().gs_user_sgpr;
-		::Loader::Gt7NativeDraws::OnDraw(ps.value, ps.count, gs.value, gs.count);
+		// The user SGPRs each shader declares (RSRC2.USER_SGPR): the ones the hardware loads for
+		// this draw. The count kept with the values is the highest ever written.
+		const auto& ps       = GetShCtx().GetPs().ps_user_sgpr;
+		const auto& gs       = GetShCtx().GetVs().gs_user_sgpr;
+		const auto  ps_count = std::min<uint32_t>(ps.count, GetShCtx().GetPs().ps_regs.rsrc2.user_sgpr);
+		const auto  gs_count = std::min<uint32_t>(gs.count, GetShCtx().GetVs().gs_regs.rsrc2.user_sgpr);
+		::Loader::Gt7NativeDraws::OnDraw(ps.value, ps_count, gs.value, gs_count);
 	}
 	if (FrameShape::Enabled()) {
 		FrameShape::OnDraw(this);
