@@ -154,3 +154,39 @@ draws and dispatches), **0 states differing** in 24 windows, the picture unchang
 
 This is the executor's input: (register state at a chunk's start, its packets) is enough to run
 the chunk's draws and dispatches. Next, slice 2: a command buffer per chunk, stitched in order.
+
+## Slice 2 design: a command list per chunk, stitched in order
+
+Reading the scheduler for slice 2: with the recording thread (on by default), a command buffer's
+Vulkan commands are already a linked list of recorded lambdas in 256 KB arena chunks
+(`CommandScheduler::Record`, `Chunk`), played into the real Vulkan command buffer by the
+recording thread. Vulkan recording is not the cost (it is already off the GPU thread), so an
+executor does not need a Vulkan command buffer of its own: it needs **a command list of its
+own**, spliced into the stream in order. Splicing a linked list is free.
+
+What a chunk's recording needs, one thread first:
+
+1. **Recording target.** `CommandScheduler::Record`, `Stash` and `Allocate` write to the calling
+   thread's target: the stream (as now) or a chunk's list. A chunk ends with its rendering ended,
+   and the stitch appends its list (and hands its arena chunks to the recording thread).
+   Commands recorded through the raw `Handle()` (`DrainRecording`) in a chunk end it and run
+   in order on the stitching side.
+2. **Image states per chunk** (`Image::GetBarriers`, `backing.state`, `subresource_states`). In
+   a chunk, an image's first use takes its state from a chunk overlay instead of the image: the
+   use is assumed to find the image as it needs it (no barrier in the chunk) and the overlay
+   records that need (layout, access, stage, per subresource where partial). Later uses in the
+   chunk go through the overlay as `GetBarriers` does now. At the stitch, for each image the
+   chunk used, `GetBarriers` on the image's real state with the chunk's first need makes the
+   barriers recorded before the chunk's list; then the image's state becomes the overlay's
+   final one.
+3. **Rendering and dynamic state.** A chunk begins with no rendering open and an empty
+   `DynamicStateShadow` (which drops state calls that repeat what the command buffer holds), and
+   ends its rendering; the stitch ends the stream's rendering and resets its shadow before the
+   splice.
+4. **What stays in order on the stitching side**: anything that records through `Handle()`,
+   creates or drops images, or uploads: the chunk ends before it (on one thread, these are
+   already in order).
+
+Verify (`KYTY_REPLAY_VERIFY`): with chunk lists on, the GPU thread also runs each `GetBarriers`
+against the real image state in stream order, and the stitch checks that each image's state
+after the chunk is what the overlay says.
