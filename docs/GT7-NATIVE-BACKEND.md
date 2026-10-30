@@ -107,3 +107,26 @@ Race, 10 s windows of 300,000 to 355,000 marked draws:
 A marked draw's pipeline and programs are a function of a key GT7's render thread makes in
 0.3 us, and the keys repeat: the record's static half (pipeline, programs, material bindings)
 can be built once per key and material.
+
+## N3, first: stage constant blocks are rare (2026-10-30)
+
+`KYTY_GT7_NATIVE_RECORDS=1`: at each marker (after the commit) the render thread copies the
+vertex and pixel stages' constant blocks (`GT7StageBinding::constants`, `constants_size`) into a
+per-thread ring and the marker carries the record; the GPU thread checks at the draw that the
+stage's descriptor at `constants_slot` points at the block and that guest memory still holds the
+copy. Race, 10 s windows of 275,000 to 350,000 marked draws:
+
+| | |
+|---|---|
+| records made on the render threads | 0.06 to 0.07 us each; 0 stale on the GPU thread |
+| stages with a constant block | **only 13,000 to 17,000** (~5 % of the draws' stages; 10 to 13 bytes a record on average) |
+| of those, descriptor at the block / bytes as copied | 78 to 83 % / the same (the rest: slot past SGPR 31, `user_data_extra`) |
+| frame rate | 16.6 fps median, as without records |
+
+The stage constant blocks are the exception, not the per-draw data. A draw's inputs reach its
+shaders through its **user-data SGPRs** (the engine's shadow at `GT7StageBinding::user_data`,
+`+0x18`, 32 of them, and `user_data_extra` past them): the material's block copy (pixel SGPRs 2-3),
+transforms, and the pointers the shaders' descriptor walks follow. So the record's per-draw half
+is the stages' user data, and what their pointers lead to: the descriptor walk Kyty's scanner
+does today, done on the render thread from the engine's shadow, with each program's resource plan
+(known after its first translation).

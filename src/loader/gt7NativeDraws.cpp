@@ -15,7 +15,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -79,6 +81,15 @@ constexpr uint64_t CtxVertexEnd    = 0xde8;
 bool     g_enabled   = false;
 uint64_t g_main_base = 0;
 
+// N3 (KYTY_GT7_NATIVE_RECORDS=1): records made at the markers and checked at the draws.
+bool RecordsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_NATIVE_RECORDS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 // Game threads: the engine state the next draw marker carries.
 thread_local Identity t_identity;
 
@@ -141,6 +152,153 @@ KYTY_SYSV_ABI void OnBindMaterial(uint64_t set, uint64_t material, uint64_t /*pa
 
 KYTY_SYSV_ABI void OnMeshDraw(uint64_t mesh) {
 	t_identity.mesh = mesh;
+}
+
+// The render thread's context at its last commit (the draw that follows uses it).
+thread_local const uint8_t* t_ctx = nullptr;
+
+// N3 (docs/GT7-NATIVE-BACKEND.md): the draw's record, made on the render thread at the marker
+// (after the commit, which may renew the constants): each of the vertex (0) and pixel (1)
+// stages' constant block, copied into the thread's ring. The GPU thread checks at the draw that
+// the stage's constant buffer descriptor (its 4 SGPRs at constants_slot) points at the block, and
+// that guest memory still holds what the render thread copied. A record whose ring space was
+// reused before the GPU thread came to it is counted, not read.
+constexpr uint64_t StageConstants     = 0x10;
+constexpr uint64_t StageConstantsSlot = 0xa0;
+constexpr uint64_t StageConstantsSize = 0xa2;
+constexpr size_t   RingBytes          = size_t {64} << 20u;
+constexpr uint32_t MaxConstants       = 0x4000;
+
+struct RecordStage {
+	uint64_t guest = 0;
+	uint32_t size  = 0;
+	uint32_t slot  = 0;
+	uint32_t offset = 0; // of the copy, from the record's start
+};
+struct Record {
+	uint64_t    serial = 0;
+	RecordStage stages[2];
+};
+struct RecordRing {
+	std::unique_ptr<uint8_t[]> bytes {new uint8_t[RingBytes]};
+	size_t                     head   = 0;
+	uint64_t                   serial = 0;
+};
+thread_local RecordRing t_ring;
+std::atomic<uint64_t>   g_record_serials {0}; // serials unique across threads
+std::atomic<uint64_t>   g_records_made {0}, g_records_ns {0}, g_record_bytes {0};
+
+uint64_t MakeRecord() {
+	if (t_ctx == nullptr) {
+		return 0;
+	}
+	const auto start = std::chrono::steady_clock::now();
+	auto&      ring  = t_ring;
+	size_t     need  = sizeof(Record);
+	uint32_t   sizes[2] {};
+	uint64_t   blocks[2] {};
+	uint32_t   slots[2] {};
+	for (uint32_t s = 0; s < 2; s++) {
+		const uint8_t* stage = t_ctx + CtxStages + s * CtxStageSize;
+		uint64_t       shader = 0;
+		std::memcpy(&shader, stage, sizeof(shader));
+		std::memcpy(&blocks[s], stage + StageConstants, sizeof(uint64_t));
+		uint16_t size = 0;
+		uint16_t slot = 0;
+		std::memcpy(&size, stage + StageConstantsSize, sizeof(size));
+		std::memcpy(&slot, stage + StageConstantsSlot, sizeof(slot));
+		if (shader == 0 || blocks[s] == 0 || size == 0 || size > MaxConstants) {
+			continue;
+		}
+		sizes[s] = size;
+		slots[s] = slot;
+		need += (size + 15u) & ~15u;
+	}
+	if (ring.head + need > RingBytes) {
+		ring.head = 0;
+	}
+	auto*   base   = ring.bytes.get() + ring.head;
+	auto*   record = new (base) Record {};
+	record->serial = g_record_serials.fetch_add(1, std::memory_order_relaxed) + 1;
+	uint32_t offset = sizeof(Record);
+	for (uint32_t s = 0; s < 2; s++) {
+		if (sizes[s] == 0) {
+			continue;
+		}
+		std::memcpy(base + offset, reinterpret_cast<const void*>(blocks[s]), sizes[s]);
+		record->stages[s] = {blocks[s], sizes[s], slots[s], offset};
+		offset += (sizes[s] + 15u) & ~15u;
+		g_record_bytes.fetch_add(sizes[s], std::memory_order_relaxed);
+	}
+	ring.head += need;
+	g_records_made.fetch_add(1, std::memory_order_relaxed);
+	g_records_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                                 std::chrono::steady_clock::now() - start)
+	                                                 .count()),
+	                       std::memory_order_relaxed);
+	// The record's address and serial: the GPU thread checks the serial is still the record's.
+	return reinterpret_cast<uint64_t>(record);
+}
+
+// GPU thread, at the draw: the checks of a marked draw's record.
+std::atomic<uint64_t> g_n3_draws {0}, g_n3_stale {0}, g_n3_stages {0}, g_n3_address {0},
+    g_n3_bytes {0}, g_n3_no_slot {0};
+
+void CheckRecord(uint64_t record_address, uint64_t serial, const uint32_t* const sgprs[2],
+                 const uint32_t counts[2]) {
+	if (record_address == 0) {
+		return;
+	}
+	g_n3_draws.fetch_add(1, std::memory_order_relaxed);
+	const auto* base   = reinterpret_cast<const uint8_t*>(record_address);
+	const auto* record = reinterpret_cast<const Record*>(base);
+	if (record->serial != serial) {
+		g_n3_stale.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	for (uint32_t s = 0; s < 2; s++) {
+		const auto& stage = record->stages[s];
+		if (stage.size == 0) {
+			continue;
+		}
+		g_n3_stages.fetch_add(1, std::memory_order_relaxed);
+		if (sgprs[s] == nullptr || stage.slot + 2 > counts[s]) {
+			g_n3_no_slot.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		const uint64_t vsharp_base =
+		    (sgprs[s][stage.slot] | (static_cast<uint64_t>(sgprs[s][stage.slot + 1]) << 32u)) &
+		    0x0000FFFFFFFFFFFFull;
+		if (vsharp_base == stage.guest) {
+			g_n3_address.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (std::memcmp(base + stage.offset, reinterpret_cast<const void*>(stage.guest),
+		                stage.size) == 0) {
+			g_n3_bytes.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+}
+
+void ReportRecords() {
+	static std::array<uint64_t, 9> last {};
+	const std::array<uint64_t, 9>  now = {g_records_made.load(), g_records_ns.load(),
+	                                      g_record_bytes.load(), g_n3_draws.load(),
+	                                      g_n3_stale.load(),     g_n3_stages.load(),
+	                                      g_n3_address.load(),   g_n3_bytes.load(),
+	                                      g_n3_no_slot.load()};
+	std::array<double, 9> d {};
+	for (size_t i = 0; i < now.size(); i++) {
+		d[i]    = static_cast<double>(now[i] - last[i]);
+		last[i] = now[i];
+	}
+	const double stages = std::max(1.0, d[5]);
+	Log::WriteUnmuted(fmt::format(
+	    "Native records N3 (10 s): {:.0f} made on the render threads, {:.2f} us and {:.0f} bytes "
+	    "of constants each | GPU thread: {:.0f} marked draws with one, {:.0f} stale | {:.0f} "
+	    "stages with constants: descriptor at the block {:.2f}%, bytes as copied {:.2f}%, no "
+	    "slot {:.0f}\n",
+	    d[0], d[0] == 0 ? 0.0 : d[1] / 1000.0 / d[0], d[0] == 0 ? 0.0 : d[2] / d[0], d[3], d[4],
+	    d[5], 100.0 * d[6] / stages, 100.0 * d[7] / stages, d[8]));
 }
 
 // N1: the render thread's state key, made at every commit (the draw follows it).
@@ -245,6 +403,7 @@ void ReportKeyParts() {
 
 KYTY_SYSV_ABI void OnCommitState(const uint8_t* ctx) {
 	const auto start = std::chrono::steady_clock::now();
+	t_ctx            = ctx;
 	constexpr uint64_t Seed = 0x6a09e667f3bcc909ull;
 	std::array<uint64_t, PartCount> parts {};
 	parts[PartColor] = HashBytes(Seed, ctx + CtxTargets, CtxDepthTarget - CtxTargets);
@@ -501,6 +660,9 @@ void Report() {
 		    td[7] == 0 ? 0.0 : td[6] / 1000.0 / td[7], td[9] == 0 ? 0.0 : td[8] / 1000.0 / td[9]));
 		ReportStateKeys();
 		ReportKeyParts();
+		if (RecordsEnabled()) {
+			ReportRecords();
+		}
 		ReportCommit();
 		ReportResolve();
 		ReportMutations();
@@ -522,19 +684,26 @@ bool ForDraw(uint64_t guest_return_address, Identity* identity) {
 	}
 	t_identity.sequence++;
 	*identity = t_identity;
+	if (RecordsEnabled()) {
+		identity->record = MakeRecord();
+		if (identity->record != 0) {
+			identity->sequence = static_cast<uint32_t>(
+			    reinterpret_cast<const Record*>(identity->record)->serial);
+		}
+	}
 	g_markers_written.fetch_add(1, std::memory_order_relaxed);
 	return true;
 }
 
 void WriteMarker(uint32_t* packet, const Identity& identity) {
 	packet[0] = KYTY_PM4(MarkerDwords, Pm4::IT_NOP, Pm4::R_GT7_DRAW);
-	const uint64_t fields[6] = {identity.set,     identity.material, identity.block,
-	                            identity.shaders, identity.mesh,     identity.state};
-	for (int i = 0; i < 6; i++) {
+	const uint64_t fields[7] = {identity.set,  identity.material, identity.block, identity.shaders,
+	                            identity.mesh, identity.state,    identity.record};
+	for (int i = 0; i < 7; i++) {
 		packet[1 + i * 2] = static_cast<uint32_t>(fields[i]);
 		packet[2 + i * 2] = static_cast<uint32_t>(fields[i] >> 32u);
 	}
-	packet[13] = identity.sequence;
+	packet[15] = identity.sequence;
 }
 
 void OnMarker(const uint32_t* payload, uint32_t dwords) {
@@ -548,11 +717,13 @@ void OnMarker(const uint32_t* payload, uint32_t dwords) {
 	const auto field = [&](int i) {
 		return payload[i * 2] | (static_cast<uint64_t>(payload[i * 2 + 1]) << 32u);
 	};
-	g_pending_identity = {field(0), field(1), field(2), field(3), field(4), field(5), payload[12]};
+	g_pending_identity = {field(0), field(1), field(2), field(3),
+	                      field(4), field(5), field(6), payload[14]};
 	g_pending          = true;
 }
 
-void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count) {
+void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count, const uint32_t* gs_user_sgprs,
+            uint32_t gs_count) {
 	g_draws.fetch_add(1, std::memory_order_relaxed);
 	Mutations::Reset();
 	if (!g_pending) {
@@ -560,6 +731,14 @@ void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count) {
 	}
 	g_pending = false;
 	const auto& id = g_pending_identity;
+	if (id.record != 0) {
+		// The serial is the record's (it went into the marker's sequence dword).
+		const uint32_t* sgprs[2]  = {gs_user_sgprs, ps_user_sgprs};
+		const uint32_t  counts[2] = {gs_count, count};
+		const auto*     record    = reinterpret_cast<const Record*>(id.record);
+		CheckRecord(id.record,
+		            (record->serial & ~uint64_t {0xffffffff}) | id.sequence, sgprs, counts);
+	}
 	g_current_marked   = true;
 	g_current_identity = id;
 	g_marked.fetch_add(1, std::memory_order_relaxed);

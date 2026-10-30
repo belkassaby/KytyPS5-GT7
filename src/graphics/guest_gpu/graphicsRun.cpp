@@ -1648,7 +1648,8 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	}
 	if (::Loader::Gt7NativeDraws::Enabled()) {
 		const auto& ps = GetShCtx().GetPs().ps_user_sgpr;
-		::Loader::Gt7NativeDraws::OnDraw(ps.value, ps.count);
+		const auto& gs = GetShCtx().GetVs().gs_user_sgpr;
+		::Loader::Gt7NativeDraws::OnDraw(ps.value, ps.count, gs.value, gs.count);
 	}
 	if (FrameShape::Enabled()) {
 		FrameShape::OnDraw(this);

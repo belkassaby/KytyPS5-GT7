@@ -29,11 +29,13 @@ struct Identity {
 	// on the render thread from its GT7RenderContext at gt7_CommitDrawState (render targets,
 	// fixed-function fields, shader headers, vertex formats, primitive type); 0 without one.
 	uint64_t state    = 0;
+	// N3: the draw's record on the render thread (its constants, copied there), or 0.
+	uint64_t record   = 0;
 	uint32_t sequence = 0; // this thread's marker count
 };
 
 // The marker: header, then the identity's fields as dwords.
-constexpr uint32_t MarkerDwords = 1 + 6 * 2 + 1;
+constexpr uint32_t MarkerDwords = 1 + 7 * 2 + 1;
 
 // Agc (a game thread, in sceAgcDcbDrawIndex): the identity to mark this draw with, if the call
 // returns into GT7's engine draws.
@@ -43,7 +45,8 @@ void               WriteMarker(uint32_t* packet, const Identity& identity);
 // Command processor (the GPU thread): a marker's payload, then the next indexed draw with the
 // pixel stage's user-data SGPRs.
 void OnMarker(const uint32_t* payload, uint32_t dwords);
-void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count);
+void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count, const uint32_t* gs_user_sgprs = nullptr,
+            uint32_t gs_count = 0);
 // After the renderer's DrawIndex, with the time it took.
 void OnDrawDone(uint64_t renderer_ns);
 
