@@ -74,6 +74,8 @@ struct Totals {
 	// Slice 1: chunks of pure packets, commands by their chunk's length, and what ended them
 	// (opcode << 8 | custom code: chunks ended, commands in them).
 	uint64_t                                                 chunks = 0;
+	uint64_t graphics_chunks = 0, compute_chunks = 0;
+	uint64_t graphics_chunk_commands = 0, compute_chunk_commands = 0;
 	std::array<uint64_t, Buckets>                            commands_by_chunk {};
 	std::unordered_map<uint32_t, std::pair<uint64_t, uint64_t>> enders;
 	uint64_t                   in_buffer = 0, dispatches_in_buffer = 0;
@@ -193,9 +195,17 @@ void ReportIfDue(uint32_t frame) {
 	    Shares(t.draws_by_submission), Shares(t.draws_by_buffer), Shares(t.draws_by_run), Shares(t.dispatches_by_submission),
 	    inherited));
 	Log::WriteUnmuted(fmt::format(
-	    "Chunks ({:.0f} frames): {:.1f} a frame with commands | commands by their chunk's: {} | "
+	    "Chunks ({:.0f} frames): {:.1f} a frame with commands (graphics {:.1f} of {:.1f} commands "
+	    "each, compute {:.1f} of {:.1f}) | commands by their chunk's: {} | "
 	    "ended by (opcode/custom code: chunks with commands, their commands): {}\n",
-	    frames, static_cast<double>(t.chunks) / frames, Shares(t.commands_by_chunk), Enders(t)));
+	    frames, static_cast<double>(t.chunks) / frames,
+	    static_cast<double>(t.graphics_chunks) / frames,
+	    static_cast<double>(t.graphics_chunk_commands) /
+	        std::max<double>(1.0, static_cast<double>(t.graphics_chunks)),
+	    static_cast<double>(t.compute_chunks) / frames,
+	    static_cast<double>(t.compute_chunk_commands) /
+	        std::max<double>(1.0, static_cast<double>(t.compute_chunks)),
+	    Shares(t.commands_by_chunk), Enders(t)));
 	t             = {};
 	t.last        = now;
 	t.first_frame = frame;
@@ -347,7 +357,9 @@ bool IsPurePacket(uint32_t opcode, uint32_t custom) {
 
 bool IsSoftPacket(uint32_t opcode, uint32_t custom) {
 	return opcode == Pm4::IT_EVENT_WRITE || opcode == Pm4::IT_RELEASE_MEM ||
-	       (opcode == Pm4::IT_NOP && custom == Pm4::R_RELEASE_MEM);
+	       opcode == Pm4::IT_ACQUIRE_MEM ||
+	       (opcode == Pm4::IT_NOP &&
+	        (custom == Pm4::R_RELEASE_MEM || custom == Pm4::R_ACQUIRE_MEM));
 }
 
 bool IsCommandPacket(uint32_t opcode, uint32_t custom) {
@@ -367,13 +379,21 @@ bool IsCommandPacket(uint32_t opcode, uint32_t custom) {
 }
 
 void OnPacket(const void* processor, uint32_t opcode, uint32_t custom) {
-	const bool pure = IsPurePacket(opcode, custom);
+	// With KYTY_REPLAY_SOFT=1 the chunks the replay sees: releases and event writes inside them.
+	static const bool soft_inside = [] {
+		const char* value = std::getenv("KYTY_REPLAY_SOFT");
+		return value != nullptr && value[0] == '1';
+	}();
+	const bool pure = IsPurePacket(opcode, custom) || (soft_inside && IsSoftPacket(opcode, custom));
 	if (pure) {
 		return;
 	}
 	auto& s = State(processor);
 	if (s.chunk_commands != 0) {
 		g_totals.chunks++;
+		(s.graphics ? g_totals.graphics_chunks : g_totals.compute_chunks)++;
+		(s.graphics ? g_totals.graphics_chunk_commands : g_totals.compute_chunk_commands) +=
+		    s.chunk_commands;
 		g_totals.commands_by_chunk[Bucket(s.chunk_commands)] += s.chunk_commands;
 		auto& ender = g_totals.enders[opcode << 8u | (opcode == Pm4::IT_NOP ? custom : 0u)];
 		ender.first++;

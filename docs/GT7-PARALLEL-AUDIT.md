@@ -250,3 +250,27 @@ thread-safe at all, used by every draw and by the GPU thread's packets with effe
   stream order on the stitching side, lookups under locks, image binding state per executor,
   the renderer lock shared, program caches under shared locks.
 - **3c: two executors, then N.**
+
+## Slice 3, measured: GT7's queues synchronize ~240 times a frame (2026-10-30)
+
+With releases and event writes inside chunks (`KYTY_REPLAY_SOFT=1`, commit 1dd4dd69: verify run
+0 differing states, no hang) chunks did not get longer. The "Chunks:" line with them counted as
+inside, and slice ends as their own ender (`ff`), a music rally race:
+
+| ender | a frame | commands before it |
+|---|---|---|
+| `WAIT_REG_MEM_64` (0x93) | ~170 to 240 | 12 to 20 |
+| `NOP` / `R_ACQUIRE_MEM` (0x10/r14) | ~130 to 190 | 4 to 6 |
+| `WRITE_DATA` (0x37) | ~50 to 65 | 1 |
+| slice ends, `DMA_DATA` | a few | |
+
+Graphics stream: ~170 to 215 chunks a frame of 15 to 22 commands; compute queues: ~250 to 300
+chunks of ~4. Acquires only make a global barrier (`CpOpAcquireMem`): they go inside chunks too.
+The waits do not: each is the graphics stream waiting for a compute queue's label (or the
+reverse), read on the CPU when the wait runs, written by a release in the other queue's stream.
+GT7 hands work between its graphics and compute queues ~200 times a frame.
+
+So the frame splits naturally **by queue, not by chunk**: between two waits, the graphics
+stream's chunk and the compute queues' chunks are independent by GT7's own design (the waits
+are the dependencies, as on the console, where async compute runs beside graphics). Within one
+queue, chunks between waits are 15 to 22 commands: too short to split across executors.

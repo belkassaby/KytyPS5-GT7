@@ -1357,6 +1357,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			if (!cp.m_replay_packets.empty()) {
 				cp.ReplayChunk();
 			}
+			// FrameShape's chunks: the end of a slice ends one too ("ff").
+			if (FrameShape::Enabled()) {
+				FrameShape::OnPacket(&cp, 0xffu, 0);
+			}
 		}
 	} replay_at_end {*this};
 	const bool draw_prep = execution.m_prep_seq != 0 && DrawPrep::Enabled();

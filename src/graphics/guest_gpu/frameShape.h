@@ -41,8 +41,8 @@ void OnPacket(const void* processor, uint32_t opcode, uint32_t custom);
 [[nodiscard]] bool IsPurePacket(uint32_t opcode, uint32_t custom);
 [[nodiscard]] bool IsCommandPacket(uint32_t opcode, uint32_t custom);
 // Slice 3 (KYTY_REPLAY_SOFT=1): packets with effects the replay can run in order inside a chunk,
-// recorded into the chunk's commands: end-of-pipe releases (labels, cache actions) and event
-// writes (barriers, flushes). Not WRITE_DATA, which can also write registers.
+// recorded into the chunk's commands: end-of-pipe releases (labels, cache actions), acquires (a
+// barrier) and event writes (barriers, flushes). Not WRITE_DATA, which can also write registers.
 [[nodiscard]] bool IsSoftPacket(uint32_t opcode, uint32_t custom);
 
 } // namespace Libs::Graphics::FrameShape
