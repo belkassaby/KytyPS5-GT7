@@ -67,3 +67,24 @@ the records.
   for the rest. Verified by picture and by an A/B.
 - **N5, coverage.** The remaining draw classes, then the compute passes (by their 59 callers),
   then the post-processing chain; then DLSS on GT7's TAA input, 120 Hz.
+
+## N1, measured: the engine state determines Kyty's choices (2026-10-30)
+
+`KYTY_GT7_NATIVE=1`: a hook on `gt7_CommitDrawState` makes the state key on the render thread
+(targets `+0x10..0x718`, attribute slots `+0x770..0x788`, the six stages' shaders, the primitive
+type, vertex formats `+0xda4..0xde8`), the marker carries it, and the GPU thread compares each
+marked draw's key with the programs and pipeline Kyty's translation chose. Music rally race,
+10 s windows of 290,000 to 375,000 marked draws (82 % of indexed draws):
+
+| | |
+|---|---|
+| cost on the render threads | 0.31 to 0.32 us a commit (~530,000 commits per 10 s, on GT7's threads) |
+| state key and material seen before, other programs or another pipeline | **0.00 %** |
+| state key alone seen before, other programs / another pipeline | 0.06 to 0.35 % / 0.29 to 1.05 % (programs specialize on the bound textures: the material) |
+| keys not seen before (state and material) | 32 to 39 % of the draws in each window |
+
+The engine state with the material **determines** Kyty's programs and pipeline: N1's question
+is answered. But a third of the draws bring a key never seen: something in the hashed fields
+changes from draw to draw (per-draw values among the target fields, or in the attribute or
+vertex format fields). For records built from cached pieces, N2 splits the key into its parts,
+finds what varies, and keys the pipeline on the parts that are state.

@@ -25,11 +25,15 @@ struct Identity {
 	uint64_t block    = 0; // the material's constant block, when bound
 	uint64_t shaders  = 0; // the shader set (fourth argument)
 	uint64_t mesh     = 0; // gt7_DrawMeshClusters's first argument, or 0
+	// Native backend N1 (docs/GT7-NATIVE-BACKEND.md): the engine state of the draw, a hash made
+	// on the render thread from its GT7RenderContext at gt7_CommitDrawState (render targets,
+	// fixed-function fields, shader headers, vertex formats, primitive type); 0 without one.
+	uint64_t state    = 0;
 	uint32_t sequence = 0; // this thread's marker count
 };
 
 // The marker: header, then the identity's fields as dwords.
-constexpr uint32_t MarkerDwords = 1 + 5 * 2 + 1;
+constexpr uint32_t MarkerDwords = 1 + 6 * 2 + 1;
 
 // Agc (a game thread, in sceAgcDcbDrawIndex): the identity to mark this draw with, if the call
 // returns into GT7's engine draws.

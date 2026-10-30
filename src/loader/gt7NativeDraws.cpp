@@ -34,6 +34,7 @@ constexpr uint64_t MeshDrawSize     = 9124;
 constexpr uint64_t DrawIndex        = 0xa1400; // gt7_DrawIndex
 constexpr uint64_t DrawIndexSize    = 434;
 constexpr uint64_t MaterialBlock    = 0x18; // GT7Material's constant block
+constexpr uint64_t CommitDrawState  = 0x16370; // gt7_CommitDrawState(ctx)
 constexpr auto     ReportEvery      = std::chrono::seconds(10);
 
 // push rbp; mov rbp, rsp; push r15; push r14; push r13; push r12; push rbx; sub rsp, 0x138
@@ -44,6 +45,25 @@ constexpr std::array<uint8_t, 20> BindMoved = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x5
 constexpr std::array<uint8_t, 20> MeshMoved = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
                                                0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48,
                                                0x81, 0xec, 0xe8, 0x06, 0x00, 0x00};
+
+// push rbp; mov rbp, rsp; push r15; push r14; push r13; push r12; push rbx; sub rsp, 0x158
+constexpr std::array<uint8_t, 20> CommitMoved = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+                                                 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48,
+                                                 0x81, 0xec, 0x58, 0x01, 0x00, 0x00};
+
+// GT7RenderContext (docs/GT7-RENDER-FRONTEND.md): what the N1 state key covers. The colour and
+// depth targets, the fields from the index state to the attribute slots (fixed-function state
+// the dirty groups commit, waits and predication excluded below), each stage's shader, the
+// primitive type and the vertex formats.
+constexpr uint64_t CtxTargets      = 0x10;
+constexpr uint64_t CtxTargetsEnd   = 0x718;
+constexpr uint64_t CtxAttribSlots  = 0x770;
+constexpr uint64_t CtxAttribEnd    = 0x788;
+constexpr uint64_t CtxStages       = 0x870;
+constexpr uint64_t CtxStageSize    = 0xb0;
+constexpr uint64_t CtxPrimType     = 0xc94;
+constexpr uint64_t CtxVertexFormat = 0xda4;
+constexpr uint64_t CtxVertexEnd    = 0xde8;
 
 bool     g_enabled   = false;
 uint64_t g_main_base = 0;
@@ -110,6 +130,122 @@ KYTY_SYSV_ABI void OnBindMaterial(uint64_t set, uint64_t material, uint64_t /*pa
 
 KYTY_SYSV_ABI void OnMeshDraw(uint64_t mesh) {
 	t_identity.mesh = mesh;
+}
+
+// N1: the render thread's state key, made at every commit (the draw follows it).
+std::atomic<uint64_t> g_state_keys {0};
+std::atomic<uint64_t> g_state_ns {0};
+
+uint64_t Mix(uint64_t key, uint64_t value) {
+	return (key ^ value) * 0x9E3779B97F4A7C15ull + (key >> 29u);
+}
+
+uint64_t HashBytes(uint64_t key, const uint8_t* data, size_t size) {
+	size_t i = 0;
+	for (; i + 8 <= size; i += 8) {
+		uint64_t word = 0;
+		std::memcpy(&word, data + i, 8);
+		key = Mix(key, word);
+	}
+	for (; i < size; i++) {
+		key = Mix(key, data[i]);
+	}
+	return key;
+}
+
+KYTY_SYSV_ABI void OnCommitState(const uint8_t* ctx) {
+	const auto start = std::chrono::steady_clock::now();
+	uint64_t   key   = 0x6a09e667f3bcc909ull;
+	key              = HashBytes(key, ctx + CtxTargets, CtxTargetsEnd - CtxTargets);
+	key              = HashBytes(key, ctx + CtxAttribSlots, CtxAttribEnd - CtxAttribSlots);
+	for (uint64_t stage = 0; stage < 6; stage++) {
+		uint64_t shader = 0;
+		std::memcpy(&shader, ctx + CtxStages + stage * CtxStageSize, sizeof(shader));
+		key = Mix(key, shader);
+	}
+	uint32_t prim = 0;
+	std::memcpy(&prim, ctx + CtxPrimType, sizeof(prim));
+	key = Mix(key, prim);
+	key = HashBytes(key, ctx + CtxVertexFormat, CtxVertexEnd - CtxVertexFormat);
+	t_identity.state = key | 1u; // never 0
+	g_state_keys.fetch_add(1, std::memory_order_relaxed);
+	g_state_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                               std::chrono::steady_clock::now() - start)
+	                                               .count()),
+	                     std::memory_order_relaxed);
+}
+
+// N1, GPU thread (NoteTemplate): what Kyty's translation chose for each key. By the state key
+// alone, and by the state key with the material (the programs depend on the bound textures).
+struct StateChoice {
+	uint64_t programs = 0;
+	uint64_t pipeline = 0;
+};
+std::unordered_map<uint64_t, StateChoice> g_state_choices;
+std::unordered_map<uint64_t, StateChoice> g_state_material_choices;
+std::atomic<uint64_t> g_n1_draws {0}, g_n1_no_key {0}, g_n1_new {0}, g_n1_same {0};
+std::atomic<uint64_t> g_n1_programs_differ {0}, g_n1_pipeline_differ {0};
+std::atomic<uint64_t> g_n1_m_new {0}, g_n1_m_same {0}, g_n1_m_programs_differ {0},
+    g_n1_m_pipeline_differ {0};
+
+void NoteStateChoice(uint64_t state, uint64_t material, uint64_t programs, uint64_t pipeline) {
+	g_n1_draws.fetch_add(1, std::memory_order_relaxed);
+	if (state == 0) {
+		g_n1_no_key.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	const auto note = [&](std::unordered_map<uint64_t, StateChoice>& map, uint64_t key,
+	                      std::atomic<uint64_t>& fresh, std::atomic<uint64_t>& same,
+	                      std::atomic<uint64_t>& programs_differ,
+	                      std::atomic<uint64_t>& pipeline_differ) {
+		if (map.size() > (1u << 20u)) {
+			map.clear();
+		}
+		auto [it, inserted] = map.try_emplace(key, StateChoice {programs, pipeline});
+		if (inserted) {
+			fresh.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		const bool p = it->second.programs != programs;
+		const bool q = it->second.pipeline != pipeline;
+		if (!p && !q) {
+			same.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (p) {
+			programs_differ.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (q) {
+			pipeline_differ.fetch_add(1, std::memory_order_relaxed);
+		}
+		it->second = {programs, pipeline};
+	};
+	note(g_state_choices, state, g_n1_new, g_n1_same, g_n1_programs_differ, g_n1_pipeline_differ);
+	note(g_state_material_choices, Mix(state, material), g_n1_m_new, g_n1_m_same,
+	     g_n1_m_programs_differ, g_n1_m_pipeline_differ);
+}
+
+void ReportStateKeys() {
+	static std::array<uint64_t, 12> last {};
+	const std::array<uint64_t, 12>  now = {
+        g_state_keys.load(),       g_state_ns.load(),          g_n1_draws.load(),
+        g_n1_no_key.load(),        g_n1_new.load(),            g_n1_same.load(),
+        g_n1_programs_differ.load(), g_n1_pipeline_differ.load(), g_n1_m_new.load(),
+        g_n1_m_same.load(),        g_n1_m_programs_differ.load(), g_n1_m_pipeline_differ.load()};
+	std::array<double, 12> d {};
+	for (size_t i = 0; i < now.size(); i++) {
+		d[i]    = static_cast<double>(now[i] - last[i]);
+		last[i] = now[i];
+	}
+	const double keyed = std::max(1.0, d[2] - d[3]);
+	Log::WriteUnmuted(fmt::format(
+	    "Native records N1 (10 s): {:.0f} commits keyed on the render threads, {:.2f} us each | "
+	    "{:.0f} marked draws, {:.0f} without a key | by the state key: {:.1f}% new, {:.1f}% the "
+	    "same programs and pipeline as before, {:.2f}% other programs, {:.2f}% another pipeline | "
+	    "by state and material: {:.1f}% new, {:.1f}% the same, {:.2f}% other programs, {:.2f}% "
+	    "another pipeline\n",
+	    d[0], d[0] == 0 ? 0.0 : d[1] / 1000.0 / d[0], d[2], d[3], 100.0 * d[4] / keyed,
+	    100.0 * d[5] / keyed, 100.0 * d[6] / keyed, 100.0 * d[7] / keyed, 100.0 * d[8] / keyed,
+	    100.0 * d[9] / keyed, 100.0 * d[10] / keyed, 100.0 * d[11] / keyed));
 }
 
 // Milestone 4: what marked draws wrote in the renderer's shared state
@@ -259,6 +395,7 @@ void Report() {
 		    "new | renderer DrawIndex: marked {:.2f} us, others {:.2f} us\n",
 		    td[0] / frames, td[5] / frames, pct(1), pct(2), pct(3), pct(4),
 		    td[7] == 0 ? 0.0 : td[6] / 1000.0 / td[7], td[9] == 0 ? 0.0 : td[8] / 1000.0 / td[9]));
+		ReportStateKeys();
 		ReportCommit();
 		ReportResolve();
 		ReportMutations();
@@ -286,13 +423,13 @@ bool ForDraw(uint64_t guest_return_address, Identity* identity) {
 
 void WriteMarker(uint32_t* packet, const Identity& identity) {
 	packet[0] = KYTY_PM4(MarkerDwords, Pm4::IT_NOP, Pm4::R_GT7_DRAW);
-	const uint64_t fields[5] = {identity.set, identity.material, identity.block, identity.shaders,
-	                            identity.mesh};
-	for (int i = 0; i < 5; i++) {
+	const uint64_t fields[6] = {identity.set,     identity.material, identity.block,
+	                            identity.shaders, identity.mesh,     identity.state};
+	for (int i = 0; i < 6; i++) {
 		packet[1 + i * 2] = static_cast<uint32_t>(fields[i]);
 		packet[2 + i * 2] = static_cast<uint32_t>(fields[i] >> 32u);
 	}
-	packet[11] = identity.sequence;
+	packet[13] = identity.sequence;
 }
 
 void OnMarker(const uint32_t* payload, uint32_t dwords) {
@@ -306,7 +443,7 @@ void OnMarker(const uint32_t* payload, uint32_t dwords) {
 	const auto field = [&](int i) {
 		return payload[i * 2] | (static_cast<uint64_t>(payload[i * 2 + 1]) << 32u);
 	};
-	g_pending_identity = {field(0), field(1), field(2), field(3), field(4), payload[10]};
+	g_pending_identity = {field(0), field(1), field(2), field(3), field(4), field(5), payload[12]};
 	g_pending          = true;
 }
 
@@ -397,6 +534,7 @@ void NoteTemplate(uint64_t programs, uint64_t pipeline) {
 		return;
 	}
 	const auto& id    = g_current_identity;
+	NoteStateChoice(id.state, id.material, programs, pipeline);
 	uint64_t    key   = id.material;
 	for (const uint64_t part: {id.mesh, programs, pipeline}) {
 		key = (key ^ part) * 0x9E3779B97F4A7C15ull + (key >> 29u);
@@ -486,6 +624,16 @@ void Install(uint64_t main_base) {
 	b.Return(BindMoved, main_base + BindMaterial);
 	// KYTY_DRAW_COUNTS hooks the same entry: then the mesh is left out
 	const bool mesh_free = std::memcmp(mesh, MeshMoved.data(), MeshMoved.size()) == 0;
+	// N1: the commit's state key (KYTY_TEXTURE_COUNTS hooks the same entry: then none)
+	auto*      commit      = reinterpret_cast<uint8_t*>(main_base + CommitDrawState);
+	const bool commit_free = std::memcmp(commit, CommitMoved.data(), CommitMoved.size()) == 0;
+	uint64_t   commit_stub = 0;
+	if (commit_free) {
+		Gt7GuestHook::Emitter c {reinterpret_cast<uint8_t*>(page + 0x400)};
+		commit_stub = c.Here();
+		c.CallHost(reinterpret_cast<const void*>(&OnCommitState)); // rdi: the render context
+		c.Return(CommitMoved, main_base + CommitDrawState);
+	}
 	uint64_t   mesh_stub = 0;
 	if (mesh_free) {
 		Gt7GuestHook::Emitter m {reinterpret_cast<uint8_t*>(page + 0x200)};
@@ -493,16 +641,20 @@ void Install(uint64_t main_base) {
 		m.CallHost(reinterpret_cast<const void*>(&OnMeshDraw)); // rdi: the mesh
 		m.Return(MeshMoved, main_base + MeshDraw);
 	}
-	Common::VirtualMemory::FlushInstructionCache(page, 0x400);
+	Common::VirtualMemory::FlushInstructionCache(page, 0x600);
 	Gt7GuestHook::PatchEntry(bind, BindMoved.size(), bind_stub);
+	if (commit_free) {
+		Gt7GuestHook::PatchEntry(commit, CommitMoved.size(), commit_stub);
+	}
 	if (mesh_free) {
 		Gt7GuestHook::PatchEntry(mesh, MeshMoved.size(), mesh_stub);
 	}
 	g_main_base = main_base;
 	g_enabled   = true;
 	std::thread(Report).detach();
-	Log::WriteToConsoleAndLog(fmt::format("Native draws: installed on gt7_BindMaterial{}\n",
-	                                      mesh_free ? " and gt7_DrawMeshClusters" : ""));
+	Log::WriteToConsoleAndLog(fmt::format("Native draws: installed on gt7_BindMaterial{}{}\n",
+	                                      mesh_free ? ", gt7_DrawMeshClusters" : "",
+	                                      commit_free ? ", gt7_CommitDrawState" : ""));
 }
 
 } // namespace Loader::Gt7NativeDraws
