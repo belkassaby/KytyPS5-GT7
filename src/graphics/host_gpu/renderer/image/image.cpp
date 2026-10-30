@@ -313,8 +313,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 
 vk::ImageLayout Image::CurrentLayout() const {
 	if (const auto* overlay = ImageStateOverlay::Active(); overlay != nullptr) {
-		if (const auto it = overlay->m_index.find(this); it != overlay->m_index.end()) {
-			return overlay->m_entries[it->second].whole.layout;
+		if (const auto* entry = const_cast<ImageStateOverlay*>(overlay)->Find(*this);
+		    entry != nullptr) {
+			return entry->whole.layout;
 		}
 	}
 	return backing.state.layout;
@@ -325,20 +326,41 @@ ImageStateOverlay::Counts& ImageStateOverlay::GetCounts() noexcept {
 	return counts;
 }
 
-ImageStateOverlay::Entry& ImageStateOverlay::Get(Image& image) {
-	if (const auto it = m_index.find(&image); it != m_index.end()) {
-		return m_entries[it->second];
+namespace {
+std::atomic<uint64_t> g_overlay_epochs {0};
+} // namespace
+
+ImageStateOverlay::ImageStateOverlay(uint32_t executor): m_executor(executor) {
+	EXIT_IF(executor >= MaxExecutors);
+	NextEpoch();
+}
+
+void ImageStateOverlay::NextEpoch() noexcept {
+	m_epoch = g_overlay_epochs.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+ImageStateOverlay::Entry* ImageStateOverlay::Find(const Image& image) noexcept {
+	const auto& slot = image.overlay_slots[m_executor];
+	if (slot.epoch != m_epoch || slot.index >= m_entries.size() ||
+	    m_entries[slot.index].image != &image) {
+		return nullptr;
 	}
-	m_index.emplace(&image, m_entries.size());
+	return &m_entries[slot.index];
+}
+
+ImageStateOverlay::Entry& ImageStateOverlay::Get(Image& image) {
+	if (auto* entry = Find(image); entry != nullptr) {
+		return *entry;
+	}
+	image.overlay_slots[m_executor] = {m_epoch, static_cast<uint32_t>(m_entries.size())};
 	auto& entry = m_entries.emplace_back();
 	entry.image = &image;
 	return entry;
 }
 
 void ImageStateOverlay::Forget(const Image* image) {
-	if (const auto it = m_index.find(image); it != m_index.end()) {
-		m_entries[it->second].image = nullptr;
-		m_index.erase(it);
+	if (auto* entry = Find(*image); entry != nullptr) {
+		entry->image = nullptr;
 	}
 }
 
@@ -607,7 +629,7 @@ void ImageStateOverlay::Stitch(bool verify) {
 	}
 	GuestImageUses::t_active = guest_before;
 	m_entries.clear();
-	m_index.clear();
+	NextEpoch();
 	t_active = this;
 	counts.barriers += all.size();
 	EXIT_IF(!all.empty() && m_pending == nullptr);

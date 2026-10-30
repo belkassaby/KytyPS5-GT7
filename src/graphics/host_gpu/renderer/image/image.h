@@ -10,6 +10,7 @@
 #include <mutex>
 #include <compare>
 #include <limits>
+#include <array>
 #include <atomic>
 #include <optional>
 #include <memory>
@@ -132,10 +133,22 @@ private:
 	// Before a chunk's first first use (Image::OverlayBarriers): the placeholder's barriers.
 	void RecordPlaceholder(CommandScheduler& scheduler);
 
-	std::vector<Entry>                       m_entries;
+	// The entry of `image` in this chunk, if it has one: the image's slot for this overlay's
+	// executor, valid while it holds this chunk's number.
+	[[nodiscard]] Entry* Find(const Image& image) noexcept;
+	// A new number for the chunk being recorded (its entries were cleared).
+	void NextEpoch() noexcept;
+
+	std::vector<Entry>                                    m_entries;
 	std::shared_ptr<std::vector<vk::ImageMemoryBarrier2>> m_pending;
-	std::unordered_map<const Image*, size_t> m_index;
+	uint32_t                                              m_executor = 0;
+	uint64_t                                              m_epoch    = 0;
 	static inline thread_local ImageStateOverlay* t_active = nullptr;
+
+public:
+	// Executors (each records chunks on a thread of its own, with an overlay of its own).
+	static constexpr uint32_t MaxExecutors = 4;
+	explicit ImageStateOverlay(uint32_t executor = 0);
 };
 
 class Image final {
@@ -306,6 +319,13 @@ public:
 	// Round 167 (images:lean): an emulator-made use (a copy, blit, clear, conversion) since its
 	// last barrier, which no guest sync point orders: the next use makes its barrier.
 	bool internal_use = false;
+	// Slice 2: this image's entry in each executor's ImageStateOverlay (the chunk number it is
+	// valid for, and the entry's index), written only by that executor.
+	struct OverlaySlot {
+		uint64_t epoch = 0;
+		uint32_t index = 0;
+	};
+	std::array<OverlaySlot, ImageStateOverlay::MaxExecutors> overlay_slots {};
 
 private:
 	friend class ImageStateOverlay;

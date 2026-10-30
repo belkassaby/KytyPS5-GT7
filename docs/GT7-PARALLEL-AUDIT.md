@@ -226,3 +226,27 @@ images a window, **0 with layouts or accesses differing**, no crash, the picture
 verify's replays, race windows 16.3 fps median at 13.3 us a command; the A/B without verify is
 next. A chunk now needs no image state from the chunks before it: the second executor can record
 chunks out of order.
+
+## Slice 2, A/B and the overlay lookup (2026-10-30)
+
+A/B, music rally race windows, same build (09:43): chunk lists and overlays 16.6 fps mean (16.3
+median) against 16.9 (16.8) without, the cost in `commit` (2.16 us a draw against 1.23): every
+image transition looked its image up in the overlay's hash map. Each image now holds a slot per
+executor (`Image::overlay_slots`: the chunk number it is valid for, and the entry's index;
+`ImageStateOverlay::Find`), written only by that executor. Verify run after it: 30 windows, 0
+states differing, no crash, `commit` 1.05 to 1.36 us a draw.
+
+## Slice 3, split
+
+Two executors need the shared caches safe for concurrent use, the buffer cache first (not
+thread-safe at all, used by every draw and by the GPU thread's packets with effects). So:
+
+- **3a: one executor thread.** Chunks replay on it (its own command list and overlay); the GPU
+  thread decodes ahead and runs the packets with effects, waiting before each until the executor
+  has finished the chunks before it, so no cache is used by two threads at once. Proves the
+  threading (hand-off, lists recorded on another thread, splicing in order, overlays per
+  executor); gains only the decode overlap (~3 %).
+- **3b: the caches safe for concurrent use**: buffer syncs and protects of a chunk done ahead in
+  stream order on the stitching side, lookups under locks, image binding state per executor,
+  the renderer lock shared, program caches under shared locks.
+- **3c: two executors, then N.**
