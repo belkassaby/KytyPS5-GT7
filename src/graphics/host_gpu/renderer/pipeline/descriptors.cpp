@@ -4226,6 +4226,36 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
+	// GT7 native path, milestone 3 (descriptor-set reuse, measured first): this function's steps
+	// for marked graphics draws: spec checks, bindless heaps, image transitions, descriptor
+	// writes, then recording and the rest (Gt7NativeDraws::AddCommitSteps, at the end)
+	struct Gt7CommitLaps {
+		bool                                            on;
+		std::chrono::steady_clock::time_point           last = std::chrono::steady_clock::now();
+		std::array<uint64_t, 5>                         ns {};
+		uint32_t                                        step = 0;
+		void Lap(uint32_t to) {
+			const auto now = std::chrono::steady_clock::now();
+			ns[step] += static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count());
+			last = now;
+			step = to;
+		}
+		~Gt7CommitLaps() {
+			if (on) {
+				Lap(4);
+				::Loader::Gt7NativeDraws::AddCommitSteps(ns.data());
+			}
+		}
+	} gt7_laps {pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
+	            ::Loader::Gt7NativeDraws::CurrentMarked()};
+	// step 0 spec checks, 1 bindless, 2 transitions, 3 writes, 4 recording (a stage's loop goes
+	// back to 1 for the next stage)
+	const auto gt7_lap = [&](uint32_t to) {
+		if (gt7_laps.on) {
+			gt7_laps.Lap(to);
+		}
+	};
 	const auto vk_buffer    = buffer.Recorder();
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;
@@ -4374,6 +4404,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 	spec_check_phase.End();
+	gt7_lap(1);
 	m_descriptor_buffers.clear();
 	m_descriptor_images.clear();
 	m_descriptor_writes.clear();
@@ -4382,6 +4413,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_writes.reserve(write_count);
 
 	for (auto* prepared: prepared_bindings) {
+		gt7_lap(1);
 		const auto& program       = *prepared->runtime->program;
 		auto&       descriptors   = *prepared;
 		const auto  shader_stage  = NativeShaderStage(program.stage);
@@ -4477,6 +4509,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			heap->checked_generation = g_bindless_state_generation.load(std::memory_order_relaxed);
 			heap->checked_count      = resolved.size();
 		}
+		gt7_lap(2);
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
@@ -4527,6 +4560,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			binding.layout = image.backing.state.layout;
 		}
 
+		gt7_lap(3);
 		m_image_occurrences.assign(descriptors.images.size(), 0);
 		for (const auto& binding: program.bindings.descriptors) {
 			vk::WriteDescriptorSet write {};
@@ -4612,6 +4646,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
+	gt7_lap(4);
 	if (has_push_data) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());

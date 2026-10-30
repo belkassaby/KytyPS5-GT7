@@ -110,6 +110,29 @@ KYTY_SYSV_ABI void OnMeshDraw(uint64_t mesh) {
 	t_identity.mesh = mesh;
 }
 
+// CommitBindings' steps for marked draws (AddCommitSteps)
+std::array<std::atomic<uint64_t>, 5> g_commit_ns {};
+std::atomic<uint64_t>                g_commit_calls {0};
+
+void ReportCommit() {
+	static std::array<uint64_t, 5> last {};
+	static uint64_t                last_calls = 0;
+	const auto                     calls      = g_commit_calls.load();
+	const auto                     n          = static_cast<double>(std::max<uint64_t>(calls - last_calls, 1));
+	last_calls                                = calls;
+	double us[5];
+	for (int i = 0; i < 5; i++) {
+		const auto now = g_commit_ns[i].load();
+		us[i]          = static_cast<double>(now - last[i]) / 1000.0 / n;
+		last[i]        = now;
+	}
+	Log::WriteUnmuted(fmt::format(
+	    "Native commit: {:.0f} marked draws' CommitBindings: {:.2f} us each = spec checks {:.2f}, "
+	    "bindless {:.2f}, image transitions {:.2f}, descriptor writes {:.2f}, recording and the "
+	    "rest {:.2f}\n",
+	    n, us[0] + us[1] + us[2] + us[3] + us[4], us[0], us[1], us[2], us[3], us[4]));
+}
+
 void Report() {
 	uint64_t last_t[11] = {};
 	constexpr int Count = 13;
@@ -162,6 +185,7 @@ void Report() {
 		    "new | renderer DrawIndex: marked {:.2f} us, others {:.2f} us\n",
 		    td[0] / frames, td[5] / frames, pct(1), pct(2), pct(3), pct(4),
 		    td[7] == 0 ? 0.0 : td[6] / 1000.0 / td[7], td[9] == 0 ? 0.0 : td[8] / 1000.0 / td[9]));
+		ReportCommit();
 	}
 }
 
@@ -249,6 +273,17 @@ void OnDrawDone(uint64_t renderer_ns) {
 	}
 	g_current_material = 0;
 	g_current_marked   = false;
+}
+
+bool CurrentMarked() {
+	return g_current_marked;
+}
+
+void AddCommitSteps(const uint64_t* nanoseconds) {
+	for (int i = 0; i < 5; i++) {
+		g_commit_ns[i].fetch_add(nanoseconds[i], std::memory_order_relaxed);
+	}
+	g_commit_calls.fetch_add(1, std::memory_order_relaxed);
 }
 
 void NoteTemplate(uint64_t programs, uint64_t pipeline) {

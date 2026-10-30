@@ -49,6 +49,13 @@ void OnDrawDone(uint64_t renderer_ns);
 // the renderer's time for marked and other draws: what draw templates could take over.
 void NoteTemplate(uint64_t programs, uint64_t pipeline);
 
+// Descriptor-set reuse, measured first (RenderExecutor::CommitBindings, GPU thread): whether the
+// draw being executed is marked, and a marked draw's nanoseconds in CommitBindings' steps (spec
+// checks, bindless heaps, image transitions, descriptor writes, recording and the rest), for a
+// "Native commit:" line.
+[[nodiscard]] bool CurrentMarked();
+void               AddCommitSteps(const uint64_t* nanoseconds);
+
 // Milestone 2 (the renderer, GPU thread, while a draw executes): the draw's material when its
 // pixel stage's texture table is that material's block, else 0. With it the pixel stage's texture
 // and sampler bindings are kept per (material, program) and reused while their descriptors and
