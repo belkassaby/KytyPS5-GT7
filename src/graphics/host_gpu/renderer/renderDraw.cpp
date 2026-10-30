@@ -43,6 +43,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "loader/gt7NativeDraws.h"
 
 #include <algorithm>
 #include <array>
@@ -3045,6 +3046,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		return;
 	}
 	auto& pipeline = *deferred_pipeline;
+	if (::Loader::Gt7NativeDraws::Enabled()) {
+		uint64_t programs = state.ps_active ? state.programs.pixel.id : 0;
+		for (const auto& program: state.programs.vertex) {
+			programs = programs * 0x9E3779B97F4A7C15ull + program.id;
+		}
+		::Loader::Gt7NativeDraws::NoteTemplate(programs, reinterpret_cast<uint64_t>(deferred_pipeline));
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	GpuPhases::Scope     rendering_phase(GpuPhases::Phase::DrawRendering);
 	if (repeats) {

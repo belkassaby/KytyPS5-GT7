@@ -1413,9 +1413,13 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		const auto& ps = GetShCtx().GetPs().ps_user_sgpr;
 		::Loader::Gt7NativeDraws::OnDraw(ps.value, ps.count);
 	}
+	const auto native_start = std::chrono::steady_clock::now();
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 	if (::Loader::Gt7NativeDraws::Enabled()) {
-		::Loader::Gt7NativeDraws::OnDrawDone();
+		::Loader::Gt7NativeDraws::OnDrawDone(static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+		                                                         native_start)
+		        .count()));
 	}
 	CompleteDraw();
 }

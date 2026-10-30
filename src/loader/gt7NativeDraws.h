@@ -40,7 +40,14 @@ void               WriteMarker(uint32_t* packet, const Identity& identity);
 // pixel stage's user-data SGPRs.
 void OnMarker(const uint32_t* payload, uint32_t dwords);
 void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count);
-void OnDrawDone();
+// After the renderer's DrawIndex, with the time it took.
+void OnDrawDone(uint64_t renderer_ns);
+
+// Milestone 3, measured first (the renderer, GPU thread): a marked draw's programs (a signature of
+// their ids) and pipeline, after the pipeline lookup. A "Native templates:" line every 10 s gives
+// how often a marked draw's (material, mesh, programs, pipeline) was seen the frame before, and
+// the renderer's time for marked and other draws: what draw templates could take over.
+void NoteTemplate(uint64_t programs, uint64_t pipeline);
 
 // Milestone 2 (the renderer, GPU thread, while a draw executes): the draw's material when its
 // pixel stage's texture table is that material's block, else 0. With it the pixel stage's texture

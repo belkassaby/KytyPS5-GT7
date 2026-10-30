@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <fmt/format.h>
@@ -72,6 +73,24 @@ std::atomic<uint64_t> g_binding_ns {0};
 std::atomic<uint64_t> g_binding_mismatches {0};
 std::atomic<uint64_t> g_binding_uncacheable {0};
 
+// Milestone 3, measured first (GPU thread): the marked draw being executed, its template keys
+// (material, mesh, programs, pipeline) and when each was last seen, and the renderer's time.
+bool                                   g_current_marked = false;
+Identity                               g_current_identity;
+std::unordered_map<uint64_t, uint64_t> g_template_frames; // key -> the frame it was last seen
+uint64_t                               g_template_frame = 0;
+std::unordered_set<uint64_t>           g_template_frame_keys; // this frame's
+std::atomic<uint64_t>                  g_template_notes {0};
+std::atomic<uint64_t>                  g_template_previous {0}; // seen the frame before
+std::atomic<uint64_t>                  g_template_same {0};     // seen earlier this frame
+std::atomic<uint64_t>                  g_template_older {0};
+std::atomic<uint64_t>                  g_template_new {0};
+std::atomic<uint64_t>                  g_template_distinct {0}; // summed over frames
+std::atomic<uint64_t>                  g_marked_draw_ns {0};
+std::atomic<uint64_t>                  g_marked_draw_count {0};
+std::atomic<uint64_t>                  g_other_draw_ns {0};
+std::atomic<uint64_t>                  g_other_draw_count {0};
+
 template <typename T>
 T Read(uint64_t address) {
 	T value {};
@@ -92,6 +111,7 @@ KYTY_SYSV_ABI void OnMeshDraw(uint64_t mesh) {
 }
 
 void Report() {
+	uint64_t last_t[11] = {};
 	constexpr int Count = 13;
 	uint64_t      last[Count] = {};
 	uint64_t      last_presents = Common::PerfStats::PresentsTotal();
@@ -124,6 +144,24 @@ void Report() {
 		    delta[8] == 0 ? 0.0 : 100.0 * static_cast<double>(delta[9]) / static_cast<double>(delta[8]),
 		    delta[8] == 0 ? 0.0 : static_cast<double>(delta[10]) / 1000.0 / static_cast<double>(delta[8]),
 		    d[12], delta[11]));
+		const uint64_t t[11] = {g_template_notes.load(),    g_template_previous.load(),
+		                        g_template_same.load(),     g_template_older.load(),
+		                        g_template_new.load(),      g_template_distinct.load(),
+		                        g_marked_draw_ns.load(),    g_marked_draw_count.load(),
+		                        g_other_draw_ns.load(),     g_other_draw_count.load(),
+		                        0};
+		double td[11];
+		for (int i = 0; i < 11; i++) {
+			td[i]     = static_cast<double>(t[i] - last_t[i]);
+			last_t[i] = t[i];
+		}
+		const auto pct = [&](int i) { return td[0] == 0 ? 0.0 : 100.0 * td[i] / td[0]; };
+		Log::WriteUnmuted(fmt::format(
+		    "Native templates: a frame: {:.0f} marked draws keyed, {:.0f} distinct keys; of the draws "
+		    "{:.1f}% keyed as the frame before, {:.1f}% earlier this frame, {:.1f}% older, {:.1f}% "
+		    "new | renderer DrawIndex: marked {:.2f} us, others {:.2f} us\n",
+		    td[0] / frames, td[5] / frames, pct(1), pct(2), pct(3), pct(4),
+		    td[7] == 0 ? 0.0 : td[6] / 1000.0 / td[7], td[9] == 0 ? 0.0 : td[8] / 1000.0 / td[9]));
 	}
 }
 
@@ -179,6 +217,8 @@ void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count) {
 	}
 	g_pending = false;
 	const auto& id = g_pending_identity;
+	g_current_marked   = true;
+	g_current_identity = id;
 	g_marked.fetch_add(1, std::memory_order_relaxed);
 	if (id.mesh != 0) {
 		g_with_mesh.fetch_add(1, std::memory_order_relaxed);
@@ -199,8 +239,51 @@ void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count) {
 	}
 }
 
-void OnDrawDone() {
+void OnDrawDone(uint64_t renderer_ns) {
+	if (g_current_marked) {
+		g_marked_draw_ns.fetch_add(renderer_ns, std::memory_order_relaxed);
+		g_marked_draw_count.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		g_other_draw_ns.fetch_add(renderer_ns, std::memory_order_relaxed);
+		g_other_draw_count.fetch_add(1, std::memory_order_relaxed);
+	}
 	g_current_material = 0;
+	g_current_marked   = false;
+}
+
+void NoteTemplate(uint64_t programs, uint64_t pipeline) {
+	if (!g_current_marked) {
+		return;
+	}
+	const auto& id    = g_current_identity;
+	uint64_t    key   = id.material;
+	for (const uint64_t part: {id.mesh, programs, pipeline}) {
+		key = (key ^ part) * 0x9E3779B97F4A7C15ull + (key >> 29u);
+	}
+	const auto frame = Common::PerfStats::PresentsTotal();
+	if (frame != g_template_frame) {
+		g_template_distinct.fetch_add(g_template_frame_keys.size(), std::memory_order_relaxed);
+		g_template_frame_keys.clear();
+		g_template_frame = frame;
+	}
+	g_template_frame_keys.insert(key);
+	g_template_notes.fetch_add(1, std::memory_order_relaxed);
+	if (g_template_frames.size() > (1u << 21u)) {
+		g_template_frames.clear();
+	}
+	auto [it, inserted] = g_template_frames.try_emplace(key, frame);
+	if (inserted) {
+		g_template_new.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	if (it->second == frame) {
+		g_template_same.fetch_add(1, std::memory_order_relaxed);
+	} else if (it->second + 1 == frame) {
+		g_template_previous.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		g_template_older.fetch_add(1, std::memory_order_relaxed);
+	}
+	it->second = frame;
 }
 
 uint64_t CurrentPixelMaterial() {
