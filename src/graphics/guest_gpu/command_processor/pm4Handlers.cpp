@@ -16,6 +16,7 @@
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
+#include "graphics/guest_gpu/frameShape.h"
 #include "loader/gt7NativeDraws.h"
 
 #include <algorithm>
@@ -2003,6 +2004,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
+	if (FrameShape::Enabled()) {
+		FrameShape::OnIndirectBuffer(&cp, (control & (1u << 20u)) != 0);
+	}
 	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
 
 	return 3;
@@ -2102,6 +2106,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 			continue;
 		}
 
+		if (FrameShape::Enabled()) {
+			FrameShape::NoteCx(&cp, cmd_offset, value);
+		}
 		auto pfunc = g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)];
 
 		if (pfunc == nullptr) {
@@ -2186,6 +2193,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 			continue;
 		}
 
+		if (FrameShape::Enabled()) {
+			FrameShape::NoteSh(&cp, cmd_offset, value);
+		}
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
 
 		if (pfunc == nullptr) {
@@ -2548,6 +2558,12 @@ KYTY_CP_OP_PARSER(CpOpSetContextReg) {
 		     num_dw - dw, cmd_id, cmd_offset, buffer[1]);
 	}
 
+	if (FrameShape::Enabled()) {
+		for (uint32_t i = 0; i + 2u < KYTY_PM4_LEN(cmd_id); i++) {
+			FrameShape::NoteCx(&cp, cmd_offset + i, buffer[1 + i]);
+		}
+	}
+
 	auto pfunc = g_hw_ctx_func[cmd_offset & (Pm4::CX_NUM - 1)];
 
 	if (pfunc == nullptr) {
@@ -2588,6 +2604,12 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 	}
 
 	EXIT_NOT_IMPLEMENTED(cmd_offset >= Pm4::SH_NUM);
+
+	if (FrameShape::Enabled()) {
+		for (uint32_t i = 0; i + 2u < KYTY_PM4_LEN(cmd_id); i++) {
+			FrameShape::NoteSh(&cp, cmd_offset + i, buffer[1 + i]);
+		}
+	}
 
 	auto pfunc = g_hw_sh_func[cmd_offset];
 

@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/drawPrepScanner.h"
+#include "graphics/guest_gpu/frameShape.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/gpuPhases.h"
@@ -1016,6 +1017,10 @@ bool GuestGpu::Process(Submission& submission) {
 	if (first_slice) {
 		submission.started = true;
 		cp.SetSubmitId(++m_submit_id);
+		if (FrameShape::Enabled()) {
+			FrameShape::OnSubmission(&cp, submission.type == SubmissionType::Graphics,
+			                         m_renderer.GetGpu().GetFrameNum());
+		}
 		cp.ResetDeCe();
 		cp.SetFlip({});
 	}
@@ -1413,6 +1418,12 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		const auto& ps = GetShCtx().GetPs().ps_user_sgpr;
 		::Loader::Gt7NativeDraws::OnDraw(ps.value, ps.count);
 	}
+	if (FrameShape::Enabled()) {
+		FrameShape::OnDraw(this);
+	}
+	if (FrameShape::NullRender()) {
+		return;
+	}
 	const auto native_start = std::chrono::steady_clock::now();
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 	if (::Loader::Gt7NativeDraws::Enabled()) {
@@ -1647,6 +1658,12 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
+		if (FrameShape::Enabled()) {
+			FrameShape::OnDispatch(this);
+		}
+		if (FrameShape::NullRender()) {
+			return;
+		}
 		FrameGraph::SetGuestQueue(m_interrupt_event_id);
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
@@ -1666,6 +1683,12 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	if (FrameShape::Enabled()) {
+		FrameShape::OnDispatch(this);
+	}
+	if (FrameShape::NullRender()) {
+		return;
+	}
 	FrameGraph::SetGuestQueue(m_interrupt_event_id);
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
 	CompleteDispatch();
@@ -1692,6 +1715,12 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		} else {
 			args.instance_count = NumInstances();
 		}
+	}
+	if (FrameShape::Enabled()) {
+		FrameShape::OnDraw(this);
+	}
+	if (FrameShape::NullRender()) {
+		return;
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 	CompleteDraw();

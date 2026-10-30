@@ -90,3 +90,40 @@ to frame, with the per-draw values (constant buffers, transforms, index range) f
 5. **Resolve by identity:** templates per material and mesh, so the serial stage costs ~1 to 2 us.
 6. **Dispatches** the same way.
 7. **Tracking, 120 Hz, 4K, then DLSS.**
+
+## Step 1, measured (2026-10-30, music rally race)
+
+`KYTY_FRAME_SHAPE=1` (`src/graphics/guest_gpu/frameShape.cpp`) and `KYTY_NULL_RENDER=1` or `=file`
+(skip draws and dispatches; with `file`, only while `_null-render` exists in the working directory).
+
+**The CPU ceiling.** With null mode on in a race, GT7 runs at **60.0 fps** with the GPU thread
+13 to 15 % busy, and write-tracking faults fall from 18,000 to 80,000 a second to ~180 (Kyty's
+GPU work causes them, not the game). The picture freezes, as expected, and the game keeps
+running. With `-Vblank 120` it still runs at 60: GT7 paces itself to 60 and offers its 120 Hz
+mode only when video out reports a 120 Hz display. That is its own piece of work; until then the
+ceiling known is 60 or more.
+
+**Decoding is cheap.** In null mode the GPU thread still parses every packet and keeps all
+register state for ~3,200 draws and ~1,900 dispatches a frame: about 2.2 ms a frame, ~0.4 us a
+command, against ~11 us to render one. **Decode stays serial** (step 2 is dropped): even at
+120 fps it is 2.2 ms of 8.3. The parallel work is the renderer's.
+
+**The frame's shape:**
+
+| | per frame |
+|---|---|
+| graphics submissions | 1, made of **~3,200 chained pieces** (GT7's segmented command buffer) |
+| compute submissions | ~62 (about 10 empty) |
+| render target runs | ~85; **79 % of draws in runs of 256 or more** |
+| dispatches in submissions of 256 or more | ~79 % |
+| key state from an earlier submission | none |
+| key state from an earlier chained piece | targets and viewport 3 to 4 % of draws, CS program 10 % of dispatches |
+
+The chained pieces are not per thread and not self-contained, so the frame cannot be split by
+command buffer. It can be split by render target run: long runs, each a natural chunk of
+recording for a worker.
+
+**The plan, revised:** decode serial (register state and a command list), resolve serial (the
+mutating parts, in stream order), prepare and record in parallel by chunk (a render target run,
+or a stretch of dispatches between barriers). Next, step 3: `RenderExecutor` split so that
+recording a draw takes only its resolved command and touches no cache.

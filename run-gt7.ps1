@@ -6,6 +6,7 @@ param(
     [int]$Width = 1920,
     [int]$Height = 1080,
     [ValidateSet('Fifo', 'Mailbox', 'Immediate')][string]$PresentMode = 'Mailbox',
+    [int]$Vblank = 60,
     [ValidateSet('None', 'Size', 'Performance')][string]$ShaderOptimization = 'Performance',
     [switch]$NoBindless,
     # Guest shaders to skip (hex hashes, comma separated). NVIDIA drivers before 616 crash compiling
@@ -24,7 +25,7 @@ $arguments = @(
     '--game', $Game,
     '--screen-width', $Width, '--screen-height', $Height,
     '--present-mode', $PresentMode,
-    '--vblank-frequency', 60,
+    '--vblank-frequency', $Vblank,
     '--shader-optimization-type', $ShaderOptimization,
     '--tessellation', '--redzone',
     '--printf-direction', 'File'
