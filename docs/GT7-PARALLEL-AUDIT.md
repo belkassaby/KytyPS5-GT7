@@ -203,3 +203,26 @@ Music rally race and menus: every replayed chunk went through a list (~80,000 ev
 0 states differing in 28 windows, the picture unchanged. Race windows 16.8 fps median at
 11.6 us a command (16.3 and 11.8 without lists): ending the rendering at each chunk costs
 nothing visible.
+
+## Slice 2, part 2, done: image states per chunk (2026-10-30)
+
+`ImageStateOverlay` (image/image.h): while a chunk records (`KYTY_CHUNK_LISTS=1`,
+`KYTY_CHUNK_IMAGES=0` turns it off), `Image::GetBarriers` works on the overlay's copy of each
+image's state. A first use in the chunk (per subresource) makes no barrier and is noted, and the
+chunk's first first use records a placeholder barrier command into the chunk's list (outside
+rendering). At the splice (`SpliceListChunks`), `Stitch` computes the barriers from each image's
+real state to the chunk's first needs into that placeholder, and makes the chunk's final states
+the real ones; a state the chunk made no barrier for keeps the accesses the real one still waits
+for (images:lean). Direct layout reads use `Image::CurrentLayout()`.
+
+Two crashes on the way, both fixed: a stitch recorded through a command buffer `Submit` had
+ended (the open list is now spliced before the end), and stitch barriers recorded into the stream
+ran between a submit and the next command buffer's begin when a chunk's list started with one
+(hence the placeholder inside the list).
+
+Verify (`KYTY_REPLAY_VERIFY=1`: each image's uses replayed in order on its real state and
+compared with the stitched state): 32 windows of menus and a music rally race, up to 800,000
+images a window, **0 with layouts or accesses differing**, no crash, the picture normal. With the
+verify's replays, race windows 16.3 fps median at 13.3 us a command; the A/B without verify is
+next. A chunk now needs no image state from the chunks before it: the second executor can record
+chunks out of order.

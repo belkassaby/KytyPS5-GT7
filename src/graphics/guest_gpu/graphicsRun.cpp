@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
+#include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -479,6 +480,14 @@ static bool ChunkListsEnabled() {
 	return on;
 }
 
+static bool ChunkImagesEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CHUNK_IMAGES");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
 static bool ReplayVerify() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_REPLAY_VERIFY");
@@ -505,6 +514,19 @@ void ReportReplayIfDue() {
 	if (now - c.last < std::chrono::seconds(10)) {
 		return;
 	}
+	const auto& images = ImageStateOverlay::GetCounts();
+	static ImageStateOverlay::Counts last_images;
+	LOGF("Replay images (10 s): %" PRIu64 " stitches, %" PRIu64 " images (%" PRIu64
+	     " first uses), %" PRIu64 " barriers stitched, %" PRIu64
+	     " in chunks | verify: %" PRIu64 " images, %" PRIu64 " with layouts and %" PRIu64
+	     " with accesses differing\n",
+	     images.stitches - last_images.stitches, images.images - last_images.images,
+	     images.firsts - last_images.firsts, images.barriers - last_images.barriers,
+	     images.chunk_barriers - last_images.chunk_barriers,
+	     images.verify_images - last_images.verify_images,
+	     images.verify_layouts - last_images.verify_layouts,
+	     images.verify_accesses - last_images.verify_accesses);
+	last_images = images;
 	LOGF("Replay (10 s): %" PRIu64 " chunks replayed (%" PRIu64 " packets, %" PRIu64
 	     " draws and dispatches; %" PRIu64 " in command lists), %" PRIu64
 	     " chunks without one | verify: %" PRIu64
@@ -533,9 +555,17 @@ void CommandProcessor::ReplayChunk() {
 	auto&      scheduler = GetScheduler();
 	const bool lists     = ChunkListsEnabled() && scheduler.Threaded();
 	scheduler.Begin(replay.m_ctx, replay.m_ucfg, replay.m_sh_ctx);
+	// Part 2: image states per chunk (KYTY_CHUNK_IMAGES=0 keeps them on the images).
+	static ImageStateOverlay overlay;
+	const bool               images = lists && ChunkImagesEnabled();
 	if (lists) {
 		scheduler.EndRendering();
 		scheduler.BeginList();
+		if (images) {
+			overlay.record_calls = ReplayVerify();
+			scheduler.SetListVerify(ReplayVerify());
+			overlay.Activate();
+		}
 	}
 	for (const auto& recorded: packets) {
 		const auto opcode = (recorded.header >> 8u) & 0xffu;
@@ -552,6 +582,9 @@ void CommandProcessor::ReplayChunk() {
 	if (lists) {
 		scheduler.EndRendering();
 		scheduler.SpliceList();
+		if (images) {
+			ImageStateOverlay::Deactivate();
+		}
 		counts.lists++;
 	}
 	counts.chunks++;

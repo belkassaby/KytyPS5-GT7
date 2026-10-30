@@ -170,6 +170,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
+	if (auto* overlay = ImageStateOverlay::Active(); overlay != nullptr) {
+		return OverlayBarriers(*overlay, destination_layout, destination_access, destination_stage,
+		                       range);
+	}
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;
 	if (range && info.IsVolume()) {
@@ -305,6 +309,312 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		internal_use = false;
 	}
 	return barriers;
+}
+
+vk::ImageLayout Image::CurrentLayout() const {
+	if (const auto* overlay = ImageStateOverlay::Active(); overlay != nullptr) {
+		if (const auto it = overlay->m_index.find(this); it != overlay->m_index.end()) {
+			return overlay->m_entries[it->second].whole.layout;
+		}
+	}
+	return backing.state.layout;
+}
+
+ImageStateOverlay::Counts& ImageStateOverlay::GetCounts() noexcept {
+	static Counts counts;
+	return counts;
+}
+
+ImageStateOverlay::Entry& ImageStateOverlay::Get(Image& image) {
+	if (const auto it = m_index.find(&image); it != m_index.end()) {
+		return m_entries[it->second];
+	}
+	m_index.emplace(&image, m_entries.size());
+	auto& entry = m_entries.emplace_back();
+	entry.image = &image;
+	return entry;
+}
+
+void ImageStateOverlay::Forget(const Image* image) {
+	if (const auto it = m_index.find(image); it != m_index.end()) {
+		m_entries[it->second].image = nullptr;
+		m_index.erase(it);
+	}
+}
+
+Image::Barriers Image::OverlayBarriers(ImageStateOverlay& overlay, vk::ImageLayout destination_layout,
+                                       vk::AccessFlags2        destination_access,
+                                       vk::PipelineStageFlags2 destination_stage,
+                                       std::optional<ImageSubresourceRange> range) {
+	auto& entry = overlay.Get(*this);
+	if (range && info.IsVolume()) {
+		range->base_layer  = 0;
+		range->layer_count = 1;
+	}
+	const bool partial =
+	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
+	              range->base_layer != 0 || range->layer_count != info.resources.layers);
+	// As GetBarriers: images:lean joins a guest use in the layout the image is in.
+	const bool guest_use = GuestImageUses::Active();
+	const bool lean =
+	    guest_use && !internal_use && Bisect::LeanImages() && GuestGpu::GuestPm4Barriers();
+	if (!guest_use) {
+		internal_use = true;
+	}
+	if (overlay.record_calls) {
+		entry.calls.push_back(
+		    {destination_layout, destination_access, destination_stage, range, guest_use});
+	}
+	constexpr auto transfer_access =
+	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
+	                              vk::AccessFlagBits2::eShaderWrite |
+	                              vk::AccessFlagBits2::eMemoryWrite;
+	const auto joins = [&](const VulkanImageState& current) {
+		return lean && current.layout == destination_layout &&
+		       !static_cast<bool>((current.access_mask | destination_access) & transfer_access);
+	};
+	const VulkanImageState need {destination_stage, destination_access, destination_layout};
+	const auto make_barrier = [&](const VulkanImageState& current, uint32_t base_level,
+	                              uint32_t level_count, uint32_t base_layer, uint32_t layer_count) {
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask                    = current.pl_stage;
+		barrier.srcAccessMask                   = current.access_mask;
+		barrier.dstStageMask                    = destination_stage;
+		barrier.dstAccessMask                   = destination_access;
+		barrier.oldLayout                       = current.layout;
+		barrier.newLayout                       = destination_layout;
+		barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image                           = backing.image;
+		barrier.subresourceRange.aspectMask     = FullAspectMask(backing.format);
+		barrier.subresourceRange.baseMipLevel   = base_level;
+		barrier.subresourceRange.levelCount     = level_count;
+		barrier.subresourceRange.baseArrayLayer = base_layer;
+		barrier.subresourceRange.layerCount     = layer_count;
+		return barrier;
+	};
+	Barriers barriers;
+	if (!partial && !entry.has_sub) {
+		if (!entry.whole_known) {
+			// The chunk's first use of the image: Stitch makes it so.
+			overlay.RecordPlaceholder(m_scheduler);
+			entry.whole_known = true;
+			entry.whole       = need;
+			entry.firsts.push_back({-1, need, guest_use});
+			return {};
+		}
+		auto& state = entry.whole;
+		if (joins(state)) {
+			state.access_mask |= destination_access;
+			state.pl_stage |= destination_stage;
+			RecordedCommands::Add(RecordedCommands::ImageBarriersSkipped);
+			return {};
+		}
+		const bool repeated_write = static_cast<bool>(state.access_mask & write_access);
+		if (state.layout == destination_layout && state.access_mask == destination_access &&
+		    !repeated_write) {
+			return {};
+		}
+		barriers.push_back(make_barrier(state, 0, VK_REMAINING_MIP_LEVELS, 0,
+		                                VK_REMAINING_ARRAY_LAYERS));
+		if (state.layout != destination_layout) {
+			NoteBindlessStateChange(*this);
+		}
+		state                 = need;
+		entry.whole_barriered = true;
+		if (guest_use) {
+			internal_use = false;
+		}
+		ImageStateOverlay::GetCounts().chunk_barriers++;
+		return barriers;
+	}
+	const uint32_t layers = info.resources.layers;
+	const uint32_t count  = info.resources.levels * layers;
+	if (!entry.has_sub) {
+		entry.has_sub = true;
+		entry.sub.assign(count, entry.whole);
+		entry.known.assign(count, entry.whole_known ? 1 : 0);
+		entry.barriered.assign(count, entry.whole_barriered ? 1 : 0);
+	}
+	const vk::ImageLayout   previous = entry.whole.layout;
+	const bool              known    = entry.whole_known;
+	vk::AccessFlags2        joined_access {};
+	vk::PipelineStageFlags2 joined_stage {};
+	uint32_t                skipped     = 0;
+	const uint32_t          base_level  = partial ? range->base_level : 0;
+	const uint32_t          level_count = partial ? range->level_count : info.resources.levels;
+	const uint32_t          base_layer  = partial ? range->base_layer : 0;
+	const uint32_t          layer_count = partial ? range->layer_count : layers;
+	for (uint32_t level = base_level; level < base_level + level_count; level++) {
+		for (uint32_t layer = base_layer; layer < base_layer + layer_count; layer++) {
+			const auto index = level * layers + layer;
+			EXIT_IF(index >= count);
+			auto& current = entry.sub[index];
+			if (entry.known[index] == 0) {
+				overlay.RecordPlaceholder(m_scheduler);
+				entry.known[index] = 1;
+				current            = need;
+				entry.firsts.push_back({static_cast<int32_t>(index), need, guest_use});
+				continue;
+			}
+			if (joins(current)) {
+				current.access_mask |= destination_access;
+				current.pl_stage |= destination_stage;
+				joined_access |= current.access_mask;
+				joined_stage |= current.pl_stage;
+				skipped++;
+				continue;
+			}
+			const bool repeated_write = static_cast<bool>(current.access_mask & write_access);
+			if (current.layout != destination_layout || current.access_mask != destination_access ||
+			    repeated_write) {
+				barriers.push_back(make_barrier(current, level, 1, layer, 1));
+				entry.barriered[index] = 1;
+				ImageStateOverlay::GetCounts().chunk_barriers++;
+			}
+			current = need;
+		}
+	}
+	if (known && previous != destination_layout) {
+		NoteBindlessStateChange(*this);
+	}
+	entry.whole       = {destination_stage | joined_stage, destination_access | joined_access,
+	                     destination_layout};
+	entry.whole_known = std::all_of(entry.known.begin(), entry.known.end(),
+	                                [](uint8_t k) { return k != 0; });
+	if (!partial) {
+		// As GetBarriers: a use of the whole image ends the subresource states.
+		entry.whole_barriered = std::all_of(entry.barriered.begin(), entry.barriered.end(),
+		                                    [](uint8_t b) { return b != 0; });
+		entry.has_sub         = false;
+		entry.sub.clear();
+		entry.known.clear();
+		entry.barriered.clear();
+	}
+	if (skipped != 0) {
+		RecordedCommands::Add(RecordedCommands::ImageBarriersSkipped);
+	}
+	return barriers;
+}
+
+void ImageStateOverlay::RecordPlaceholder(CommandScheduler& scheduler) {
+	if (m_pending != nullptr) {
+		return;
+	}
+	m_pending = std::make_shared<std::vector<vk::ImageMemoryBarrier2>>();
+	scheduler.EndRendering();
+	scheduler.Record([pending = m_pending](vk::CommandBuffer command) {
+		if (pending->empty()) {
+			return;
+		}
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = static_cast<uint32_t>(pending->size());
+		dependency.pImageMemoryBarriers    = pending->data();
+		command.pipelineBarrier2(dependency);
+	});
+}
+
+void ImageStateOverlay::Stitch(bool verify) {
+	auto& counts = GetCounts();
+	counts.stitches++;
+	t_active = nullptr;
+	Image::Barriers all;
+	const bool      guest_before = GuestImageUses::t_active;
+	for (auto& entry: m_entries) {
+		if (entry.image == nullptr) {
+			continue;
+		}
+		auto&      image  = *entry.image;
+		const auto layers = image.info.resources.layers;
+		counts.images++;
+		// Verify: the uses in order on the real state, as without the overlay.
+		VulkanImageState              sequential_state;
+		std::vector<VulkanImageState> sequential_sub;
+		if (verify) {
+			const auto saved_state    = image.backing.state;
+			const auto saved_sub      = image.backing.subresource_states;
+			const auto saved_internal = image.internal_use;
+			for (const auto& call: entry.calls) {
+				GuestImageUses::t_active = call.guest;
+				(void)image.GetBarriers(call.layout, call.access, call.stage, call.range);
+			}
+			sequential_state                 = image.backing.state;
+			sequential_sub                   = image.backing.subresource_states;
+			image.backing.state              = saved_state;
+			image.backing.subresource_states = saved_sub;
+			image.internal_use               = saved_internal;
+		}
+		// The barriers to the chunk's first needs, from the real state.
+		for (const auto& first: entry.firsts) {
+			GuestImageUses::t_active = first.guest;
+			std::optional<ImageSubresourceRange> range;
+			if (first.index >= 0) {
+				const auto index = static_cast<uint32_t>(first.index);
+				range            = ImageSubresourceRange {index / layers, 1, index % layers, 1};
+			}
+			auto barriers = image.GetBarriers(first.need.layout, first.need.access_mask,
+			                                  first.need.pl_stage, range);
+			counts.firsts++;
+			all.insert(all.end(), barriers.begin(), barriers.end());
+		}
+		// The chunk's final state becomes the real one. A state the chunk made no barrier for
+		// keeps what the real one still waits for (images:lean joined it).
+		auto& real = image.backing;
+		if (!entry.has_sub) {
+			auto final_state = entry.whole;
+			if (!entry.whole_barriered && real.subresource_states.empty() &&
+			    real.state.layout == final_state.layout) {
+				final_state.access_mask |= real.state.access_mask;
+				final_state.pl_stage |= real.state.pl_stage;
+			}
+			real.subresource_states.clear();
+			real.state = final_state;
+		} else {
+			const auto count = static_cast<uint32_t>(entry.sub.size());
+			if (real.subresource_states.empty()) {
+				real.subresource_states.assign(count, real.state);
+			}
+			for (uint32_t i = 0; i < count; i++) {
+				if (entry.known[i] == 0) {
+					continue;
+				}
+				auto  final_state = entry.sub[i];
+				auto& current     = real.subresource_states[i];
+				if (entry.barriered[i] == 0 && current.layout == final_state.layout) {
+					final_state.access_mask |= current.access_mask;
+					final_state.pl_stage |= current.pl_stage;
+				}
+				current = final_state;
+			}
+			real.state = entry.whole;
+		}
+		if (verify) {
+			counts.verify_images++;
+			bool       layouts  = sequential_state.layout != real.state.layout;
+			bool       accesses = sequential_state.access_mask != real.state.access_mask;
+			const auto count = std::max(sequential_sub.size(), real.subresource_states.size());
+			for (size_t i = 0; i < count; i++) {
+				const auto& a = i < sequential_sub.size() ? sequential_sub[i] : sequential_state;
+				const auto& b =
+				    i < real.subresource_states.size() ? real.subresource_states[i] : real.state;
+				layouts |= a.layout != b.layout;
+				accesses |= a.access_mask != b.access_mask;
+			}
+			counts.verify_layouts += layouts ? 1 : 0;
+			counts.verify_accesses += accesses ? 1 : 0;
+		}
+	}
+	GuestImageUses::t_active = guest_before;
+	m_entries.clear();
+	m_index.clear();
+	t_active = this;
+	counts.barriers += all.size();
+	EXIT_IF(!all.empty() && m_pending == nullptr);
+	if (m_pending != nullptr) {
+		*m_pending = std::move(all);
+		m_pending  = nullptr;
+	}
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
@@ -1104,6 +1414,9 @@ uint64_t Image::HashGuestEdges() const {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
+	if (auto* overlay = ImageStateOverlay::Active(); overlay != nullptr) {
+		overlay->Forget(this);
+	}
 	if (backing.image != nullptr && ImageBackingPool::Get().Put(m_graphics, backing, views)) {
 		return;
 	}

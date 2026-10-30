@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/image/image.h"
 
 #include "common/assert.h"
 #include "common/cpuAffinity.h"
@@ -649,6 +650,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	// Round 167: a batch of copies ends with its command buffer.
 	m_command.Recorder().FlushCopyBatch();
 	CopyBatch().fenced = false;
+	if (m_list_active) {
+		// Slice 2: an open list (and its stitch barriers, recorded through this command buffer)
+		// goes to the stream before the command buffer ends below.
+		m_list_early_splices++;
+		SpliceListChunks();
+	}
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
@@ -883,6 +890,11 @@ void CommandScheduler::DispatchChunk() {
 void CommandScheduler::SpliceListChunks() {
 	if (m_chunk != nullptr && !m_chunk->Empty()) {
 		m_list_chunks.push_back(std::move(m_chunk));
+	}
+	// Part 2: the barriers that bring the images the list used to what its first uses needed,
+	// into the placeholder the list holds before them.
+	if (auto* overlay = ImageStateOverlay::Active(); overlay != nullptr && !overlay->Empty()) {
+		overlay->Stitch(m_list_verify);
 	}
 	if (m_list_chunks.empty()) {
 		return;

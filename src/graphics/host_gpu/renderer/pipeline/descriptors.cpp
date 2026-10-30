@@ -4652,7 +4652,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				const auto layout = image->info.IsDepth()
 				                        ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 				                        : vk::ImageLayout::eShaderReadOnlyOptimal;
-				if (image->backing.state.layout != layout) {
+				if (image->CurrentLayout() != layout) {
 					const GuestImageUses guest_use;
 					image->Transit(layout, vk::AccessFlagBits2::eShaderRead, {}, vk_buffer);
 				}
@@ -4700,7 +4700,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				const auto layout = image->info.IsDepth()
 				                        ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 				                        : vk::ImageLayout::eShaderReadOnlyOptimal;
-				if (image->backing.state.layout != layout) {
+				if (image->CurrentLayout() != layout) {
 					if (verify && i < skipped) {
 						EXIT("bindless: image %u of heap 0x%016" PRIx64
 						     " changed layout without a state generation change\n",
@@ -4762,7 +4762,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                                   : vk::ImageLayout::eShaderReadOnlyOptimal,
 				              vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
 			}
-			binding.layout = image.backing.state.layout;
+			binding.layout = image.CurrentLayout();
 		}
 
 		gt7_lap(3);

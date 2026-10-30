@@ -12,7 +12,9 @@
 #include <limits>
 #include <atomic>
 #include <optional>
+#include <memory>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -61,8 +63,79 @@ public:
 	[[nodiscard]] static bool Active() noexcept { return t_active; }
 
 private:
+	friend class ImageStateOverlay;
 	static inline thread_local bool t_active = false;
 	bool                            m_previous;
+};
+
+class Image;
+class CommandScheduler;
+
+// Parallel execution slice 2, part 2 (KYTY_CHUNK_LISTS=1; docs/GT7-PARALLEL-AUDIT.md): image
+// states per chunk. While one is active on a thread, Image::GetBarriers works on its copy of each
+// image's state instead of the image's: an image's first use in the chunk (per subresource) is
+// assumed to find the image as it needs it (no barrier) and is noted; later uses make their
+// barriers against the copy. Stitch, before the chunk's commands join the stream, records the
+// barriers that bring each image from its real state to those first needs and makes the copy's
+// final state the real one. A chunk recorded this way needs no image state from the chunks
+// before it. The barriers go into the chunk's own commands: its first first use records a
+// placeholder there (outside rendering), which Stitch fills before the commands are recorded, so
+// they are always inside a command buffer (a chunk's commands may begin with one).
+class ImageStateOverlay {
+public:
+	[[nodiscard]] static ImageStateOverlay* Active() noexcept { return t_active; }
+	void                                    Activate() noexcept { t_active = this; }
+	static void                             Deactivate() noexcept { t_active = nullptr; }
+	[[nodiscard]] bool                      Empty() const noexcept { return m_entries.empty(); }
+	// With `verify`, also replays each image's uses on its real state in order and counts where
+	// the result differs from the stitched one.
+	void Stitch(bool verify);
+	// Keep each use for Stitch's verify.
+	bool record_calls = false;
+	// The image is going away: its entry is dropped.
+	void Forget(const Image* image);
+
+	struct Counts {
+		uint64_t stitches = 0, images = 0, firsts = 0, barriers = 0, chunk_barriers = 0;
+		uint64_t verify_images = 0, verify_layouts = 0, verify_accesses = 0;
+	};
+	[[nodiscard]] static Counts& GetCounts() noexcept;
+
+private:
+	friend class Image;
+	struct Call {
+		vk::ImageLayout                      layout;
+		vk::AccessFlags2                     access;
+		vk::PipelineStageFlags2              stage;
+		std::optional<ImageSubresourceRange> range;
+		bool                                 guest = false;
+	};
+	struct First {
+		int32_t          index = -1; // a subresource (level * layers + layer), or -1: the image
+		VulkanImageState need;
+		bool             guest = false;
+	};
+	struct Entry {
+		Image*                        image            = nullptr;
+		bool                          whole_known      = false;
+		bool                          whole_barriered  = false;
+		VulkanImageState              whole;
+		bool                          has_sub          = false;
+		std::vector<VulkanImageState> sub;
+		std::vector<uint8_t>          known;
+		std::vector<uint8_t>          barriered;
+		std::vector<First>            firsts;
+		std::vector<Call>             calls; // verify only
+	};
+	Entry& Get(Image& image);
+
+	// Before a chunk's first first use (Image::OverlayBarriers): the placeholder's barriers.
+	void RecordPlaceholder(CommandScheduler& scheduler);
+
+	std::vector<Entry>                       m_entries;
+	std::shared_ptr<std::vector<vk::ImageMemoryBarrier2>> m_pending;
+	std::unordered_map<const Image*, size_t> m_index;
+	static inline thread_local ImageStateOverlay* t_active = nullptr;
 };
 
 class Image final {
@@ -73,6 +146,8 @@ public:
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
+	// The layout its last use left it in (the active ImageStateOverlay's, in a chunk).
+	[[nodiscard]] vk::ImageLayout CurrentLayout() const;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
@@ -233,6 +308,13 @@ public:
 	bool internal_use = false;
 
 private:
+	friend class ImageStateOverlay;
+	// GetBarriers on the active ImageStateOverlay's copy of the state.
+	[[nodiscard]] Barriers OverlayBarriers(ImageStateOverlay& overlay,
+	                                       vk::ImageLayout destination_layout,
+	                                       vk::AccessFlags2 destination_access,
+	                                       vk::PipelineStageFlags2 destination_stage,
+	                                       std::optional<ImageSubresourceRange> range);
 	friend struct ImageTestAccess;
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;

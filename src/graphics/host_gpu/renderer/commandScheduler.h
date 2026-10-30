@@ -276,6 +276,9 @@ public:
 	void               BeginList();
 	void               SpliceList();
 	[[nodiscard]] bool ListActive() const noexcept { return m_list_active; }
+	// With an ImageStateOverlay active on the list's thread, each splice stitches it first;
+	// `verify` asks the stitch to check its states against the uses replayed in order.
+	void SetListVerify(bool verify) noexcept { m_list_verify = verify; }
 
 private:
 	class CommandPool {
@@ -423,6 +426,7 @@ private:
 	CopyBatchState                        m_list_batch;
 	DynamicStateShadow                    m_list_shadow;
 	uint64_t                              m_list_early_splices = 0;
+	bool                                  m_list_verify        = false;
 	// Appends the open list's chunks (the current one included) to the record queue.
 	void SpliceListChunks();
 };
