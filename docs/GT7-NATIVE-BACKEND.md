@@ -88,3 +88,22 @@ is answered. But a third of the draws bring a key never seen: something in the h
 changes from draw to draw (per-draw values among the target fields, or in the attribute or
 vertex format fields). For records built from cached pieces, N2 splits the key into its parts,
 finds what varies, and keys the pipeline on the parts that are state.
+
+## N2, first: a stable key (2026-10-30)
+
+Split into parts on a sample of the commits ("Native key parts"), the key's new values came from
+the region after the depth target's pairs: `gt7_CommitDrawState`'s group 3 (16 viewports of
+0x1c bytes at `+0x4cc..0x68c`), group 12 (screen scissor rectangles, `+0x69c..0x6b0`) and
+group 16 (polygon offset values, `+0x6f0..0x718`), which change from draw to draw (cameras,
+shadow cascades, decals) and which Vulkan sets as dynamic state. The key now leaves those out.
+Race, 10 s windows of 300,000 to 355,000 marked draws:
+
+| | |
+|---|---|
+| state key and material seen before | **99.7 to 99.9 %** |
+| ... with other programs or another pipeline | **0.00 %** |
+| key parts new, sampled | 0.0 to 0.1 % each (shaders up to 1.2 % in a scene change) |
+
+A marked draw's pipeline and programs are a function of a key GT7's render thread makes in
+0.3 us, and the keys repeat: the record's static half (pipeline, programs, material bindings)
+can be built once per key and material.

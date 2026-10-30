@@ -15,10 +15,12 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -56,7 +58,16 @@ constexpr std::array<uint8_t, 20> CommitMoved = {0x55, 0x48, 0x89, 0xe5, 0x41, 0
 // the dirty groups commit, waits and predication excluded below), each stage's shader, the
 // primitive type and the vertex formats.
 constexpr uint64_t CtxTargets      = 0x10;
+constexpr uint64_t CtxDepthTarget  = 0x418;
 constexpr uint64_t CtxTargetsEnd   = 0x718;
+// N2: the dynamic state among them (gt7_CommitDrawState's groups 3, 12 and 16), which Vulkan
+// sets per draw and the pipeline key leaves out: 16 viewports of 0x1c bytes (+0x68c: the mask
+// of those used), the screen scissor rectangles, the polygon offset values.
+constexpr uint64_t CtxViewports     = 0x4cc;
+constexpr uint64_t CtxViewportsEnd  = 0x68c;
+constexpr uint64_t CtxScissors      = 0x69c;
+constexpr uint64_t CtxScissorsEnd   = 0x6b0;
+constexpr uint64_t CtxPolyOffset    = 0x6f0;
 constexpr uint64_t CtxAttribSlots  = 0x770;
 constexpr uint64_t CtxAttribEnd    = 0x788;
 constexpr uint64_t CtxStages       = 0x870;
@@ -153,21 +164,114 @@ uint64_t HashBytes(uint64_t key, const uint8_t* data, size_t size) {
 	return key;
 }
 
+// N2, measured first: the key's parts, on a sample of the commits (one in 16 a thread): how often
+// each part's value is one not seen before, and the 32-bit fields of the hashed regions with the
+// most distinct values (what varies from draw to draw). A "Native key parts" line every 10 s.
+enum KeyPart : uint32_t { PartColor, PartDepth, PartFixed, PartAttribs, PartShaders, PartPrim,
+                          PartFormats, PartAll, PartCount };
+constexpr std::array<const char*, PartCount> PartNames = {
+    "colour targets", "depth target", "fixed function", "attribute slots", "shaders",
+    "primitive type", "vertex formats", "all"};
+struct KeyParts {
+	std::mutex                                                  mutex;
+	std::array<std::unordered_set<uint64_t>, PartCount>         seen;
+	std::array<uint64_t, PartCount>                             fresh {};
+	uint64_t                                                    samples = 0;
+	// distinct values by field offset (capped)
+	std::unordered_map<uint32_t, std::unordered_set<uint32_t>> fields;
+};
+KeyParts g_key_parts;
+thread_local uint32_t t_key_sample = 0;
+
+void SampleKeyParts(const uint8_t* ctx, const std::array<uint64_t, PartCount>& parts) {
+	auto&           k = g_key_parts;
+	std::lock_guard lock(k.mutex);
+	k.samples++;
+	for (uint32_t i = 0; i < PartCount; i++) {
+		if (k.seen[i].size() > (1u << 18u)) {
+			k.seen[i].clear();
+		}
+		if (k.seen[i].insert(parts[i]).second) {
+			k.fresh[i]++;
+		}
+	}
+	const auto fields = [&](uint64_t begin, uint64_t end) {
+		for (uint64_t offset = begin; offset + 4 <= end; offset += 4) {
+			uint32_t value = 0;
+			std::memcpy(&value, ctx + offset, sizeof(value));
+			auto& set = k.fields[static_cast<uint32_t>(offset)];
+			if (set.size() < 4096) {
+				set.insert(value);
+			}
+		}
+	};
+	fields(CtxTargets, CtxTargetsEnd);
+	fields(CtxAttribSlots, CtxAttribEnd);
+	fields(CtxVertexFormat, CtxVertexEnd);
+}
+
+void ReportKeyParts() {
+	auto&           k = g_key_parts;
+	std::lock_guard lock(k.mutex);
+	if (k.samples == 0) {
+		return;
+	}
+	const double samples = static_cast<double>(k.samples);
+	std::string  parts;
+	for (uint32_t i = 0; i < PartCount; i++) {
+		parts += fmt::format("{}{} {:.1f}%", i == 0 ? "" : ", ", PartNames[i],
+		                     100.0 * static_cast<double>(k.fresh[i]) / samples);
+	}
+	std::vector<std::pair<uint32_t, size_t>> varied;
+	for (const auto& [offset, set]: k.fields) {
+		if (set.size() > 1) {
+			varied.emplace_back(offset, set.size());
+		}
+	}
+	std::sort(varied.begin(), varied.end(),
+	          [](const auto& a, const auto& b) { return a.second > b.second; });
+	std::string fields;
+	for (size_t i = 0; i < varied.size() && i < 24; i++) {
+		fields += fmt::format("{}+{:#x} {}", i == 0 ? "" : ", ", varied[i].first, varied[i].second);
+	}
+	Log::WriteUnmuted(fmt::format(
+	    "Native key parts (10 s, {} sampled commits): new values: {} | fields with the most "
+	    "distinct values (offset, values): {}\n",
+	    k.samples, parts, fields));
+	k.samples = 0;
+	k.fresh   = {};
+	k.fields.clear();
+}
+
 KYTY_SYSV_ABI void OnCommitState(const uint8_t* ctx) {
 	const auto start = std::chrono::steady_clock::now();
-	uint64_t   key   = 0x6a09e667f3bcc909ull;
-	key              = HashBytes(key, ctx + CtxTargets, CtxTargetsEnd - CtxTargets);
-	key              = HashBytes(key, ctx + CtxAttribSlots, CtxAttribEnd - CtxAttribSlots);
+	constexpr uint64_t Seed = 0x6a09e667f3bcc909ull;
+	std::array<uint64_t, PartCount> parts {};
+	parts[PartColor] = HashBytes(Seed, ctx + CtxTargets, CtxDepthTarget - CtxTargets);
+	parts[PartDepth] = HashBytes(Seed, ctx + CtxDepthTarget, CtxViewports - CtxDepthTarget);
+	parts[PartFixed] = HashBytes(Seed, ctx + CtxViewportsEnd, CtxScissors - CtxViewportsEnd);
+	parts[PartFixed] =
+	    HashBytes(parts[PartFixed], ctx + CtxScissorsEnd, CtxPolyOffset - CtxScissorsEnd);
+	parts[PartAttribs] = HashBytes(Seed, ctx + CtxAttribSlots, CtxAttribEnd - CtxAttribSlots);
+	parts[PartShaders] = Seed;
 	for (uint64_t stage = 0; stage < 6; stage++) {
 		uint64_t shader = 0;
 		std::memcpy(&shader, ctx + CtxStages + stage * CtxStageSize, sizeof(shader));
-		key = Mix(key, shader);
+		parts[PartShaders] = Mix(parts[PartShaders], shader);
 	}
 	uint32_t prim = 0;
 	std::memcpy(&prim, ctx + CtxPrimType, sizeof(prim));
-	key = Mix(key, prim);
-	key = HashBytes(key, ctx + CtxVertexFormat, CtxVertexEnd - CtxVertexFormat);
+	parts[PartPrim]    = Mix(Seed, prim);
+	parts[PartFormats] = HashBytes(Seed, ctx + CtxVertexFormat, CtxVertexEnd - CtxVertexFormat);
+	uint64_t key       = Seed;
+	for (uint32_t i = 0; i < PartAll; i++) {
+		key = Mix(key, parts[i]);
+	}
+	parts[PartAll]   = key;
 	t_identity.state = key | 1u; // never 0
+	if ((t_key_sample++ & 15u) == 0) {
+		SampleKeyParts(ctx, parts);
+	}
 	g_state_keys.fetch_add(1, std::memory_order_relaxed);
 	g_state_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                               std::chrono::steady_clock::now() - start)
@@ -396,6 +500,7 @@ void Report() {
 		    td[0] / frames, td[5] / frames, pct(1), pct(2), pct(3), pct(4),
 		    td[7] == 0 ? 0.0 : td[6] / 1000.0 / td[7], td[9] == 0 ? 0.0 : td[8] / 1000.0 / td[9]));
 		ReportStateKeys();
+		ReportKeyParts();
 		ReportCommit();
 		ReportResolve();
 		ReportMutations();
