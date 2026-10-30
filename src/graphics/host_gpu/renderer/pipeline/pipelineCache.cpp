@@ -34,6 +34,7 @@
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
+#include "graphics/host_gpu/renderer/drawMutations.h"
 
 #include <algorithm>
 #include <array>
@@ -6065,6 +6066,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		     static_cast<void*>(pixel_program.module));
 	}
 
+	DrawMutations::Note(DrawMutations::NewPipeline);
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	auto build_programs            = programs;

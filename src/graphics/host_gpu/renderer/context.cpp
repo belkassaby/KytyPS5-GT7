@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/stallWatch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/drawMutations.h"
 
 #include <algorithm>
 #include <bit>
@@ -207,6 +208,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	if (m_rendering && m_render_state == state) {
 		return;
 	}
+	DrawMutations::Note(DrawMutations::RenderPass);
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
@@ -265,6 +267,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
+	DrawMutations::Note(DrawMutations::RenderPass);
 	Recorder().endRendering();
 	m_rendering    = false;
 	m_render_state = {};

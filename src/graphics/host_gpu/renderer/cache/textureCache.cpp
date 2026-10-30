@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/stallWatch.h"
 #include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/drawMutations.h"
 
 #include <algorithm>
 #include <array>
@@ -1094,6 +1095,7 @@ void NoteImageFreed(const char* why) {
 } // namespace
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	DrawMutations::Note(DrawMutations::NewImage);
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	m_slot_images[id].self_id = id;
 	Profiler::Add(Profiler::Counter::ImagesCreated);
@@ -2478,6 +2480,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	DrawMutations::Note(DrawMutations::ImageUpload);
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {

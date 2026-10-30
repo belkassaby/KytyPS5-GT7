@@ -6,6 +6,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/drawMutations.h"
 #include "loader/gt7GuestHook.h"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -110,6 +112,42 @@ KYTY_SYSV_ABI void OnMeshDraw(uint64_t mesh) {
 	t_identity.mesh = mesh;
 }
 
+// Milestone 4, measured first: what marked draws changed in the renderer's shared state
+// (Libs::Graphics::DrawMutations), by kind, and how many changed nothing
+namespace Mutations = Libs::Graphics::DrawMutations;
+std::array<std::atomic<uint64_t>, Mutations::Count> g_mutation_counts {};
+std::atomic<uint64_t>                               g_mutation_draws {0};
+std::atomic<uint64_t>                               g_pure_draws {0};
+std::atomic<uint64_t>                               g_pure_ns {0};
+std::atomic<uint64_t>                               g_impure_ns {0};
+
+void ReportMutations() {
+	static std::array<uint64_t, Mutations::Count> last {};
+	static uint64_t last_draws = 0, last_pure = 0, last_pure_ns = 0, last_impure_ns = 0;
+	const auto draws = g_mutation_draws.load(), pure = g_pure_draws.load();
+	const auto pure_ns = g_pure_ns.load(), impure_ns = g_impure_ns.load();
+	const auto n       = static_cast<double>(std::max<uint64_t>(draws - last_draws, 1));
+	const auto p       = static_cast<double>(pure - last_pure);
+	const char* names[Mutations::Count] = {"barrier", "render pass", "new image", "image upload",
+	                                       "new buffer", "buffer upload", "new pipeline"};
+	std::string kinds;
+	for (uint32_t i = 0; i < Mutations::Count; i++) {
+		const auto now = g_mutation_counts[i].load();
+		kinds += fmt::format("{}{} {:.1f}%", i == 0 ? "" : ", ", names[i],
+		                     100.0 * static_cast<double>(now - last[i]) / n);
+		last[i] = now;
+	}
+	Log::WriteUnmuted(fmt::format(
+	    "Native mutations: {:.0f} marked draws: {:.1f}% changed no shared state ({:.2f} us each in "
+	    "the renderer; the others {:.2f} us) | draws with each kind: {}\n",
+	    n, 100.0 * p / n, p == 0 ? 0.0 : static_cast<double>(pure_ns - last_pure_ns) / 1000.0 / p,
+	    n - p == 0 ? 0.0 : static_cast<double>(impure_ns - last_impure_ns) / 1000.0 / (n - p), kinds));
+	last_draws     = draws;
+	last_pure      = pure;
+	last_pure_ns   = pure_ns;
+	last_impure_ns = impure_ns;
+}
+
 // CommitBindings' steps for marked draws (AddCommitSteps)
 std::array<std::atomic<uint64_t>, 5> g_commit_ns {};
 std::atomic<uint64_t>                g_commit_calls {0};
@@ -186,6 +224,7 @@ void Report() {
 		    td[0] / frames, td[5] / frames, pct(1), pct(2), pct(3), pct(4),
 		    td[7] == 0 ? 0.0 : td[6] / 1000.0 / td[7], td[9] == 0 ? 0.0 : td[8] / 1000.0 / td[9]));
 		ReportCommit();
+		ReportMutations();
 	}
 }
 
@@ -236,6 +275,7 @@ void OnMarker(const uint32_t* payload, uint32_t dwords) {
 
 void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count) {
 	g_draws.fetch_add(1, std::memory_order_relaxed);
+	Mutations::t_mask = 0;
 	if (!g_pending) {
 		return;
 	}
@@ -265,6 +305,19 @@ void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count) {
 
 void OnDrawDone(uint64_t renderer_ns) {
 	if (g_current_marked) {
+		const auto mask = Mutations::t_mask;
+		g_mutation_draws.fetch_add(1, std::memory_order_relaxed);
+		if (mask == 0) {
+			g_pure_draws.fetch_add(1, std::memory_order_relaxed);
+			g_pure_ns.fetch_add(renderer_ns, std::memory_order_relaxed);
+		} else {
+			g_impure_ns.fetch_add(renderer_ns, std::memory_order_relaxed);
+		}
+		for (uint32_t i = 0; i < Mutations::Count; i++) {
+			if ((mask >> i) & 1u) {
+				g_mutation_counts[i].fetch_add(1, std::memory_order_relaxed);
+			}
+		}
 		g_marked_draw_ns.fetch_add(renderer_ns, std::memory_order_relaxed);
 		g_marked_draw_count.fetch_add(1, std::memory_order_relaxed);
 	} else {

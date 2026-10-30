@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/drawMutations.h"
 
 #include <algorithm>
 #include <array>
@@ -2160,6 +2161,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	KYTY_PROFILER_FUNCTION();
+	DrawMutations::Note(DrawMutations::NewBuffer);
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	if (vaddr < CACHING_PAGESIZE) {
@@ -2377,6 +2379,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 
 void BufferCache::RecordUpload(Buffer& buffer, std::span<const vk::BufferCopy> copies,
                                uint64_t total_size, vk::Buffer source) {
+	DrawMutations::Note(DrawMutations::BufferUpload);
 	if (m_metadata_watch_count.load(std::memory_order_relaxed) != 0) {
 		// Bytes the CPU wrote, uploaded over what a fast-clear check left there.
 		std::unique_lock lock(m_dirty_ranges_mutex);
