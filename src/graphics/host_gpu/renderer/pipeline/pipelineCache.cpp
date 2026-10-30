@@ -2475,6 +2475,33 @@ struct PipelineCache::ProgramCache {
 		bool     specialization_hash_valid = false;
 	};
 
+	// GT7 port, native path milestone 4 (docs/GT7-NATIVE-PATH.md): a draw's refresh of a stage
+	// (its resource snapshot and specialization) is kept per thread and stage, not in the
+	// program's shared entry, so draws of one program can be prepared on different threads. The
+	// draw's runtime points here; `entry` says whose refresh it holds (a prepared result is used
+	// again by a later draw of the same packet only when it is this entry's).
+	struct StageSnapshot {
+		const SourceEntry*                           entry = nullptr;
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		uint64_t                                     prepared_serial           = 0;
+		uint64_t                                     specialization_hash       = 0;
+		bool                                         specialization_hash_valid = false;
+	};
+	static StageSnapshot& Snapshot(ShaderType stage) {
+		static thread_local std::array<StageSnapshot, 16> snapshots;
+		return snapshots[static_cast<size_t>(stage) & 15u];
+	}
+	// A parallel stage walk (PrepareStagesInParallel) refreshed the entry itself: its result
+	// moves to this thread's snapshot.
+	static void TakeEntryRefresh(SourceEntry& entry, StageSnapshot& snapshot) {
+		std::swap(snapshot.resources, entry.resources);
+		std::swap(snapshot.specialization, entry.specialization);
+		snapshot.entry                     = &entry;
+		snapshot.prepared_serial           = 0;
+		snapshot.specialization_hash_valid = false;
+	}
+
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
 			std::size_t hash = static_cast<std::size_t>(key.stage);
@@ -2544,7 +2571,7 @@ struct PipelineCache::ProgramCache {
 
 	// A compiled (or cached) permutation of the source: its module, bound for this stage.
 	template <typename InputInfo>
-	ShaderProgram AddPermutation(SourceEntry& source, const char* stage_name,
+	ShaderProgram AddPermutation(SourceEntry& source, StageSnapshot& snapshot, const char* stage_name,
 	                             const ShaderRecompiler::CompileOptions&  options,
 	                             const std::vector<uint32_t>&             spirv,
 	                             ShaderRecompiler::IR::CompiledShaderInfo program,
@@ -2598,8 +2625,8 @@ struct PipelineCache::ProgramCache {
 		}
 		const auto id = ++next_shader_id;
 		source.permutations.push_back({
-		    .specialization      = source.specialization,
-		    .specialization_hash = SpecializationHash(source.specialization),
+		    .specialization      = snapshot.specialization,
+		    .specialization_hash = SpecializationHash(snapshot.specialization),
 		    .program             = std::move(program),
 		    .handle              = {.id                = id,
 		                            .module            = module,
@@ -2611,7 +2638,7 @@ struct PipelineCache::ProgramCache {
 		                            .normalized_id     = normalized_module != nullptr ? ++next_shader_id : 0u},
 		});
 		const auto& permutation = source.permutations.back();
-		input_info.stage = {.program = &permutation.program, .resources = &source.resources};
+		input_info.stage = {.program = &permutation.program, .resources = &snapshot.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
@@ -2634,12 +2661,15 @@ struct PipelineCache::ProgramCache {
 	static bool MaterializeFirstUse(SourceEntry&                           source,
 	                                const ShaderRecompiler::IR::SrtRuntime& runtime,
 	                                ShaderType stage, const char* stage_name, uint64_t hash) {
-		bool ok = false;
+		bool ok       = false;
+		auto& snapshot = Snapshot(stage);
 		{
 			std::lock_guard walk_lock(source.walk_mutex);
-			source.prepared_serial = 0;
+			snapshot.entry                     = &source;
+			snapshot.prepared_serial           = 0;
+			snapshot.specialization_hash_valid = false;
 			ok = ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime,
-			                                                source.resources, source.specialization);
+			                                                snapshot.resources, snapshot.specialization);
 		}
 		if (ok) {
 			return true;
@@ -2841,25 +2871,27 @@ struct PipelineCache::ProgramCache {
 				KYTY_PROFILER_PHASE(refresh_zone, "SRT refresh", profiler::colors::Amber300);
 				// Compute: flat slots only the shader uses are left to the GPU when it wrote their
 				// bytes; the renderer copies them on the GPU before the dispatch (SrtGpuFill).
-				entry->second.resources.gpu_fills.clear();
+				auto& snapshot = Snapshot(stage);
+				snapshot.resources.gpu_fills.clear();
 				if (stage == ShaderType::Compute && SrtGpuFillEnabled()) {
 					runtime.gpu_written = SrtBytesGpuWritten;
-					runtime.gpu_fills   = &entry->second.resources.gpu_fills;
+					runtime.gpu_fills   = &snapshot.resources.gpu_fills;
 				}
 				t_srt_shader_hash = params.hash;
 				bool materialized = false;
 				bool scanned      = false;
 				if (TakePrepared(&entry->second)) {
-					entry->second.prepared_serial = 0;
 					// Refreshed in this draw's parallel window (PrepareStagesInParallel).
 					static const bool verify = std::getenv("KYTY_STAGE_PREP_VERIFY") != nullptr;
 					materialized             = true;
 					if (verify) {
 						VerifyPrepared(entry->second, runtime, stage, params.hash);
 					}
+					TakeEntryRefresh(entry->second, snapshot);
 				} else if (DrawPrep::Enabled() && !Bisect::DrawPrepOff() && [&] {
 					           const GpuPhases::Scope phase(GpuPhases::Phase::ProgramScanned);
-					           return TakeScanned(entry->second, stage, runtime, params.hash);
+					           return TakeScanned(entry->second, snapshot, stage, runtime,
+					                              params.hash);
 				           }()) {
 					// Prepared by the draw-prep scanner from the same inputs and bytes.
 					materialized = true;
@@ -2867,14 +2899,18 @@ struct PipelineCache::ProgramCache {
 				} else {
 					const GpuPhases::Scope phase(GpuPhases::Phase::ProgramWalk);
 					std::lock_guard        walk_lock(entry->second.walk_mutex);
-					entry->second.prepared_serial = 0;
+					// the plan's memo and replay state are the entry's (shared); the refresh is
+					// the draw's
+					DrawMutations::Note(DrawMutations::ProgramEntry);
+					snapshot.entry           = &entry->second;
+					snapshot.prepared_serial = 0;
 					materialized = ShaderRecompiler::IR::MaterializeResources(
-					    entry->second.resource_plan, runtime, entry->second.resources,
-					    entry->second.specialization);
+					    entry->second.resource_plan, runtime, snapshot.resources,
+					    snapshot.specialization);
 				}
 				if (!scanned) {
 					// Refreshed here: its specialization has no hash made with it.
-					entry->second.specialization_hash_valid = false;
+					snapshot.specialization_hash_valid = false;
 				}
 				t_srt_shader_hash = 0;
 				runtime.gpu_written = nullptr;
@@ -2911,18 +2947,19 @@ struct PipelineCache::ProgramCache {
 					return ShaderProgram {};
 				}
 			}
-			auto&      source  = entry->second;
+			auto&      source   = entry->second;
+			auto&      snapshot = Snapshot(stage);
 			// Round 79: by the hash the scanner made, when there is one (comparing the
 			// specializations themselves read the scanner's freshly written vectors: ~2 % of the
 			// GPU thread in a race). KYTY_BISECT's spechash:off compares them again.
-			const bool by_hash = source.specialization_hash_valid && !Bisect::SpecHashOff();
+			const bool by_hash = snapshot.specialization_hash_valid && !Bisect::SpecHashOff();
 			const auto matches = [&](const Permutation& candidate) {
 				const auto& layout = candidate.program.bindings;
 				return layout.push_data_start_dword ==
 				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
 				                                                    layout.ShaderDataDwords()) &&
-				       (by_hash ? candidate.specialization_hash == source.specialization_hash
-				                : candidate.specialization == source.specialization);
+				       (by_hash ? candidate.specialization_hash == snapshot.specialization_hash
+				                : candidate.specialization == snapshot.specialization);
 			};
 			Permutation* permutation = nullptr;
 			if (source.last_permutation < source.permutations.size() &&
@@ -2934,14 +2971,14 @@ struct PipelineCache::ProgramCache {
 				source.last_permutation = static_cast<size_t>(found - source.permutations.begin());
 			}
 			if (permutation != nullptr && by_hash && DrawPrep::VerifyMode() != 0 &&
-			    !(permutation->specialization == source.specialization)) {
+			    !(permutation->specialization == snapshot.specialization)) {
 				// KYTY_DRAW_PREP_VERIFY: the hash found a permutation of another specialization.
 				DrawPrep::Add(DrawPrep::Counter::VerifyMismatches);
 				static std::atomic<uint32_t> logged {0};
 				if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
 					LOGF("DrawPrep verify: %s 0x%016" PRIx64 " specialization hash %016" PRIx64
 					     " found a permutation of another specialization\n",
-					     StageLabel(stage), params.hash, source.specialization_hash);
+					     StageLabel(stage), params.hash, snapshot.specialization_hash);
 				}
 				if (DrawPrep::VerifyMode() == 2) {
 					EXIT("DrawPrep verify: specialization hash collision\n");
@@ -2949,7 +2986,7 @@ struct PipelineCache::ProgramCache {
 			}
 			if (permutation != nullptr) {
 				input_info.stage = {.program   = &permutation->program,
-				                    .resources = &source.resources};
+				                    .resources = &snapshot.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
@@ -3082,7 +3119,7 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 			if (entry != programs.end()) {
-				BuildPermutationKey(permutation_key, source_key, entry->second.specialization,
+				BuildPermutationKey(permutation_key, source_key, Snapshot(stage).specialization,
 				                    push_data_cursor);
 				std::vector<uint8_t>               payload;
 				ShaderDiskCache::PermutationRecord record;
@@ -3111,7 +3148,7 @@ struct PipelineCache::ProgramCache {
 					if (!lookup_key.function_code.empty()) {
 						gave_up_call_shaders.erase(params.hash);
 					}
-					auto handle = AddPermutation(entry->second, stage_name, options, record.spirv,
+					auto handle = AddPermutation(entry->second, Snapshot(stage), stage_name, options, record.spirv,
 					                             std::move(record.program), input_info,
 					                             push_data_cursor, InlinedCalls(params));
 					NotePixelEntry<InputInfo>(handle, permutation_key);
@@ -3300,7 +3337,7 @@ struct PipelineCache::ProgramCache {
 				return ShaderProgram {};
 			}
 			if (disk != nullptr) {
-				BuildPermutationKey(permutation_key, source_key, entry->second.specialization,
+				BuildPermutationKey(permutation_key, source_key, Snapshot(stage).specialization,
 				                    push_data_cursor);
 				if (disk_verify) {
 					std::vector<uint8_t> payload;
@@ -3311,7 +3348,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		auto compiled = CompileTranslated(options, std::move(translated),
-		                                  entry->second.specialization, push_data_cursor);
+		                                  Snapshot(stage).specialization, push_data_cursor);
 		if (compiled.unsupported != nullptr) {
 			// Skipped, as a shader that gives up is, instead of ending the emulator.
 			const char* label = options.dump_label != nullptr ? options.dump_label : "Shader";
@@ -3337,7 +3374,7 @@ struct PipelineCache::ProgramCache {
 		if (!lookup_key.function_code.empty()) {
 			gave_up_call_shaders.erase(params.hash); // a later expansion of it translated
 		}
-		const auto handle = AddPermutation(entry->second, stage_name, options, compiled.spirv,
+		const auto handle = AddPermutation(entry->second, Snapshot(stage), stage_name, options, compiled.spirv,
 		                                   std::move(compiled.program), input_info,
 		                                   push_data_cursor, InlinedCalls(params));
 		{
@@ -4217,7 +4254,7 @@ struct PipelineCache::ProgramCache {
 
 	// GPU thread: the scanner's refresh of this stage for the current packet, when it was made
 	// from the same program, user data and shader base and its bytes are unchanged and clean.
-	bool TakeScanned(SourceEntry& entry, ShaderType stage,
+	bool TakeScanned(SourceEntry& entry, StageSnapshot& snapshot, ShaderType stage,
 	                 const ShaderRecompiler::IR::SrtRuntime& runtime, uint64_t hash) {
 		auto* result = DrawPrep::Take(static_cast<uint32_t>(stage));
 		if (result == nullptr) {
@@ -4229,7 +4266,7 @@ struct PipelineCache::ProgramCache {
 		}
 		// Used already by an earlier draw of this packet: the entry must still hold its refresh.
 		const bool again = result->consumed;
-		if (again && entry.prepared_serial != result->serial) {
+		if (again && (snapshot.entry != &entry || snapshot.prepared_serial != result->serial)) {
 			DrawPrep::Add(DrawPrep::Counter::MissNone);
 			DrawPrep::Add(DrawPrep::Counter::MissAgain);
 			return false;
@@ -4251,7 +4288,7 @@ struct PipelineCache::ProgramCache {
 			return false;
 		}
 		// A slot left to the GPU must still be GPU-written, or the walk here would read it.
-		for (const auto& fill: (again ? entry.resources : result->resources).gpu_fills) {
+		for (const auto& fill: (again ? snapshot.resources : result->resources).gpu_fills) {
 			if (!SrtBytesGpuWritten(fill.address, sizeof(uint32_t))) {
 				DrawPrep::Add(DrawPrep::Counter::MissReads);
 				return false;
@@ -4259,8 +4296,8 @@ struct PipelineCache::ProgramCache {
 		}
 		result->consumed = true;
 		// The refresh as it will be used: the result's before the swap, the entry's when again.
-		const auto& used_resources      = again ? entry.resources : result->resources;
-		const auto& used_specialization = again ? entry.specialization : result->specialization;
+		const auto& used_resources      = again ? snapshot.resources : result->resources;
+		const auto& used_specialization = again ? snapshot.specialization : result->specialization;
 		if (DrawPrep::VerifyMode() != 0) {
 			ShaderRecompiler::IR::ResourceSnapshot       fresh;
 			ShaderRecompiler::IR::ResourceSpecialization fresh_specialization;
@@ -4312,13 +4349,14 @@ struct PipelineCache::ProgramCache {
 			DrawPrep::Add(DrawPrep::Counter::Reused);
 			return true;
 		}
-		// Swapped, not moved: the entry's old buffers go back to the scanner with the result.
-		DrawMutations::Note(DrawMutations::ProgramEntry);
-		std::swap(entry.resources, result->resources);
-		std::swap(entry.specialization, result->specialization);
-		entry.specialization_hash       = result->specialization_hash;
-		entry.specialization_hash_valid = result->specialization_hash != 0;
-		entry.prepared_serial = result->serial;
+		// Swapped, not moved, into this thread's snapshot (not the shared entry: milestone 4): the
+		// snapshot's old buffers go back to the scanner with the result.
+		std::swap(snapshot.resources, result->resources);
+		std::swap(snapshot.specialization, result->specialization);
+		snapshot.entry                     = &entry;
+		snapshot.specialization_hash       = result->specialization_hash;
+		snapshot.specialization_hash_valid = result->specialization_hash != 0;
+		snapshot.prepared_serial           = result->serial;
 		DrawPrep::Add(DrawPrep::Counter::Used);
 		return true;
 	}
