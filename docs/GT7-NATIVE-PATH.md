@@ -71,8 +71,47 @@ layout and the bindings, with only the per-draw parts (constant buffer addresses
 primitive ID base, transforms) filled in at the draw. Measure first how stable the keys are frame
 to frame and how much of a draw's 10 us a template removes.
 
+### Milestone 3, measured: templates would hit, but save little each
+
+- Template keys (material, mesh, programs, pipeline) of marked draws: **99.6 to 100 % seen before**
+  (53 to 74 % the frame before, 14 to 25 % earlier in the same frame, 9 to 22 % older).
+- Marked draws cost 10.0 to 13.5 us in the renderer, the others 7.1 to 8.8 us.
+- But a draw's cost is spread thin, and the per-draw inputs (copy-on-write constants, transforms,
+  index range, targets) keep most of it per draw: `CommitBindings` is 1.05 to 1.55 us (image
+  transitions 0.35 to 0.76, recording 0.33, descriptor writes 0.23, spec checks 0.15, bindless
+  0.06), so reusing descriptor sets would save ~0.4 us. Templates as a whole: ~2 us of ~11.
+  Parallelism is the multiplier; milestone 4 went first.
+
 ## Milestone 4: recording on worker threads
 
 Templates make a marked draw self-contained: runs of them in one render pass can be recorded into
 secondary command buffers by worker threads while the GPU thread keeps everything that mutates
 (GT7-STEP5-PLAN.md), which is where the frame rate gains past one thread's limit come from.
+
+**What a draw writes in shared state** (`DrawMutations`, `renderer/drawMutations.h`): the renderer
+marks, per draw and phase (prepare: programs, bindings, vertex buffers, pipeline lookup; record:
+render targets onward), barriers, render pass changes, new images and buffers, image and buffer
+uploads, new pipelines, program cache entries replaced, texture descriptors added, texture memos
+written and samplers created. Music rally race, marked draws:
+
+| | first audit | after per-draw snapshots |
+|---|---|---|
+| nothing written while preparing | 0.0 to 0.1 % | **97.8 to 98.8 %** |
+| nothing written while recording | 92.5 to 93.6 % | 92.4 to 93.4 % |
+| nothing written at all | 0.0 to 0.1 % | **91.9 to 93.0 %** |
+| program entry replaced while preparing | 99.8 to 100 % | 0.1 to 0.7 % (full walks) |
+
+Recording: render pass changes 6.4 to 7.6 %, barriers 2.4 to 3.3 %. Preparing: each other kind
+under 1 %. Clean draws take ~10 us in the renderer, the others 33 to 66 us.
+
+**Per-draw snapshots** (commit 84ecd733): the program cache kept each draw's refresh of a stage
+(resource snapshot, specialization) in the program's shared entry, written by every draw of the
+program. It is now kept per thread and stage (`ProgramCache::StageSnapshot`), and the draw's
+runtime points there. `KYTY_DRAW_PREP_VERIFY=1` over a race: 15.9 million prepared refreshes
+used, 0 differing from a walk. A/B: 15.9 fps against 15.7 (a draw 11.51 us against 11.19, other
+scenes: within noise).
+
+**Next: prepare-ahead.** While the GPU thread records draw N, a worker prepares the next marked
+draws from register state the draw-prep scanner keeps; the GPU thread takes a prepared draw when
+its inputs still match and prepares it itself otherwise (and when preparing it would write shared
+state), with a verify mode. Then recording on workers (secondary command buffers).
