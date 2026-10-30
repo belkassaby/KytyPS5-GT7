@@ -44,6 +44,7 @@
 #include "graphics/host_gpu/renderer/drawMutations.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -56,6 +57,7 @@
 #include <mutex>
 #include <set>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1022,6 +1024,105 @@ static uint64_t Gt7Now() {
 	                                 .count());
 }
 
+// The slow path's images in those stages, tallied (GPU thread): why the memo did not serve them,
+// what the lookup found, and the descriptors that took it most. A "Native slow path:" line every
+// 10 s.
+enum Gt7SlowReason : uint32_t {
+	Gt7SlowStorage,      // not memo-eligible: written or atomic
+	Gt7SlowBindless,     // not memo-eligible: bindless heap
+	Gt7SlowDepthCompare, // not memo-eligible: depth comparison
+	Gt7SlowDynamicMip,   // not memo-eligible: per-mip views
+	Gt7SlowMemoOff,      // the memo is off
+	Gt7SlowNoneKept,     // the descriptor has nothing kept
+	Gt7SlowStale,        // an image near its memory was made or dropped since
+	Gt7SlowGone,         // the kept image is unregistered
+	Gt7SlowDepth,        // the kept image has a depth association
+	Gt7SlowRebind,       // the kept image must be bound again
+	Gt7SlowReasons
+};
+
+struct Gt7SlowTally {
+	struct Top {
+		uint64_t count = 0, ns = 0, size = 0;
+		uint32_t width = 0, height = 0, reasons = 0, usage = 0;
+		uint32_t format = 0;
+	};
+	std::array<uint64_t, Gt7SlowReasons> count {}, ns {};
+	uint64_t images = 0;
+	// The stale ones: the lookup found the kept image again (only the zone stamp moved), and how
+	// many have a descriptor range past 4 MB (stamped by 64 MB region).
+	uint64_t stale_same = 0, stale_region = 0;
+	// After the lookup: may be kept (the same backing, no stamp change during it), or not because
+	// of a different backing / a stamp change during the lookup.
+	uint64_t keepable = 0, other_backing = 0, moved_during = 0;
+	// The image found: a render target, depth target, storage image, written by the GPU, missing.
+	uint64_t render_target = 0, depth_target = 0, storage = 0, gpu_pixels = 0, missing = 0;
+	std::unordered_map<uint64_t, Top>     by_address;
+	std::chrono::steady_clock::time_point last {};
+};
+static Gt7SlowTally g_gt7_slow;
+
+static void ReportGt7Slow() {
+	auto&      t   = g_gt7_slow;
+	const auto now = std::chrono::steady_clock::now();
+	if (t.last.time_since_epoch().count() == 0) {
+		t.last = now;
+		return;
+	}
+	if (now - t.last < std::chrono::seconds(10)) {
+		return;
+	}
+	static const char* const names[Gt7SlowReasons] = {
+	    "storage", "bindless", "depth compare", "per-mip", "memo off",
+	    "nothing kept", "stale", "image gone", "depth assoc", "rebind"};
+	const double images = static_cast<double>(std::max<uint64_t>(t.images, 1));
+	std::string  reasons;
+	for (uint32_t i = 0; i < Gt7SlowReasons; i++) {
+		if (t.count[i] != 0) {
+			reasons += fmt::format("{}{} {:.1f}% ({:.2f} us)", reasons.empty() ? "" : ", ",
+			                       names[i], 100.0 * static_cast<double>(t.count[i]) / images,
+			                       static_cast<double>(t.ns[i]) / 1000.0 /
+			                           static_cast<double>(t.count[i]));
+		}
+	}
+	const auto pct = [&](uint64_t v) { return 100.0 * static_cast<double>(v) / images; };
+	std::vector<std::pair<uint64_t, const Gt7SlowTally::Top*>> top;
+	top.reserve(t.by_address.size());
+	for (const auto& [address, entry] : t.by_address) {
+		top.emplace_back(address, &entry);
+	}
+	const size_t shown = std::min<size_t>(top.size(), 10);
+	std::partial_sort(top.begin(), top.begin() + static_cast<ptrdiff_t>(shown), top.end(),
+	                  [](const auto& a, const auto& b) { return a.second->count > b.second->count; });
+	std::string tops;
+	for (size_t i = 0; i < shown; i++) {
+		const auto& e = *top[i].second;
+		std::string why;
+		for (uint32_t r = 0; r < Gt7SlowReasons; r++) {
+			if ((e.reasons & (1u << r)) != 0) {
+				why += fmt::format("{}{}", why.empty() ? "" : "+", names[r]);
+			}
+		}
+		tops += fmt::format("\n  {:#x}: {:.1f}% {}x{} fmt {} {} KB{}{}{} | {}", top[i].first,
+		                    pct(e.count), e.width, e.height, e.format, e.size / 1024,
+		                    (e.usage & 1u) != 0 ? " RT" : "", (e.usage & 2u) != 0 ? " DT" : "",
+		                    (e.usage & 4u) != 0 ? " GPU-written" : "", why);
+	}
+	LOGF("%s", fmt::format("Native slow path ({:.0f} s): {} images in {} descriptors | {} | stale: "
+	                       "{:.1f}% found the kept image again, {:.1f}% over 4 MB | after: {:.1f}% "
+	                       "keepable, {:.1f}% other backing, {:.1f}% stamp moved during | found: "
+	                       "{:.1f}% render targets, {:.1f}% depth, {:.1f}% storage, {:.1f}% "
+	                       "GPU-written, {:.1f}% none; top:{}\n",
+	                       std::chrono::duration<double>(now - t.last).count(), t.images,
+	                       t.by_address.size(), reasons, pct(t.stale_same), pct(t.stale_region),
+	                       pct(t.keepable), pct(t.other_backing), pct(t.moved_during),
+	                       pct(t.render_target), pct(t.depth_target), pct(t.storage),
+	                       pct(t.gpu_pixels), pct(t.missing), tops)
+	                .c_str());
+	t      = {};
+	t.last = now;
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value,
                                               bool                                         memo) {
@@ -1059,7 +1160,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			t_gt7_resolve.key_ns += gt7_found - gt7_start;
 		}
 		if (found != nullptr) {
-			auto& entry = *found;
+			auto& entry      = *found;
+			auto  gt7_reason = resource.written || resource.atomic || resource.atomic64
+			                       ? Gt7SlowStorage
+			                   : resource.bindless      ? Gt7SlowBindless
+			                   : resource.depth_compare ? Gt7SlowDepthCompare
+			                   : resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic
+			                       ? Gt7SlowDynamicMip
+			                       : Gt7SlowMemoOff;
 			if (use_memo && MemoCurrent(entry.memo, entry.desc, texture_cache)) {
 				// The image FindImage would find: RebindImages checks it is unchanged before it
 				// uses the view again, and looks it up again otherwise.
@@ -1078,9 +1186,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 					return binding;
 				}
 				g_texture_memo_counts.miss_image++;
+				gt7_reason = image == nullptr || !image->registered ? Gt7SlowGone
+				             : image->depth_id                      ? Gt7SlowDepth
+				                                                    : Gt7SlowRebind;
 			} else if (use_memo) {
 				(entry.memo.generation == 0 ? g_texture_memo_counts.miss_none
 				                            : g_texture_memo_counts.miss_stale)++;
+				gt7_reason = entry.memo.generation == 0 ? Gt7SlowNoneKept : Gt7SlowStale;
 			}
 			const auto generation   = texture_cache.ImageSetGeneration();
 			const auto range        = entry.desc.info.data;
@@ -1091,8 +1203,54 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
                 entry.view_format, entry.size, use_memo ? &same_backing : nullptr);
 			KeepForMemo(binding, use_memo, same_backing, generation, stamp, range, texture_cache);
 			if (t_gt7_resolve.on) {
+				const uint64_t ns = Gt7Now() - gt7_found;
 				t_gt7_resolve.slows++;
-				t_gt7_resolve.slow_ns += Gt7Now() - gt7_found;
+				t_gt7_resolve.slow_ns += ns;
+				auto& t = g_gt7_slow;
+				t.images++;
+				t.count[gt7_reason]++;
+				t.ns[gt7_reason] += ns;
+				if (gt7_reason == Gt7SlowStale) {
+					t.stale_same += binding.image_id == entry.memo.id ? 1 : 0;
+					t.stale_region += ((range.address + range.size - 1) >> 20u) -
+					                              (range.address >> 20u) + 1 >
+					                          4
+					                      ? 1
+					                      : 0;
+				}
+				if (use_memo) {
+					if (binding.memo_generation != 0) {
+						t.keepable++;
+					} else if (!same_backing) {
+						t.other_backing++;
+					} else {
+						t.moved_during++;
+					}
+				}
+				uint32_t    usage = 0;
+				const auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
+				if (image == nullptr) {
+					t.missing++;
+				} else {
+					usage |= image->usage.render_target ? 1u : 0u;
+					usage |= image->usage.depth_target ? 2u : 0u;
+					usage |= image->gpu_pixels ? 4u : 0u;
+					t.render_target += image->usage.render_target ? 1 : 0;
+					t.depth_target += image->usage.depth_target ? 1 : 0;
+					t.storage += image->usage.storage ? 1 : 0;
+					t.gpu_pixels += image->gpu_pixels ? 1 : 0;
+				}
+				auto& top = t.by_address[range.address];
+				top.count++;
+				top.ns += ns;
+				top.reasons |= 1u << gt7_reason;
+				top.usage |= usage;
+				if (image != nullptr) {
+					top.width  = image->info.extent.width;
+					top.height = image->info.extent.height;
+					top.format = static_cast<uint32_t>(image->info.guest_format);
+					top.size   = image->info.data.size;
+				}
 			}
 			return binding;
 		}
@@ -3661,6 +3819,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		::Loader::Gt7NativeDraws::AddResolveSteps(r.key_ns, r.memo_ns, r.slow_ns, r.bind_ns, r.images,
 		                                         r.hits, r.slows);
 		t_gt7_resolve.on = false;
+		ReportGt7Slow();
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	// KYTY_BISECT lit:big: whether a sampler samples a depth image 4096 or more texels wide. One
