@@ -175,9 +175,14 @@ struct RecordStage {
 	uint32_t slot  = 0;
 	uint32_t offset = 0; // of the copy, from the record's start
 };
+// N3 step 1: each stage's user-data SGPRs 0-31 from the engine's shadow (GT7StageBinding +0x18),
+// compared at the draw with the SGPRs Kyty's command processor holds.
+constexpr uint64_t StageUserData = 0x18;
 struct Record {
 	uint64_t    serial = 0;
 	RecordStage stages[2];
+	uint32_t    user[2][32] {};
+	bool        has_user[2] {};
 };
 struct RecordRing {
 	std::unique_ptr<uint8_t[]> bytes {new uint8_t[RingBytes]};
@@ -220,6 +225,15 @@ uint64_t MakeRecord() {
 	auto*   base   = ring.bytes.get() + ring.head;
 	auto*   record = new (base) Record {};
 	record->serial = g_record_serials.fetch_add(1, std::memory_order_relaxed) + 1;
+	for (uint32_t s = 0; s < 2; s++) {
+		const uint8_t* stage  = t_ctx + CtxStages + s * CtxStageSize;
+		uint64_t       shader = 0;
+		std::memcpy(&shader, stage, sizeof(shader));
+		if (shader != 0) {
+			std::memcpy(record->user[s], stage + StageUserData, sizeof(record->user[s]));
+			record->has_user[s] = true;
+		}
+	}
 	uint32_t offset = sizeof(Record);
 	for (uint32_t s = 0; s < 2; s++) {
 		if (sizes[s] == 0) {
@@ -243,6 +257,10 @@ uint64_t MakeRecord() {
 // GPU thread, at the draw: the checks of a marked draw's record.
 std::atomic<uint64_t> g_n3_draws {0}, g_n3_stale {0}, g_n3_stages {0}, g_n3_address {0},
     g_n3_bytes {0}, g_n3_no_slot {0};
+// Step 1: stages compared, stages whose SGPRs all matched, SGPRs compared, and per SGPR index the
+// mismatches (vertex stage, pixel stage).
+std::atomic<uint64_t> g_user_stages {0}, g_user_stages_same {0}, g_user_sgprs {0};
+std::array<std::array<std::atomic<uint64_t>, 32>, 2> g_user_diff {};
 
 void CheckRecord(uint64_t record_address, uint64_t serial, const uint32_t* const sgprs[2],
                  const uint32_t counts[2]) {
@@ -255,6 +273,33 @@ void CheckRecord(uint64_t record_address, uint64_t serial, const uint32_t* const
 	if (record->serial != serial) {
 		g_n3_stale.fetch_add(1, std::memory_order_relaxed);
 		return;
+	}
+	for (uint32_t s = 0; s < 2; s++) {
+		if (!record->has_user[s] || sgprs[s] == nullptr) {
+			continue;
+		}
+		const uint32_t count = std::min<uint32_t>(counts[s], 32);
+		bool           same  = true;
+		for (uint32_t i = 0; i < count; i++) {
+			if (record->user[s][i] != sgprs[s][i]) {
+				g_user_diff[s][i].fetch_add(1, std::memory_order_relaxed);
+				same = false;
+				// A sample: the first mismatches of each SGPR, with both values.
+				static std::array<std::array<std::atomic<uint32_t>, 32>, 2> logged {};
+				if (logged[s][i].fetch_add(1, std::memory_order_relaxed) < 4) {
+					Log::WriteUnmuted(fmt::format(
+					    "Native records N3 user data: {} stage SGPR {}: engine 0x{:08x}, Kyty "
+					    "0x{:08x} (SGPR {} 0x{:08x} / 0x{:08x})\n",
+					    s == 0 ? "vertex" : "pixel", i, record->user[s][i], sgprs[s][i], i ^ 1u,
+					    record->user[s][i ^ 1u], sgprs[s][i ^ 1u]));
+				}
+			}
+		}
+		g_user_stages.fetch_add(1, std::memory_order_relaxed);
+		g_user_sgprs.fetch_add(count, std::memory_order_relaxed);
+		if (same) {
+			g_user_stages_same.fetch_add(1, std::memory_order_relaxed);
+		}
 	}
 	for (uint32_t s = 0; s < 2; s++) {
 		const auto& stage = record->stages[s];
@@ -292,6 +337,29 @@ void ReportRecords() {
 		last[i] = now[i];
 	}
 	const double stages = std::max(1.0, d[5]);
+	static uint64_t last_user[3] {};
+	const uint64_t  user_now[3] = {g_user_stages.load(), g_user_stages_same.load(),
+	                               g_user_sgprs.load()};
+	const double    user_stages = static_cast<double>(user_now[0] - last_user[0]);
+	const double    user_same   = static_cast<double>(user_now[1] - last_user[1]);
+	const double    user_sgprs  = static_cast<double>(user_now[2] - last_user[2]);
+	std::copy(std::begin(user_now), std::end(user_now), std::begin(last_user));
+	static std::array<std::array<uint64_t, 32>, 2> last_diff {};
+	std::string                                    diffs;
+	for (uint32_t s = 0; s < 2; s++) {
+		for (uint32_t i = 0; i < 32; i++) {
+			const uint64_t now_diff = g_user_diff[s][i].load();
+			if (now_diff != last_diff[s][i]) {
+				diffs += fmt::format(" {}{}:{}", s == 0 ? "v" : "p", i, now_diff - last_diff[s][i]);
+			}
+			last_diff[s][i] = now_diff;
+		}
+	}
+	Log::WriteUnmuted(fmt::format(
+	    "Native records N3 user data (10 s): {:.0f} stages compared, {:.2f}% with every SGPR as "
+	    "the engine's shadow, {:.1f} SGPRs each | differing SGPRs (stage, index: count):{}\n",
+	    user_stages, user_stages == 0 ? 0.0 : 100.0 * user_same / user_stages,
+	    user_stages == 0 ? 0.0 : user_sgprs / user_stages, diffs.empty() ? " none" : diffs));
 	Log::WriteUnmuted(fmt::format(
 	    "Native records N3 (10 s): {:.0f} made on the render threads, {:.2f} us and {:.0f} bytes "
 	    "of constants each | GPU thread: {:.0f} marked draws with one, {:.0f} stale | {:.0f} "

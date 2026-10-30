@@ -130,3 +130,25 @@ transforms, and the pointers the shaders' descriptor walks follow. So the record
 is the stages' user data, and what their pointers lead to: the descriptor walk Kyty's scanner
 does today, done on the render thread from the engine's shadow, with each program's resource plan
 (known after its first translation).
+
+## N3 step 1, measured: the engine's user-data shadow is not the SGPRs (2026-10-30)
+
+Records with the vertex and pixel stages' SGPRs 0-31 from the engine's shadow
+(`GT7StageBinding::user_data`), compared at the draw with Kyty's: only **27 to 38 %** of stages
+match on every SGPR (race, 580,000 to 700,000 stages per 10 s). Vertex SGPRs 10-11 differ in
+about two thirds of the vertex stages; pixel SGPRs 8 to 28 in most pixel stages. A sample of the
+values:
+
+- the shadow holds **0** where Kyty has a sampler (pixel 12-15 and 20-23: `0x00000005 0x00700000
+  0x00280000 0x00124061`, an S#), or a buffer descriptor (vertex 12-19, pixel 16-17), or the
+  vertex buffer table pointer (vertex 10-11);
+- or it holds an **older value** (pixel 0-1: a pointer `0xc8200000_125c6000` against Kyty's
+  `0x10_00548800`; pixel 18-19: another S# than the one bound).
+
+GT7 writes these SGPRs into the command buffer **directly**, not through the shadow: the
+material's textures and samplers (`gt7_BindTexture` / `gt7_BindSampler` from `gt7_BindMaterial`,
+the slot from the shader's resource offsets), the vertex buffer table, buffer descriptors. The
+shadow only tracks what `gt7_SetUserData` writes. So the record's user data has to be assembled
+from GT7's **bind calls** as they write, per stage and SGPR: hooks on the writers the decompile
+names, building the render thread's own complete copy, checked against Kyty's SGPRs until it
+matches every draw.
