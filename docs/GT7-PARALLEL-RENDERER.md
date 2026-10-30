@@ -127,3 +127,43 @@ recording for a worker.
 mutating parts, in stream order), prepare and record in parallel by chunk (a render target run,
 or a stretch of dispatches between barriers). Next, step 3: `RenderExecutor` split so that
 recording a draw takes only its resolved command and touches no cache.
+
+## Step 3, revised: what is already parallel
+
+Reading the draw path for step 3 (`RenderExecutor::DrawIndex`, `PrepareDrawRenderState`,
+`ExecutePreparedDraw`) showed two of the three stages exist already:
+
+- **Recording is off the GPU thread.** With `KYTY_RECORD_THREAD` (on by default), every Vulkan
+  command a draw makes goes to the recording thread (`CommandScheduler::EnableRecordingThread`,
+  `buffer.Recorder()`), which also submits. The GPU thread's ~11 us a draw makes no Vulkan
+  calls.
+- **Decoding ahead exists.** The draw-prep scanner (`guest_gpu/drawPrepScanner.cpp`) reads every
+  submission when it is queued, follows its register writes on a command processor of its own,
+  and has workers walk each draw's descriptors. The GPU thread takes a walk when the bytes it
+  read are unchanged (`ReadSet::Validate`).
+
+So the GPU thread's whole cost is **preparing and resolving**: programs 2.6 us, textures 1.7,
+commit 1.2 (descriptor contents, image transitions), buffers 0.7, images 0.6, rendering 0.5,
+targets, vertex, pipeline and the rest. That is what has to move. Step 3 becomes **whole-draw
+prepare-ahead**: the scanner's workers prepare each draw completely from the scanner's register
+state (programs, pipeline, texture and buffer bindings, vertex bindings, descriptor contents),
+with read-only cache lookups under the stage 1 locks, and record what the result depended on
+(the read set's bytes, image-set and zone stamps, buffer generations). The GPU thread validates
+those, then does only what mutates (image transitions, barriers, render targets, uploads) and
+queues the commands; a draw whose validation fails is prepared on the GPU thread as now.
+
+Expected: with programs, textures, buffers and the descriptor contents prepared ahead (~6 of
+~11 us), ~4.5 us a draw stays on the GPU thread (~2.4x, about 40 fps in a race); 60 fps needs
+the targets, images and rendering bookkeeping cut to ~3 us as well (resolve by identity, step 5).
+
+Order:
+
+1. **Programs ahead.** The scanner's workers already walk the descriptors. They also take the
+   program lookup (`ProgramCache::Get`'s key and entry), so the GPU thread's 2.6 us `programs`
+   phase becomes a check.
+2. **Textures ahead.** The pixel and vertex stages' `ResolveTexture` on the workers, against
+   state the GPU thread publishes (the texture memo and image validity), validated by stamps.
+3. **Buffers and vertex bindings ahead.**
+4. **Descriptor contents ahead.** `CommitBindings`' writes prepared as data. The GPU thread keeps
+   the image transitions.
+5. **Dispatches** the same way (compute has its own scanner).
