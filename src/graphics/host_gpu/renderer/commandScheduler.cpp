@@ -648,7 +648,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 	// Round 167: a batch of copies ends with its command buffer.
 	m_command.Recorder().FlushCopyBatch();
-	m_copy_batch.fenced = false;
+	CopyBatch().fenced = false;
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
@@ -704,6 +704,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 			QueueSubmit(job);
 			m_worker_buffer = nullptr;
 		});
+		if (m_list_active) {
+			// Slice 2: the tick may be waited on next; what the open list holds goes now.
+			m_list_early_splices++;
+			SpliceListChunks();
+		}
 		DispatchChunk();
 		ReportRecording();
 		return job.tick;
@@ -862,6 +867,11 @@ void CommandScheduler::DispatchChunk() {
 	if (m_chunk == nullptr || m_chunk->Empty()) {
 		return;
 	}
+	if (m_list_active) {
+		// Slice 2: a full chunk of an open list waits in the list.
+		m_list_chunks.push_back(std::move(m_chunk));
+		return;
+	}
 	{
 		std::lock_guard lock(m_record_mutex);
 		m_record_queue.push_back(std::move(m_chunk));
@@ -870,9 +880,53 @@ void CommandScheduler::DispatchChunk() {
 	m_record_available.notify_one();
 }
 
+void CommandScheduler::SpliceListChunks() {
+	if (m_chunk != nullptr && !m_chunk->Empty()) {
+		m_list_chunks.push_back(std::move(m_chunk));
+	}
+	if (m_list_chunks.empty()) {
+		return;
+	}
+	{
+		std::lock_guard lock(m_record_mutex);
+		for (auto& chunk: m_list_chunks) {
+			m_record_queue.push_back(std::move(chunk));
+			m_chunks_dispatched++;
+		}
+	}
+	m_list_chunks.clear();
+	m_record_available.notify_one();
+}
+
+void CommandScheduler::BeginList() {
+	EXIT_IF(!m_threaded || m_list_active);
+	EXIT_IF(m_command.IsRendering());
+	// What the stream holds so far goes first; the list starts on a chunk of its own.
+	m_command.Recorder().FlushCopyBatch();
+	DispatchChunk();
+	m_list_active = true;
+	m_list_shadow.InvalidateAll();
+}
+
+void CommandScheduler::SpliceList() {
+	EXIT_IF(!m_list_active);
+	EXIT_IF(m_command.IsRendering());
+	m_command.Recorder().FlushCopyBatch();
+	SpliceListChunks();
+	m_list_active = false;
+	// The stream's command buffer holds what the list's commands left: unknown here.
+	m_state_shadow.InvalidateAll();
+}
+
 vk::CommandBuffer CommandScheduler::DrainRecording() {
 	if (!m_threaded) {
 		return m_command.m_buffer;
+	}
+	if (m_list_active) {
+		// Slice 2: what the open list holds runs before the raw commands that follow.
+		m_list_early_splices++;
+		m_command.Recorder().FlushCopyBatch();
+		SpliceListChunks();
 	}
 	KYTY_PROFILER_FUNCTION();
 	DispatchChunk();

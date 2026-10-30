@@ -469,6 +469,16 @@ static bool ReplayEnabled() {
 	return on;
 }
 
+// Slice 2 (CommandScheduler::BeginList): each replayed chunk records into a command list of its
+// own, appended to the stream in order at its end.
+static bool ChunkListsEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CHUNK_LISTS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
 static bool ReplayVerify() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_REPLAY_VERIFY");
@@ -480,7 +490,7 @@ static bool ReplayVerify() {
 namespace {
 struct ReplayCounts {
 	uint64_t chunks = 0, packets = 0, commands = 0, empty = 0, checks = 0, ctx_diff = 0,
-	         ucfg_diff = 0;
+	         ucfg_diff = 0, lists = 0;
 	std::chrono::steady_clock::time_point last {};
 };
 ReplayCounts g_replay_counts;
@@ -496,9 +506,10 @@ void ReportReplayIfDue() {
 		return;
 	}
 	LOGF("Replay (10 s): %" PRIu64 " chunks replayed (%" PRIu64 " packets, %" PRIu64
-	     " draws and dispatches), %" PRIu64 " chunks without one | verify: %" PRIu64
+	     " draws and dispatches; %" PRIu64 " in command lists), %" PRIu64
+	     " chunks without one | verify: %" PRIu64
 	     " checks, %" PRIu64 " context and %" PRIu64 " user config states differing\n",
-	     c.chunks, c.packets, c.commands, c.empty, c.checks, c.ctx_diff, c.ucfg_diff);
+	     c.chunks, c.packets, c.commands, c.lists, c.empty, c.checks, c.ctx_diff, c.ucfg_diff);
 	c      = {};
 	c.last = now;
 }
@@ -519,7 +530,13 @@ void CommandProcessor::ReplayChunk() {
 	}
 	auto& replay = *m_replay;
 	// The scheduler's command buffer reads the registers it is bound to: the replay's meanwhile.
-	GetScheduler().Begin(replay.m_ctx, replay.m_ucfg, replay.m_sh_ctx);
+	auto&      scheduler = GetScheduler();
+	const bool lists     = ChunkListsEnabled() && scheduler.Threaded();
+	scheduler.Begin(replay.m_ctx, replay.m_ucfg, replay.m_sh_ctx);
+	if (lists) {
+		scheduler.EndRendering();
+		scheduler.BeginList();
+	}
 	for (const auto& recorded: packets) {
 		const auto opcode = (recorded.header >> 8u) & 0xffu;
 		if (recorded.has_key) {
@@ -531,6 +548,11 @@ void CommandProcessor::ReplayChunk() {
 		                           !(opcode == Pm4::IT_NOP)
 		                       ? 1
 		                       : 0;
+	}
+	if (lists) {
+		scheduler.EndRendering();
+		scheduler.SpliceList();
+		counts.lists++;
 	}
 	counts.chunks++;
 	counts.packets += packets.size();

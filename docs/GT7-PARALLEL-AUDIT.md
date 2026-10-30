@@ -190,3 +190,16 @@ What a chunk's recording needs, one thread first:
 Verify (`KYTY_REPLAY_VERIFY`): with chunk lists on, the GPU thread also runs each `GetBarriers`
 against the real image state in stream order, and the stitch checks that each image's state
 after the chunk is what the overlay says.
+
+## Slice 2, part 1, done: command lists per chunk (2026-10-30)
+
+`KYTY_CHUNK_LISTS=1` with `KYTY_REPLAY=1`: `CommandScheduler::BeginList` / `SpliceList`. A
+replayed chunk records into a list of its own (its own dynamic state shadow and copy batch, no
+rendering open at either end), appended to the stream in order at its end; a submit or a raw
+`Handle()` drain inside a chunk appends what the list holds first. Image layouts are still
+tracked on the images, in stream order (part 2 moves them to per-chunk overlays).
+
+Music rally race and menus: every replayed chunk went through a list (~80,000 every 10 s),
+0 states differing in 28 windows, the picture unchanged. Race windows 16.8 fps median at
+11.6 us a command (16.3 and 11.8 without lists): ending the rendering at each chunk costs
+nothing visible.

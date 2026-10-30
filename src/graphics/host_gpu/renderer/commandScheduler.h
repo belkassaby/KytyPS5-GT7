@@ -260,9 +260,22 @@ public:
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 	// Round 167: the recording command buffer's batch of copies (the recording side's thread).
-	[[nodiscard]] CopyBatchState& CopyBatch() noexcept { return m_copy_batch; }
+	[[nodiscard]] CopyBatchState& CopyBatch() noexcept {
+		return m_list_active ? m_list_batch : m_copy_batch;
+	}
 	// Round 172: the recording command buffer's pipelines and dynamic state.
-	[[nodiscard]] DynamicStateShadow& StateShadow() noexcept { return m_state_shadow; }
+	[[nodiscard]] DynamicStateShadow& StateShadow() noexcept {
+		return m_list_active ? m_list_shadow : m_state_shadow;
+	}
+
+	// Parallel execution slice 2 (KYTY_CHUNK_LISTS=1, docs/GT7-PARALLEL-AUDIT.md; threaded
+	// only): a chunk's commands go to a command list of their own, with their own dynamic state
+	// shadow and copy batch, from BeginList to SpliceList, which appends the list to the stream in
+	// order. No rendering is open at either end. A submit or a drain while a list is open splices
+	// what it holds first (their commands follow it in order).
+	void               BeginList();
+	void               SpliceList();
+	[[nodiscard]] bool ListActive() const noexcept { return m_list_active; }
 
 private:
 	class CommandPool {
@@ -404,6 +417,14 @@ private:
 	PageManager*                          m_submit_pages      = nullptr;
 	CopyBatchState                        m_copy_batch;
 	DynamicStateShadow                    m_state_shadow;
+	// Slice 2's command list (BeginList): its full chunks, in order, and its own shadow and batch.
+	bool                                  m_list_active = false;
+	std::vector<std::unique_ptr<Chunk>>   m_list_chunks;
+	CopyBatchState                        m_list_batch;
+	DynamicStateShadow                    m_list_shadow;
+	uint64_t                              m_list_early_splices = 0;
+	// Appends the open list's chunks (the current one included) to the record queue.
+	void SpliceListChunks();
 };
 
 } // namespace Libs::Graphics
