@@ -1096,7 +1096,10 @@ void NoteImageFreed(const char* why) {
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	DrawMutations::Note(DrawMutations::NewImage);
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	const auto id = [&] {
+		std::unique_lock slots_lock(m_slots_mutex);
+		return m_slot_images.insert(m_graphics, m_scheduler, info);
+	}();
 	m_slot_images[id].self_id = id;
 	Profiler::Add(Profiler::Counter::ImagesCreated);
 	if (!info.data.Empty()) {
@@ -1262,7 +1265,10 @@ void TextureCache::ReleaseImage(ImageId id) {
 		m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
 		return;
 	}
-	m_slot_images.erase(id);
+	{
+		std::unique_lock slots_lock(m_slots_mutex);
+		m_slot_images.erase(id);
+	}
 	Profiler::Add(Profiler::Counter::ImagesDestroyed);
 }
 

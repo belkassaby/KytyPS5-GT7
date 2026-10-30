@@ -4494,7 +4494,10 @@ PipelineCache::~PipelineCache() {
 	for (const auto quick: m_quick_retired) {
 		m_graphics.device.destroyPipeline(quick, nullptr);
 	}
-	destroy(m_graphics_pipelines);
+	{
+		std::unique_lock pipelines_lock(m_graphics_pipelines_mutex);
+		destroy(m_graphics_pipelines);
+	}
 	destroy(m_compute_pipelines);
 	destroy(m_compute_waiting);
 	if (m_driver_cache != nullptr) {
@@ -6160,6 +6163,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			GpuPhases::Count(GpuPhases::Phase::PipelineProbeHit, 1);
 			ReportGraphicsPipelineBuilt(vs_hash, ps_hash, probe_begin);
 			LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+			std::unique_lock pipelines_lock(m_graphics_pipelines_mutex);
 			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 			EXIT_IF(!inserted);
 			return iter->second.get();
@@ -6197,6 +6201,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			GpuPhases::Count(GpuPhases::Phase::PipelineProbeMiss, 1);
 		}
 		WaitForPipeline(*job);
+		std::unique_lock pipelines_lock(m_graphics_pipelines_mutex);
 		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 		EXIT_IF(!inserted);
 		auto& pipeline = *iter->second;
@@ -6244,6 +6249,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 
+	std::unique_lock pipelines_lock(m_graphics_pipelines_mutex);
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 

@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <shared_mutex>
 
 namespace Libs::Graphics {
 
@@ -457,6 +458,9 @@ private:
 	std::vector<vk::Pipeline> m_quick_retired;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// GT7 port, native path milestone 4 (prepare-ahead): inserts and the final destroy hold this
+	// exclusively; the GPU thread's own finds need no lock, another thread's take it shared.
+	std::shared_mutex m_graphics_pipelines_mutex;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	// Round 97: by shader hash, its last expansion whose compute pipeline is ready (the program id
 	// and the expanded code), run while a newer one compiles (GetComputeProgram); and the newer

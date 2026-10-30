@@ -28,6 +28,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <shared_mutex>
 
 namespace Libs::Graphics {
 
@@ -88,6 +89,10 @@ public:
 	// The texture memo (RenderExecutor::ResolveTexture). The image set's generation changes
 	// whenever an image is registered or unregistered: while it stays, FindImage gives a
 	// description the same image, so a binding resolved before can name it again.
+	// Another thread than the GPU thread: the image slots may be read while this is held.
+	[[nodiscard]] std::shared_lock<std::shared_mutex> LockSlotsShared() const {
+		return std::shared_lock(m_slots_mutex);
+	}
 	[[nodiscard]] uint64_t ImageSetGeneration() const noexcept {
 		return m_image_set_generation.load(std::memory_order_acquire);
 	}
@@ -558,6 +563,10 @@ private:
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
+	// GT7 port, native path milestone 4 (prepare-ahead): the GPU thread inserts and erases image
+	// slots under this, exclusively; its own reads need no lock (it is the only writer); another
+	// thread reads the slots (not the images' mutable state) under LockSlotsShared.
+	mutable std::shared_mutex                         m_slots_mutex;
 	ImagePageTable                                    m_image_page_table;
 	RegisteredPageCounts                                          m_registered_pages;
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
