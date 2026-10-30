@@ -35,6 +35,8 @@
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 #include "graphics/host_gpu/renderer/drawMutations.h"
+#include "graphics/host_gpu/renderer/pipeline/gt7NativeWalk.h"
+#include "loader/gt7NativeDraws.h"
 
 #include <algorithm>
 #include <array>
@@ -2949,6 +2951,19 @@ struct PipelineCache::ProgramCache {
 			}
 			auto&      source   = entry->second;
 			auto&      snapshot = Snapshot(stage);
+			// GT7 native backend N3 step 2: a marked draw's vertex or pixel stage teaches the
+			// render threads its program, and checks the walk its record carries.
+			if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				if (::Loader::Gt7NativeDraws::RecordsWalk() &&
+				    ::Loader::Gt7NativeDraws::CurrentMarked() &&
+				    (stage == ShaderType::Pixel || stage == ShaderType::Vertex ||
+				     stage == ShaderType::Mesh)) {
+					::Loader::Gt7NativeDraws::OnStageWalk(
+					    stage == ShaderType::Pixel ? 1u : 0u,
+					    Gt7NativeWalk::Learned {&source, params.Base(), params.user_data_count},
+					    Gt7NativeWalk::Hash(snapshot.resources));
+				}
+			}
 			// Round 79: by the hash the scanner made, when there is one (comparing the
 			// specializations themselves read the scanner's freshly written vectors: ~2 % of the
 			// GPU thread in a race). KYTY_BISECT's spechash:off compares them again.
@@ -4107,7 +4122,7 @@ struct PipelineCache::ProgramCache {
 	// round 70 (Mtx_lock in ProgramCache::Get), and then walked it again itself. The copy is the
 	// plan decoded from its disk cache encoding (which round-trips exactly before anything is
 	// stored): the same values, with a memo of its own. One per entry and scanner thread.
-	ShaderRecompiler::IR::ResourcePlan* ScannerPlan(SourceEntry& entry) {
+	static ShaderRecompiler::IR::ResourcePlan* ScannerPlan(SourceEntry& entry) {
 		if (Bisect::ScanPlanShared()) {
 			return nullptr;
 		}
@@ -4363,6 +4378,138 @@ struct PipelineCache::ProgramCache {
 
 	void SetDeferTranslation(bool value) { defer_translation = value; }
 };
+
+namespace Gt7NativeWalk {
+
+// Bytes no GPU work has written only (the backing store): the render thread never takes the
+// guest mapping's fault, which would drain the GPU from a game thread.
+// As the draw-prep scanner's walks (ReadShaderGuestMemoryProbe): copied from the backing store,
+// never downloaded, faulted or waited for.
+thread_local uint32_t t_failure         = 0;
+thread_local uint64_t t_failure_address = 0;
+thread_local uint32_t t_failure_size    = 0;
+
+// Reads the probe refuses are mostly the bytes this render thread just wrote: the stage's blocks
+// in its own command buffer memory, which the page tracker has not seen as clean yet (the GPU
+// thread's tracking). GPU work never writes them, so the backing store holds them: read there,
+// never through the guest mapping (its write-tracked pages fault on a game thread: ~130 us a
+// walk, the frame rate halved). The GPU thread's comparison catches a stale read.
+std::atomic<uint64_t> g_raw_reads {0};
+std::atomic<uint64_t> g_reads {0}, g_read_ns {0}, g_probe_ns {0};
+
+static bool ReadClean(void* /*userdata*/, uint64_t address, std::span<uint32_t> values) {
+	// Off the GPU thread the clean-backing probe refuses all of GPU-visible memory
+	// (MaybeGpuDirtyForClean): it is not asked. Most reads do not come here at all: the walker
+	// reads the pages MapPage gives it directly.
+	g_reads.fetch_add(1, std::memory_order_relaxed);
+	// FindBacking: a pointer from the address space's per-thread mapping cache (TryReadBacking
+	// took its commit lock on every read: ~1 us, 130 reads a walk).
+	if (const auto* backing = Libs::LibKernel::Memory::FindBacking(address, values.size_bytes());
+	    backing != nullptr) {
+		std::memcpy(values.data(), backing, values.size_bytes());
+		g_raw_reads.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	if (t_failure == 0) {
+		t_failure         = 2;
+		t_failure_address = address;
+		t_failure_size    = static_cast<uint32_t>(values.size_bytes());
+	}
+	return false;
+}
+
+void ReadStats(uint64_t* reads, uint64_t* read_ns, uint64_t* probe_ns, uint64_t* fallbacks) {
+	*reads     = g_reads.load();
+	*read_ns   = g_read_ns.load();
+	*probe_ns  = g_probe_ns.load();
+	*fallbacks = g_raw_reads.load();
+}
+
+// The walker's fast path (SrtRuntime::map_clean_page): a guest page's backing bytes, read
+// directly. Counted as the reads' pages.
+static const uint8_t* MapPage(void* /*userdata*/, uint64_t page) {
+	g_probe_ns.fetch_add(1, std::memory_order_relaxed);
+	return Libs::LibKernel::Memory::FindBacking(page, 4096); // the page's address
+}
+
+uint32_t LastFailure(uint64_t* address, uint32_t* size) {
+	*address = t_failure_address;
+	*size    = t_failure_size;
+	return t_failure;
+}
+
+static uint64_t Mix(uint64_t key, uint64_t value) {
+	return (key ^ value) * 0x9E3779B97F4A7C15ull + (key >> 29u);
+}
+
+uint64_t Hash(const ShaderRecompiler::IR::ResourceSnapshot& snapshot) {
+	uint64_t   key     = 0x243f6a8885a308d3ull;
+	const auto values  = [&](const std::vector<ShaderRecompiler::IR::DescriptorValue>& list) {
+		key = Mix(key, list.size());
+		for (const auto& value: list) {
+			key = Mix(key, value.dword_count);
+			for (uint32_t i = 0; i < value.dword_count && i < value.dwords.size(); i++) {
+				key = Mix(key, value.dwords[i]);
+			}
+		}
+	};
+	values(snapshot.buffers);
+	values(snapshot.images);
+	values(snapshot.samplers);
+	key = Mix(key, snapshot.flattened_srt.size());
+	for (const auto word: snapshot.flattened_srt) {
+		key = Mix(key, word);
+	}
+	return key;
+}
+
+bool Walk(const Learned& learned, const uint32_t* user_data, uint64_t* hash) {
+	t_failure = 0;
+	if (learned.entry == nullptr || learned.user_data_count > 32) {
+		t_failure = 1;
+		return false;
+	}
+	return PipelineCache::Gt7Walk(learned.entry, std::span(user_data, learned.user_data_count),
+	                              learned.shader_base, hash);
+}
+
+} // namespace Gt7NativeWalk
+
+bool PipelineCache::Gt7Walk(void* source, std::span<const uint32_t> user_data, uint64_t shader_base,
+                            uint64_t* hash) {
+	auto*                            entry = static_cast<ProgramCache::SourceEntry*>(source);
+	GuestPageReadCache               cache;
+	ShaderRecompiler::IR::SrtRuntime runtime {
+	    .user_data                  = user_data,
+	    .shader_base                = shader_base,
+	    .read_memory                = Gt7NativeWalk::ReadClean,
+	    .userdata                   = &cache,
+	    .read_specialization_memory = Gt7NativeWalk::ReadClean,
+	    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
+	};
+	runtime.map_clean_page = Gt7NativeWalk::MapPage;
+	runtime.page_userdata  = nullptr;
+	runtime.page_shift     = 12;
+	thread_local ShaderRecompiler::IR::ResourceSnapshot       snapshot;
+	thread_local ShaderRecompiler::IR::ResourceSpecialization specialization;
+	bool ok = false;
+	// The thread's own copy of the plan, as the draw-prep scanner's (ScannerPlan): walking the
+	// entry's under its lock contended with the GPU thread and the other render threads (~120 us
+	// a walk), and their memos undid each other's.
+	if (auto* plan = ProgramCache::ScannerPlan(*entry); plan != nullptr) {
+		ok = ShaderRecompiler::IR::MaterializeResources(*plan, runtime, snapshot, specialization);
+	} else {
+		std::lock_guard walk_lock(entry->walk_mutex);
+		ok = ShaderRecompiler::IR::MaterializeResources(entry->resource_plan, runtime, snapshot,
+		                                                specialization);
+	}
+	if (ok) {
+		*hash = Gt7NativeWalk::Hash(snapshot);
+	} else if (Gt7NativeWalk::t_failure == 0) {
+		Gt7NativeWalk::t_failure = 3;
+	}
+	return ok;
+}
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics),

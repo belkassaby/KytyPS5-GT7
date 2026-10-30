@@ -367,6 +367,11 @@ public:
 	                                const ShaderProgram&          compute_program,
 	                                std::span<const uint32_t>     expansion = {});
 
+	// GT7 native backend N3 step 2 (gt7NativeWalk.h): a program source entry's descriptor walk
+	// with the given user data, on a render thread; the snapshot's hash, or false.
+	[[nodiscard]] static bool Gt7Walk(void* entry, std::span<const uint32_t> user_data,
+	                                  uint64_t shader_base, uint64_t* hash);
+
 private:
 	struct BackgroundCompute;
 	struct WaitingPartition;

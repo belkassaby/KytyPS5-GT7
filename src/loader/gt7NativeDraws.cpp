@@ -17,6 +17,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <new>
 #include <string>
 #include <thread>
@@ -81,11 +82,20 @@ constexpr uint64_t CtxVertexEnd    = 0xde8;
 bool     g_enabled   = false;
 uint64_t g_main_base = 0;
 
-// N3 (KYTY_GT7_NATIVE_RECORDS=1): records made at the markers and checked at the draws.
+// N3 (KYTY_GT7_NATIVE_RECORDS=1): records made at the markers and checked at the draws; with
+// =walk, also each stage's descriptor walk on the render thread (step 2).
 bool RecordsEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_GT7_NATIVE_RECORDS");
-		return value != nullptr && value[0] == '1';
+		return value != nullptr && (value[0] == '1' || std::strcmp(value, "walk") == 0);
+	}();
+	return enabled;
+}
+
+bool RecordsWalkEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_NATIVE_RECORDS");
+		return value != nullptr && std::strcmp(value, "walk") == 0;
 	}();
 	return enabled;
 }
@@ -186,6 +196,9 @@ struct Record {
 	bool        has_user[2] {};
 	uint8_t     user_type[2] {};  // the shader's type (ShaderBinaryType)
 	uint8_t     user_stage[2] {}; // the GT7 stage it came from
+	// Step 2: the walk of each stage on the render thread (0 not walked, 1 walked, 2 unreadable).
+	uint8_t     walk_state[2] {};
+	uint64_t    walk_hash[2] {};
 };
 struct RecordRing {
 	std::unique_ptr<uint8_t[]> bytes {new uint8_t[RingBytes]};
@@ -195,6 +208,61 @@ struct RecordRing {
 thread_local RecordRing t_ring;
 std::atomic<uint64_t>   g_record_serials {0}; // serials unique across threads
 std::atomic<uint64_t>   g_records_made {0}, g_records_ns {0}, g_record_bytes {0};
+
+// Step 2: the programs the GPU thread learned, by state key, material and stage.
+std::shared_mutex                                                         g_learned_mutex;
+std::unordered_map<uint64_t, Libs::Graphics::Gt7NativeWalk::Learned>      g_learned;
+std::atomic<uint64_t> g_walks {0}, g_walk_ns {0}, g_walk_unreadable {0}, g_walk_unknown {0};
+std::array<std::atomic<uint64_t>, 4> g_walk_why {}; // by Gt7NativeWalk::LastFailure
+
+uint64_t LearnedKey(uint64_t state, uint64_t material, uint32_t stage) {
+	return ((state ^ (material * 0x9E3779B97F4A7C15ull)) << 1u) | stage;
+}
+
+void WalkRecord(Record& record) {
+	for (uint32_t s = 0; s < 2; s++) {
+		if (!record.has_user[s]) {
+			continue;
+		}
+		Libs::Graphics::Gt7NativeWalk::Learned learned;
+		{
+			std::shared_lock lock(g_learned_mutex);
+			const auto it = g_learned.find(LearnedKey(t_identity.state, t_identity.material, s));
+			if (it == g_learned.end()) {
+				g_walk_unknown.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
+			learned = it->second;
+		}
+		const auto start = std::chrono::steady_clock::now();
+		uint64_t   hash  = 0;
+		if (Libs::Graphics::Gt7NativeWalk::Walk(learned, record.user[s], &hash)) {
+			record.walk_state[s] = 1;
+			record.walk_hash[s]  = hash;
+		} else {
+			record.walk_state[s] = 2;
+			g_walk_unreadable.fetch_add(1, std::memory_order_relaxed);
+			uint64_t       address = 0;
+			uint32_t       size    = 0;
+			const uint32_t why     = Libs::Graphics::Gt7NativeWalk::LastFailure(&address, &size);
+			g_walk_why[std::min<uint32_t>(why, 3)].fetch_add(1, std::memory_order_relaxed);
+			static std::atomic<uint32_t> logged {0};
+			if (why == 2 && logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+				Log::WriteUnmuted(fmt::format(
+				    "Native records N3 walks: {} stage read refused at 0x{:x} ({} bytes), user data "
+				    "{}: {:08x} {:08x} {:08x} {:08x}\n",
+				    s == 0 ? "vertex" : "pixel", address, size, learned.user_data_count,
+				    record.user[s][0], record.user[s][1], record.user[s][2], record.user[s][3]));
+			}
+		}
+		g_walks.fetch_add(1, std::memory_order_relaxed);
+		g_walk_ns.fetch_add(static_cast<uint64_t>(
+		                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                            std::chrono::steady_clock::now() - start)
+		                            .count()),
+		                    std::memory_order_relaxed);
+	}
+}
 
 uint64_t MakeRecord() {
 	if (t_ctx == nullptr) {
@@ -250,6 +318,9 @@ uint64_t MakeRecord() {
 		record->has_user[hw]   = true;
 		record->user_type[hw]  = type;
 		record->user_stage[hw] = static_cast<uint8_t>(s);
+	}
+	if (RecordsWalkEnabled()) {
+		WalkRecord(*record);
 	}
 	uint32_t offset = sizeof(Record);
 	for (uint32_t s = 0; s < 2; s++) {
@@ -345,6 +416,53 @@ void CheckRecord(uint64_t record_address, uint64_t serial, const uint32_t* const
 			g_n3_bytes.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
+}
+
+// Step 2, GPU thread: compared stages, and how they compared.
+std::atomic<uint64_t> g_walk_compared {0}, g_walk_equal {0}, g_walk_differ {0},
+    g_walk_none {0}, g_walk_failed {0};
+
+void ReportWalks() {
+	static std::array<uint64_t, 9> last {};
+	const std::array<uint64_t, 9>  now = {g_walks.load(),          g_walk_ns.load(),
+	                                      g_walk_unreadable.load(), g_walk_unknown.load(),
+	                                      g_walk_compared.load(),   g_walk_equal.load(),
+	                                      g_walk_differ.load(),     g_walk_none.load(),
+	                                      g_walk_failed.load()};
+	std::array<double, 9> d {};
+	for (size_t i = 0; i < now.size(); i++) {
+		d[i]    = static_cast<double>(now[i] - last[i]);
+		last[i] = now[i];
+	}
+	const double compared = std::max(1.0, d[4]);
+	static std::array<uint64_t, 4> last_why {};
+	std::array<uint64_t, 4>        why {};
+	for (size_t i = 0; i < why.size(); i++) {
+		const uint64_t now_why = g_walk_why[i].load();
+		why[i]                 = now_why - last_why[i];
+		last_why[i]            = now_why;
+	}
+	Log::WriteUnmuted(fmt::format(
+	    "Native records N3 walks failed: {} more user data than 32, {} a read refused, {} otherwise\n",
+	    why[1], why[2], why[3]));
+	static std::array<uint64_t, 4> last_reads {};
+	std::array<uint64_t, 4>        reads {};
+	Libs::Graphics::Gt7NativeWalk::ReadStats(&reads[0], &reads[1], &reads[2], &reads[3]);
+	const double read_count = static_cast<double>(std::max<uint64_t>(reads[0] - last_reads[0], 1));
+	Log::WriteUnmuted(fmt::format(
+	    "Native records N3 walk reads: {:.1f} a walk, {:.2f} us each ({:.2f} us of it in refused "
+	    "probes), {:.1f}% from the backing store after a refused probe\n",
+	    d[0] == 0 ? 0.0 : read_count / d[0],
+	    static_cast<double>(reads[1] - last_reads[1]) / 1000.0 / read_count,
+	    static_cast<double>(reads[2] - last_reads[2]) / 1000.0 / read_count,
+	    100.0 * static_cast<double>(reads[3] - last_reads[3]) / read_count));
+	last_reads = reads;
+	Log::WriteUnmuted(fmt::format(
+	    "Native records N3 walks (10 s): {:.0f} stages walked on the render threads, {:.2f} us each, "
+	    "{:.0f} unreadable, {:.0f} with no program learned | GPU thread: {:.0f} stages compared: "
+	    "{:.2f}% the same resources, {:.2f}% different, {:.2f}% not walked, {:.2f}% walk failed\n",
+	    d[0], d[0] == 0 ? 0.0 : d[1] / 1000.0 / d[0], d[2], d[3], d[4], 100.0 * d[5] / compared,
+	    100.0 * d[6] / compared, 100.0 * d[7] / compared, 100.0 * d[8] / compared));
 }
 
 void ReportRecords() {
@@ -771,6 +889,9 @@ void Report() {
 		if (RecordsEnabled()) {
 			ReportRecords();
 		}
+		if (RecordsWalkEnabled()) {
+			ReportWalks();
+		}
 		ReportCommit();
 		ReportResolve();
 		ReportMutations();
@@ -900,6 +1021,41 @@ void OnDrawDone(uint64_t renderer_ns) {
 	}
 	g_current_material = 0;
 	g_current_marked   = false;
+}
+
+bool RecordsWalk() {
+	return RecordsWalkEnabled();
+}
+
+void OnStageWalk(uint32_t stage, const Libs::Graphics::Gt7NativeWalk::Learned& learned,
+                 uint64_t hash) {
+	const auto& id = g_current_identity;
+	if (id.state == 0 || stage > 1) {
+		return;
+	}
+	{
+		std::unique_lock lock(g_learned_mutex);
+		if (g_learned.size() > (1u << 18u)) {
+			g_learned.clear();
+		}
+		g_learned[LearnedKey(id.state, id.material, stage)] = learned;
+	}
+	if (id.record == 0) {
+		return;
+	}
+	const auto* record = reinterpret_cast<const Record*>(id.record);
+	if (static_cast<uint32_t>(record->serial) != id.sequence) {
+		return;
+	}
+	g_walk_compared.fetch_add(1, std::memory_order_relaxed);
+	switch (record->walk_state[stage]) {
+		case 0: g_walk_none.fetch_add(1, std::memory_order_relaxed); break;
+		case 2: g_walk_failed.fetch_add(1, std::memory_order_relaxed); break;
+		default:
+			(record->walk_hash[stage] == hash ? g_walk_equal : g_walk_differ)
+			    .fetch_add(1, std::memory_order_relaxed);
+			break;
+	}
 }
 
 bool CurrentMarked() {

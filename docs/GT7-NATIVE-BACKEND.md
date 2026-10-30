@@ -172,3 +172,33 @@ So the render thread holds, at each marker, the exact per-draw inputs of the ver
 stages, in engine terms (which SGPR is which texture, sampler, block, table is known from the
 binds). Next, N3 step 2: the descriptor walk on the render thread from this user data, with each
 program's resource plan, checked against Kyty's walk of the same draw.
+
+## N3 step 2, done: the descriptor walk on GT7's render threads (2026-10-30)
+
+`KYTY_GT7_NATIVE_RECORDS=walk`. The GPU thread, after a marked draw's vertex or pixel stage
+refresh, teaches the render threads the program it used for the draw's state key, material and
+stage (`Gt7NativeWalk::Learned`: the source entry, shader base, declared user data count), and
+hashes its resource snapshot (buffers, images, samplers, flattened SRT). At the next markers of
+the same key and material the render thread walks that program's resource plan from the record's
+user data (`PipelineCache::Gt7Walk`) and the GPU thread compares the hashes.
+
+Getting the walk's cost down took four runs, each measured:
+
+| render thread walk | us a stage | frame rate |
+|---|---|---|
+| clean-backing reader only (`TryReadBufferBacking`: refuses GPU-visible memory off the GPU thread) | 1.3, 98 % unreadable | 16 |
+| guest mapping fallback (page faults on GT7's threads) | ~130 | 6 to 8 |
+| backing store (`TryReadBacking`: the address space's commit lock on each of ~130 reads) | ~120 | 8 to 9 |
+| backing pointer through the mapping cache (`FindBacking`) | ~57 | 14 |
+| the walker's page fast path (`map_clean_page` -> `FindBacking`), each thread its own plan copy (`ScannerPlan`) | **3.8 to 3.9** | **15.9** median |
+
+Race, 10 s windows of 530,000 to 550,000 stages: **97.4 to 98.7 % the same resources as the GPU
+thread's walk, 0.00 % different**, the rest stages whose program was not learned yet. A record
+(both stages, user data, walks) costs 6.6 us on the render thread. The frame rate is as without
+records: GT7's render threads have the time.
+
+Open: the walk reads the backing store without asking whether GPU work wrote the bytes (off the
+GPU thread nothing can say so); the bytes it reads are mostly the render thread's own command
+buffer memory. Before a record replaces the GPU thread's walk, its reads are checked as the
+draw-prep scanner's are (the bytes compared at the draw), or confined to memory the engine knows
+the CPU wrote.

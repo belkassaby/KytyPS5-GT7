@@ -1,6 +1,8 @@
 #ifndef KYTY_LOADER_GT7NATIVEDRAWS_H_
 #define KYTY_LOADER_GT7NATIVEDRAWS_H_
 
+#include "graphics/host_gpu/renderer/pipeline/gt7NativeWalk.h"
+
 #include <cstdint>
 
 // GT7 port, native path, milestone 1 (KYTY_GT7_NATIVE=1; docs/GT7-NATIVE-PATH.md): GT7's draws
@@ -61,6 +63,14 @@ void NoteTemplate(uint64_t programs, uint64_t pipeline);
 // checks, bindless heaps, image transitions, descriptor writes, recording and the rest), for a
 // "Native commit:" line.
 [[nodiscard]] bool CurrentMarked();
+
+// N3 step 2 (KYTY_GT7_NATIVE_RECORDS=walk): the GPU thread, after a marked draw's vertex (0) or
+// pixel (1) stage refresh: the program it used, which the render threads walk the next draws of
+// the same state key and material with, and the hash of the refresh, compared with the walk the
+// draw's record carries.
+[[nodiscard]] bool RecordsWalk();
+void OnStageWalk(uint32_t stage, const Libs::Graphics::Gt7NativeWalk::Learned& learned,
+                 uint64_t hash);
 void               AddCommitSteps(const uint64_t* nanoseconds);
 
 // Prepare-ahead stage 2, measured first (RenderExecutor::ResolveTexture for a marked draw's pixel
