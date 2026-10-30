@@ -60,7 +60,17 @@ std::atomic<uint64_t> g_marked {0};         // ... with a marker
 std::atomic<uint64_t> g_block_match {0};    // ... whose pixel stage's SGPRs 2-3 are the block
 std::atomic<uint64_t> g_no_block {0};       // ... whose material had no block
 std::atomic<uint64_t> g_with_mesh {0};
-std::unordered_set<uint64_t> g_materials;   // this window's (GPU thread)
+std::unordered_set<uint64_t> g_materials;   // GPU thread only
+std::atomic<uint64_t>        g_material_count {0};
+
+// Milestone 2 (GPU thread): the material of the draw being executed, when its pixel stage's
+// texture table is the material's block (0 otherwise), and the pixel-stage binding counts.
+uint64_t              g_current_material = 0;
+std::atomic<uint64_t> g_binding_draws {0};
+std::atomic<uint64_t> g_binding_hits {0};
+std::atomic<uint64_t> g_binding_ns {0};
+std::atomic<uint64_t> g_binding_mismatches {0};
+std::atomic<uint64_t> g_binding_uncacheable {0};
 
 template <typename T>
 T Read(uint64_t address) {
@@ -82,32 +92,38 @@ KYTY_SYSV_ABI void OnMeshDraw(uint64_t mesh) {
 }
 
 void Report() {
-	uint64_t last[8]       = {};
-	uint64_t last_presents = Common::PerfStats::PresentsTotal();
+	constexpr int Count = 13;
+	uint64_t      last[Count] = {};
+	uint64_t      last_presents = Common::PerfStats::PresentsTotal();
 	for (;;) {
 		std::this_thread::sleep_for(ReportEvery);
-		const uint64_t now[8] = {g_markers_written.load(), g_markers.load(), g_orphans.load(),
-		                         g_draws.load(),           g_marked.load(),  g_block_match.load(),
-		                         g_no_block.load(),        g_with_mesh.load()};
+		const uint64_t now[Count] = {
+		    g_markers_written.load(),    g_markers.load(),         g_orphans.load(),
+		    g_draws.load(),              g_marked.load(),          g_block_match.load(),
+		    g_no_block.load(),           g_with_mesh.load(),       g_binding_draws.load(),
+		    g_binding_hits.load(),       g_binding_ns.load(),      g_binding_mismatches.load(),
+		    g_binding_uncacheable.load()};
 		const auto presents = Common::PerfStats::PresentsTotal();
 		const auto frames   = static_cast<double>(std::max<uint64_t>(presents - last_presents, 1));
-		double     d[8];
-		for (int i = 0; i < 8; i++) {
-			d[i] = static_cast<double>(now[i] - last[i]) / frames;
-			last[i] = now[i];
+		double     d[Count];
+		uint64_t   delta[Count];
+		for (int i = 0; i < Count; i++) {
+			delta[i] = now[i] - last[i];
+			d[i]     = static_cast<double>(delta[i]) / frames;
+			last[i]  = now[i];
 		}
 		last_presents = presents;
 		Log::WriteUnmuted(fmt::format(
 		    "Native draws: a frame: {:.0f} markers written, {:.0f} seen ({:.0f} without a draw) | "
 		    "{:.0f} indexed draws, {:.0f} marked ({:.1f}%): {:.0f} with the pixel stage's texture "
 		    "table at the material's block, {:.0f} whose material has no block, {:.0f} with a mesh "
-		    "| {} materials in the window\n",
+		    "| {} materials so far | pixel bindings by material ({}): {:.0f} draws, {:.1f}% reused, "
+		    "{:.2f} us each, {:.0f} uncacheable, {} verify mismatches\n",
 		    d[0], d[1], d[2], d[3], d[4], d[3] == 0 ? 0.0 : 100.0 * d[4] / d[3], d[5], d[6], d[7],
-		    g_materials.size()));
-		// read on this thread while the GPU thread may insert: a count only, cleared rarely
-		if (g_materials.size() > 1u << 16u) {
-			g_materials.clear();
-		}
+		    g_material_count.load(), BindingsEnabled() ? "on" : "off", d[8],
+		    delta[8] == 0 ? 0.0 : 100.0 * static_cast<double>(delta[9]) / static_cast<double>(delta[8]),
+		    delta[8] == 0 ? 0.0 : static_cast<double>(delta[10]) / 1000.0 / static_cast<double>(delta[8]),
+		    d[12], delta[11]));
 	}
 }
 
@@ -167,8 +183,8 @@ void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count) {
 	if (id.mesh != 0) {
 		g_with_mesh.fetch_add(1, std::memory_order_relaxed);
 	}
-	if (g_materials.size() <= 1u << 16u) {
-		g_materials.insert(id.material);
+	if (g_materials.size() <= 1u << 20u && g_materials.insert(id.material).second) {
+		g_material_count.fetch_add(1, std::memory_order_relaxed);
 	}
 	if (id.block == 0) {
 		g_no_block.fetch_add(1, std::memory_order_relaxed);
@@ -178,8 +194,48 @@ void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count) {
 		const uint64_t table = ps_user_sgprs[2] | (static_cast<uint64_t>(ps_user_sgprs[3]) << 32u);
 		if (table == id.block) {
 			g_block_match.fetch_add(1, std::memory_order_relaxed);
+			g_current_material = id.material;
 		}
 	}
+}
+
+void OnDrawDone() {
+	g_current_material = 0;
+}
+
+uint64_t CurrentPixelMaterial() {
+	return g_current_material;
+}
+
+bool BindingsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_NATIVE_BINDINGS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool BindingsVerify() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_NATIVE_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void AddPixelBindings(bool hit, bool uncacheable, uint64_t nanoseconds) {
+	g_binding_draws.fetch_add(1, std::memory_order_relaxed);
+	g_binding_ns.fetch_add(nanoseconds, std::memory_order_relaxed);
+	if (hit) {
+		g_binding_hits.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (uncacheable) {
+		g_binding_uncacheable.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void AddBindingMismatch() {
+	g_binding_mismatches.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Install(uint64_t main_base) {

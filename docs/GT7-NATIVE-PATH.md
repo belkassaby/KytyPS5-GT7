@@ -47,6 +47,23 @@ block's T#s and S#s, the texture cache's image set and the images' memory stamps
 otherwise it prepares them as now. A verify mode compares both. Expected: part of the `textures`
 phase (1.7 us a draw), a few percent; the point is the mechanism, keyed on engine identity.
 
+**Done** (`PrepareBindings`, `KYTY_GT7_NATIVE_BINDINGS=0` off, `KYTY_GT7_NATIVE_VERIFY=1`):
+
+- Almost every GT7 material shader binds a **light grid** (clustered lighting), which has
+  per-draw checks (`CheckLightGridView`): first made whole entries uncacheable (0.1 to 1.2 %
+  reused); now the light grids are resolved every draw and not compared, and the rest is reused.
+- Verify run: **62 to 72 % of the material draws reused, 0 mismatches**.
+- A/B, music rally race windows:
+
+| | off | on |
+|---|---|---|
+| pixel bindings of a material draw | 3.00 us | **2.07 us** |
+| `textures` phase a draw | 2.02 us | **1.62 us** |
+| a draw | 11.00 us | **10.55 us** |
+| draws a frame / fps | 3,441 / 15.9 | 3,645 / 16.1 |
+
+About 4 % of a draw: as expected, the mechanism, not the frame rate.
+
 ## Milestone 3: draw templates
 
 Per (material, mesh, pixel and vertex programs, pass state): the pipeline, the vertex buffer

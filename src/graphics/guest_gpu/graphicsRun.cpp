@@ -1414,6 +1414,9 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		::Loader::Gt7NativeDraws::OnDraw(ps.value, ps.count);
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	if (::Loader::Gt7NativeDraws::Enabled()) {
+		::Loader::Gt7NativeDraws::OnDrawDone();
+	}
 	CompleteDraw();
 }
 

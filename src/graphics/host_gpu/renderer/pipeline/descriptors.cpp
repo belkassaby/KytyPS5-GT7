@@ -40,6 +40,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#include "loader/gt7NativeDraws.h"
 
 #include <algorithm>
 #include <atomic>
@@ -3321,6 +3322,66 @@ void FindConstants(RenderContext& context, const ShaderStageRuntime& runtime) {
 }
 } // namespace
 
+// GT7 native path, milestone 2 (loader/gt7NativeDraws.h, docs/GT7-NATIVE-PATH.md): a pixel
+// stage's texture and sampler bindings, kept per (material, program) for draws whose texture table
+// is the material's constant block, with what they were made from: the descriptors, the texture
+// cache's image set and each image's memory stamp. Reused while all of them are the same (as the
+// texture memo reuses one binding); RebindImages checks the images again before their views are
+// used, as for any binding. GPU thread only.
+namespace {
+
+struct Gt7MaterialBindings {
+	bool                                                  valid       = false;
+	bool                                                  uncacheable = false;
+	// light grids (per-draw checks, CheckLightGridView): resolved every draw, not compared
+	std::vector<uint8_t>                                  grid;
+	bool                                                  normalize   = false;
+	uint64_t                                              generation  = 0;
+	std::vector<ShaderRecompiler::IR::DescriptorValue>    images_key;
+	std::vector<ShaderRecompiler::IR::DescriptorValue>    samplers_key;
+	std::vector<std::array<uint64_t, 3>>                  stamps; // address, size, stamp
+	std::vector<TextureBinding>                           images;
+	std::vector<vk::Sampler>                              samplers;
+};
+
+struct Gt7MaterialKey {
+	uint64_t    material;
+	const void* program;
+	bool        operator==(const Gt7MaterialKey&) const = default;
+};
+
+struct Gt7MaterialKeyHash {
+	size_t operator()(const Gt7MaterialKey& key) const noexcept {
+		return std::hash<uint64_t> {}(key.material * 0x9e3779b97f4a7c15ull ^
+		                              reinterpret_cast<uint64_t>(key.program));
+	}
+};
+
+std::unordered_map<Gt7MaterialKey, Gt7MaterialBindings, Gt7MaterialKeyHash> g_gt7_material_bindings;
+
+bool Gt7BindingsCurrent(const Gt7MaterialBindings& entry, const ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+                        bool normalize, TextureCache& texture_cache) {
+	if (!entry.valid || entry.uncacheable || entry.normalize != normalize ||
+	    entry.generation != texture_cache.ImageSetGeneration() ||
+	    entry.images_key.size() != snapshot.images.size() || entry.samplers_key != snapshot.samplers) {
+		return false;
+	}
+	for (size_t i = 0; i < entry.images_key.size(); i++) {
+		if (entry.grid[i] == 0 && !(entry.images_key[i] == snapshot.images[i])) {
+			return false;
+		}
+	}
+	for (size_t i = 0; i < entry.stamps.size(); i++) {
+		const auto& [address, size, stamp] = entry.stamps[i];
+		if (entry.grid[i] == 0 && texture_cache.RangeStamp(address, size) != stamp) {
+			return false;
+		}
+	}
+	return true; // the images themselves: PrepareBindings (TextureCache's slots are its friend's)
+}
+
+} // namespace
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -3471,7 +3532,63 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 		return false;
 	};
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+	// GT7 native path, milestone 2: the material's bindings, when this draw has them unchanged
+	auto&          texture_cache = m_context.GetTextureCache();
+	const uint64_t gt7_material =
+	    pixel && watched_use == UINT32_MAX && !RenderMapping::Enabled() && !Bisect::Active()
+	        ? ::Loader::Gt7NativeDraws::CurrentPixelMaterial()
+	        : 0;
+	const auto           gt7_start = std::chrono::steady_clock::now();
+	Gt7MaterialBindings* gt7_entry = nullptr;
+	bool                 gt7_hit   = false;
+	if (gt7_material != 0) {
+		gt7_entry = &g_gt7_material_bindings[{gt7_material, &program}];
+		const auto images_registered = [&] {
+			for (size_t i = 0; i < gt7_entry->images.size(); i++) {
+				if (gt7_entry->grid[i] != 0) {
+					continue;
+				}
+				const auto& binding = gt7_entry->images[i];
+				const auto* image   = texture_cache.m_slot_images.try_get(binding.image_id);
+				if (image == nullptr || !image->registered || image->binding.needs_rebind) {
+					return false;
+				}
+			}
+			return true;
+		};
+		if (::Loader::Gt7NativeDraws::BindingsEnabled() &&
+		    Gt7BindingsCurrent(*gt7_entry, snapshot, prepared.normalize_unnormalized,
+		                       texture_cache) &&
+		    images_registered()) {
+			gt7_hit = true;
+			for (uint32_t i = 0; i < program.info.images.size(); i++) {
+				if (gt7_entry->grid[i] != 0) {
+					// as the loop below does for a light grid
+					auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
+					TextureCache::NoteLightGridShape(binding.desc.info);
+					CheckLightGridView(runtime, i, binding);
+					BindImage(binding.image_id,
+					          binding.desc.type == TextureCache::BindingType::Storage);
+					binding.mip_views.swap(prepared.images[i].mip_views);
+					binding.mip_views.clear();
+					prepared.images[i] = std::move(binding);
+					continue;
+				}
+				auto binding = gt7_entry->images[i];
+				if (::Loader::Gt7NativeDraws::BindingsVerify() &&
+				    ResolveTexture(program.info.images[i], snapshot.images[i], true).image_id !=
+				        binding.image_id) {
+					::Loader::Gt7NativeDraws::AddBindingMismatch();
+				}
+				BindImage(binding.image_id,
+				          binding.desc.type == TextureCache::BindingType::Storage);
+				binding.mip_views.swap(prepared.images[i].mip_views);
+				binding.mip_views.clear();
+				prepared.images[i] = std::move(binding);
+			}
+		}
+	}
+	for (uint32_t i = 0; !gt7_hit && i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
 		if (hiz_off &&
 		    program.info.images[i].resource_class !=
@@ -3532,10 +3649,42 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 		return big;
 	};
-	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+	if (gt7_hit) {
+		prepared.samplers = gt7_entry->samplers;
+	}
+	for (uint32_t i = 0; !gt7_hit && i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(
 		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index],
 		    samples_big_depth(i), prepared.normalize_unnormalized));
+	}
+	if (gt7_entry != nullptr) {
+		if (!gt7_hit) {
+			// what the bindings were made from; light grids are resolved again every draw
+			auto& entry       = *gt7_entry;
+			entry.uncacheable = false;
+			entry.grid.assign(program.info.images.size(), 0);
+			for (uint32_t i = 0; i < program.info.images.size(); i++) {
+				entry.grid[i] = IsLightGridBinding(program.info.images[i], prepared.images[i]) ? 1 : 0;
+			}
+			entry.valid        = true;
+			entry.normalize    = prepared.normalize_unnormalized;
+			entry.generation   = texture_cache.ImageSetGeneration();
+			entry.images_key   = snapshot.images;
+			entry.samplers_key = snapshot.samplers;
+			entry.images       = prepared.images;
+			entry.samplers     = prepared.samplers;
+			entry.stamps.clear();
+			for (const auto& binding: prepared.images) {
+				const auto& range = binding.desc.info.data;
+				entry.stamps.push_back(
+				    {range.address, range.size, texture_cache.RangeStamp(range.address, range.size)});
+			}
+		}
+		::Loader::Gt7NativeDraws::AddPixelBindings(
+		    gt7_hit, gt7_entry->uncacheable,
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              std::chrono::steady_clock::now() - gt7_start)
+		                              .count()));
 	}
 	for (const auto& use: snapshot.bindless_heaps) {
 		if (m_bindless_surveyed.insert(use.base ^ (static_cast<uint64_t>(use.table_offset) << 48u))

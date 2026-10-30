@@ -40,6 +40,19 @@ void               WriteMarker(uint32_t* packet, const Identity& identity);
 // pixel stage's user-data SGPRs.
 void OnMarker(const uint32_t* payload, uint32_t dwords);
 void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count);
+void OnDrawDone();
+
+// Milestone 2 (the renderer, GPU thread, while a draw executes): the draw's material when its
+// pixel stage's texture table is that material's block, else 0. With it the pixel stage's texture
+// and sampler bindings are kept per (material, program) and reused while their descriptors and
+// images are unchanged (RenderExecutor::PrepareBindings; KYTY_GT7_NATIVE_BINDINGS=0 turns it off,
+// still timing the same draws, for an A/B; KYTY_GT7_NATIVE_VERIFY=1 resolves every reused
+// binding again and counts the ones that differ).
+[[nodiscard]] uint64_t CurrentPixelMaterial();
+[[nodiscard]] bool     BindingsEnabled();
+[[nodiscard]] bool     BindingsVerify();
+void                   AddPixelBindings(bool hit, bool uncacheable, uint64_t nanoseconds);
+void                   AddBindingMismatch();
 
 } // namespace Loader::Gt7NativeDraws
 
