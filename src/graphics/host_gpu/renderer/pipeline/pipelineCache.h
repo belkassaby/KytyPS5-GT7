@@ -28,6 +28,10 @@
 
 namespace Libs::Graphics {
 
+namespace DrawPrep {
+struct StageResult;
+} // namespace DrawPrep
+
 struct GraphicContext;
 class CoverageVariants;
 struct ShaderParams;
@@ -371,6 +375,9 @@ public:
 	// with the given user data, on a render thread; the snapshot's hash, or false.
 	[[nodiscard]] static bool Gt7Walk(void* entry, std::span<const uint32_t> user_data,
 	                                  uint64_t shader_base, uint64_t* hash);
+	[[nodiscard]] static bool Gt7Prepare(void* entry, std::span<const uint32_t> user_data,
+	                                     uint64_t shader_base, uint32_t stage,
+	                                     DrawPrep::StageResult* result);
 
 private:
 	struct BackgroundCompute;

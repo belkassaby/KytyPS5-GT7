@@ -5,6 +5,7 @@
 #include "common/perfStats.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/drawMutations.h"
 #include "loader/gt7GuestHook.h"
@@ -28,6 +29,10 @@
 #include <fmt/format.h>
 
 namespace Loader::Gt7NativeDraws {
+
+// N3 step 3 (defined with the public functions below, used by the report and the draws).
+void ReportUse();
+void FreeRecordStages();
 
 namespace Pm4 = Libs::Graphics::Pm4;
 
@@ -87,15 +92,25 @@ uint64_t g_main_base = 0;
 bool RecordsEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_GT7_NATIVE_RECORDS");
-		return value != nullptr && (value[0] == '1' || std::strcmp(value, "walk") == 0);
+		return value != nullptr && (value[0] == '1' || std::strcmp(value, "walk") == 0 ||
+		                            std::strcmp(value, "use") == 0);
 	}();
 	return enabled;
 }
 
+bool RecordsUseEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_NATIVE_RECORDS");
+		return value != nullptr && std::strcmp(value, "use") == 0;
+	}();
+	return enabled;
+}
+
+// =walk, and =use (step 3) which walks too
 bool RecordsWalkEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_GT7_NATIVE_RECORDS");
-		return value != nullptr && std::strcmp(value, "walk") == 0;
+		return value != nullptr && (std::strcmp(value, "walk") == 0 || std::strcmp(value, "use") == 0);
 	}();
 	return enabled;
 }
@@ -199,6 +214,9 @@ struct Record {
 	// Step 2: the walk of each stage on the render thread (0 not walked, 1 walked, 2 unreadable).
 	uint8_t     walk_state[2] {};
 	uint64_t    walk_hash[2] {};
+	// Step 3: the stages prepared for the GPU thread to take (owned by the record until the GPU
+	// thread's draw ends; it frees them).
+	Libs::Graphics::DrawPrep::StageResult* prepared[2] {};
 };
 struct RecordRing {
 	std::unique_ptr<uint8_t[]> bytes {new uint8_t[RingBytes]};
@@ -236,7 +254,21 @@ void WalkRecord(Record& record) {
 		}
 		const auto start = std::chrono::steady_clock::now();
 		uint64_t   hash  = 0;
-		if (Libs::Graphics::Gt7NativeWalk::Walk(learned, record.user[s], &hash)) {
+		if (RecordsUseEnabled()) {
+			auto* prepared = new Libs::Graphics::DrawPrep::StageResult;
+			if (Libs::Graphics::Gt7NativeWalk::Prepare(
+			        learned, record.user[s],
+			        learned.stage,
+			        prepared)) {
+				record.prepared[s]   = prepared;
+				record.walk_state[s] = 1;
+				record.walk_hash[s]  = Libs::Graphics::Gt7NativeWalk::Hash(prepared->resources);
+			} else {
+				delete prepared;
+				record.walk_state[s] = 2;
+				g_walk_unreadable.fetch_add(1, std::memory_order_relaxed);
+			}
+		} else if (Libs::Graphics::Gt7NativeWalk::Walk(learned, record.user[s], &hash)) {
 			record.walk_state[s] = 1;
 			record.walk_hash[s]  = hash;
 		} else {
@@ -892,6 +924,9 @@ void Report() {
 		if (RecordsWalkEnabled()) {
 			ReportWalks();
 		}
+		if (RecordsUseEnabled()) {
+			ReportUse();
+		}
 		ReportCommit();
 		ReportResolve();
 		ReportMutations();
@@ -991,6 +1026,9 @@ void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count, const uint32_t* gs_us
 }
 
 void OnDrawDone(uint64_t renderer_ns) {
+	if (RecordsUseEnabled()) {
+		FreeRecordStages();
+	}
 	if (g_current_marked) {
 		const auto masks = Mutations::t_masks;
 		g_mutation_draws.fetch_add(1, std::memory_order_relaxed);
@@ -1025,6 +1063,72 @@ void OnDrawDone(uint64_t renderer_ns) {
 
 bool RecordsWalk() {
 	return RecordsWalkEnabled();
+}
+
+bool RecordsUse() {
+	return RecordsUseEnabled();
+}
+
+// The current marked draw's record, when it is still the record the marker named.
+Record* CurrentRecord() {
+	const auto& id = g_current_identity;
+	if (!g_current_marked || id.record == 0) {
+		return nullptr;
+	}
+	auto* record = reinterpret_cast<Record*>(id.record);
+	return static_cast<uint32_t>(record->serial) == id.sequence ? record : nullptr;
+}
+
+std::atomic<uint64_t> g_use_offered {0}, g_use_taken {0}, g_use_used {0};
+
+Libs::Graphics::DrawPrep::StageResult* TakeRecordStage(uint32_t stage) {
+	auto* record = CurrentRecord();
+	if (record == nullptr) {
+		return nullptr;
+	}
+	const uint32_t index =
+	    stage == static_cast<uint32_t>(Libs::Graphics::ShaderType::Pixel) ? 1u : 0u;
+	auto* prepared = record->prepared[index];
+	if (prepared == nullptr || !prepared->ok || prepared->stage != stage) {
+		return nullptr;
+	}
+	g_use_taken.fetch_add(1, std::memory_order_relaxed);
+	return prepared;
+}
+
+// After the draw: the record's prepared stages are freed, counted by whether the draw used them.
+void FreeRecordStages() {
+	auto* record = CurrentRecord();
+	if (record == nullptr) {
+		return;
+	}
+	for (auto*& prepared: record->prepared) {
+		if (prepared == nullptr) {
+			continue;
+		}
+		g_use_offered.fetch_add(1, std::memory_order_relaxed);
+		if (prepared->consumed) {
+			g_use_used.fetch_add(1, std::memory_order_relaxed);
+		}
+		delete prepared;
+		prepared = nullptr;
+	}
+}
+
+void ReportUse() {
+	static std::array<uint64_t, 3> last {};
+	const std::array<uint64_t, 3>  now = {g_use_offered.load(), g_use_taken.load(),
+	                                      g_use_used.load()};
+	std::array<double, 3>          d {};
+	for (size_t i = 0; i < now.size(); i++) {
+		d[i]    = static_cast<double>(now[i] - last[i]);
+		last[i] = now[i];
+	}
+	const double offered = std::max(1.0, d[0]);
+	Log::WriteUnmuted(fmt::format(
+	    "Native records N3 use (10 s): {:.0f} stages prepared on the render threads reached their "
+	    "draw, {:.1f}% taken by the GPU thread, {:.1f}% used in place of its walk\n",
+	    d[0], 100.0 * d[1] / offered, 100.0 * d[2] / offered));
 }
 
 void OnStageWalk(uint32_t stage, const Libs::Graphics::Gt7NativeWalk::Learned& learned,

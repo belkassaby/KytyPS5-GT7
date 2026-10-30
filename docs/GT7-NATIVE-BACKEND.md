@@ -202,3 +202,24 @@ GPU thread nothing can say so); the bytes it reads are mostly the render thread'
 buffer memory. Before a record replaces the GPU thread's walk, its reads are checked as the
 draw-prep scanner's are (the bytes compared at the draw), or confined to memory the engine knows
 the CPU wrote.
+
+## N3 step 3, done: the GPU thread uses the render threads' walks (2026-10-30)
+
+`KYTY_GT7_NATIVE_RECORDS=use`: the render thread prepares each marked draw's vertex and pixel
+stage as the draw-prep scanner does (`PipelineCache::Gt7Prepare`: a `DrawPrep::StageResult` with
+the program entry, inputs, resources, specialization and its hash, and every byte read recorded
+in its `ReadSet`, served through `FindBacking`'s mapping cache). The GPU thread's
+`ProgramCache::Get` takes the record's stage before the scanner's and checks it as it checks the
+scanner's (`TakeScanned`: same entry, shader base and user data; every recorded byte still there
+and GPU-clean, `ReadSet::Validate`), which closes step 2's open point: a byte GPU work wrote since
+the render thread read it fails the check and the stage is walked on the GPU thread.
+
+Race with `KYTY_DRAW_PREP_VERIFY=1` (every result taken walked again on the GPU thread and
+compared), 10 s windows: 324,000 to 365,000 prepared stages reached their draw, **100.0 % taken
+and used in place of the GPU thread's walk**; the draw-prep line: 752,297 checks (records' and
+scanner's), **0 mismatches**; no crash.
+
+What it changes and what not: the scanner prepared these walks ahead already, so the GPU thread's
+work per stage is the same (take, check the bytes, apply). The point is the source: each marked
+draw's shader resources now come from GT7's render thread, from engine state, checked at the
+draw, which is what N4's records need.

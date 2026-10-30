@@ -1,6 +1,7 @@
 #ifndef KYTY_LOADER_GT7NATIVEDRAWS_H_
 #define KYTY_LOADER_GT7NATIVEDRAWS_H_
 
+#include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/pipeline/gt7NativeWalk.h"
 
 #include <cstdint>
@@ -69,6 +70,10 @@ void NoteTemplate(uint64_t programs, uint64_t pipeline);
 // the same state key and material with, and the hash of the refresh, compared with the walk the
 // draw's record carries.
 [[nodiscard]] bool RecordsWalk();
+// N3 step 3 (KYTY_GT7_NATIVE_RECORDS=use): the record's prepared stage (ShaderType `stage`: the
+// pixel stage, or the vertex one) for ProgramCache to take in place of its walk, or null.
+[[nodiscard]] bool                                RecordsUse();
+[[nodiscard]] Libs::Graphics::DrawPrep::StageResult* TakeRecordStage(uint32_t stage);
 void OnStageWalk(uint32_t stage, const Libs::Graphics::Gt7NativeWalk::Learned& learned,
                  uint64_t hash);
 void               AddCommitSteps(const uint64_t* nanoseconds);

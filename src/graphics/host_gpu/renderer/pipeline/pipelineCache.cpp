@@ -2960,7 +2960,8 @@ struct PipelineCache::ProgramCache {
 				     stage == ShaderType::Mesh)) {
 					::Loader::Gt7NativeDraws::OnStageWalk(
 					    stage == ShaderType::Pixel ? 1u : 0u,
-					    Gt7NativeWalk::Learned {&source, params.Base(), params.user_data_count},
+					    Gt7NativeWalk::Learned {&source, params.Base(), params.user_data_count,
+					                            static_cast<uint32_t>(stage)},
 					    Gt7NativeWalk::Hash(snapshot.resources));
 				}
 			}
@@ -4271,7 +4272,15 @@ struct PipelineCache::ProgramCache {
 	// from the same program, user data and shader base and its bytes are unchanged and clean.
 	bool TakeScanned(SourceEntry& entry, StageSnapshot& snapshot, ShaderType stage,
 	                 const ShaderRecompiler::IR::SrtRuntime& runtime, uint64_t hash) {
-		auto* result = DrawPrep::Take(static_cast<uint32_t>(stage));
+		// GT7 native backend N3 step 3: a marked draw's stage prepared on GT7's render thread,
+		// taken as the scanner's are (and checked the same way below).
+		DrawPrep::StageResult* result = nullptr;
+		if (::Loader::Gt7NativeDraws::RecordsUse()) {
+			result = ::Loader::Gt7NativeDraws::TakeRecordStage(static_cast<uint32_t>(stage));
+		}
+		if (result == nullptr) {
+			result = DrawPrep::Take(static_cast<uint32_t>(stage));
+		}
 		if (result == nullptr) {
 			return false;
 		}
@@ -4432,6 +4441,34 @@ static const uint8_t* MapPage(void* /*userdata*/, uint64_t page) {
 	return Libs::LibKernel::Memory::FindBacking(page, 4096); // the page's address
 }
 
+// Step 3's reader: every byte through FindBacking's mapping cache, recorded into the result's
+// read set (the GPU thread checks them before it takes the result).
+struct RecordingBackingReader {
+	DrawPrep::ReadSet* reads  = nullptr;
+	bool               failed = false;
+};
+
+static bool ReadRecordedBacking(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& reader = *static_cast<RecordingBackingReader*>(userdata);
+	const auto* backing = Libs::LibKernel::Memory::FindBacking(address, values.size_bytes());
+	if (values.empty() || backing == nullptr) {
+		reader.failed = true;
+		return false;
+	}
+	std::memcpy(values.data(), backing, values.size_bytes());
+	reader.reads->Add(address, values.data(), static_cast<uint32_t>(values.size_bytes()));
+	return true;
+}
+
+bool Prepare(const Learned& learned, const uint32_t* user_data, uint32_t stage,
+             DrawPrep::StageResult* result) {
+	if (learned.entry == nullptr || learned.user_data_count > 32 || result == nullptr) {
+		return false;
+	}
+	return PipelineCache::Gt7Prepare(learned.entry, std::span(user_data, learned.user_data_count),
+	                                 learned.shader_base, stage, result);
+}
+
 uint32_t LastFailure(uint64_t* address, uint32_t* size) {
 	*address = t_failure_address;
 	*size    = t_failure_size;
@@ -4474,6 +4511,50 @@ bool Walk(const Learned& learned, const uint32_t* user_data, uint64_t* hash) {
 }
 
 } // namespace Gt7NativeWalk
+
+bool PipelineCache::Gt7Prepare(void* source, std::span<const uint32_t> user_data,
+                               uint64_t shader_base, uint32_t stage,
+                               DrawPrep::StageResult* result) {
+	// As ProgramCache::ScanStage, for a graphics stage, with the backing reader.
+	auto* entry = static_cast<ProgramCache::SourceEntry*>(source);
+	result->ok          = false;
+	result->stage       = stage;
+	result->entry       = entry;
+	result->shader_base = shader_base;
+	result->user_data.assign(user_data.begin(), user_data.end());
+	result->reads.Clear();
+	result->workgroup_counts = {};
+	result->workgroup_size   = {};
+	result->gpu_fills        = false;
+	result->resources.gpu_fills.clear();
+	Gt7NativeWalk::RecordingBackingReader reader {.reads = &result->reads};
+	ShaderRecompiler::IR::SrtRuntime      runtime {
+	    .user_data                  = user_data,
+	    .shader_base                = shader_base,
+	    .read_memory                = Gt7NativeWalk::ReadRecordedBacking,
+	    .userdata                   = &reader,
+	    .read_specialization_memory = Gt7NativeWalk::ReadRecordedBacking,
+	    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
+	};
+	bool ok = false;
+	if (auto* plan = ProgramCache::ScannerPlan(*entry); plan != nullptr) {
+		ok = ShaderRecompiler::IR::MaterializeResources(*plan, runtime, result->resources,
+		                                                result->specialization);
+	} else {
+		std::lock_guard walk_lock(entry->walk_mutex);
+		ok = ShaderRecompiler::IR::MaterializeResources(entry->resource_plan, runtime,
+		                                                result->resources, result->specialization);
+	}
+	if (!ok || reader.failed) {
+		return false;
+	}
+	result->specialization_hash = SpecializationHash(result->specialization);
+	static std::atomic<uint64_t> serials {uint64_t {1} << 62u};
+	result->ok       = true;
+	result->consumed = false;
+	result->serial   = ++serials;
+	return true;
+}
 
 bool PipelineCache::Gt7Walk(void* source, std::span<const uint32_t> user_data, uint64_t shader_base,
                             uint64_t* hash) {
