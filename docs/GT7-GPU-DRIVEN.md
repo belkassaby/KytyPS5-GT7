@@ -186,3 +186,17 @@ Second race, `=buffers` (no checks), shader cache warm but some pipelines still 
 G1.1 neither gains nor costs measurably, as expected while the draw still writes a descriptor set
 for its images, samplers and flattened SRT. A same-day baseline (markers on, G1 off) to compare
 exactly is still to run.
+
+Same-day A/B (same build and warm cache; markers on in both; `_g1-buffers-race.txt` against
+`_g1-baseline-race.txt`), music rally, windows of 2,000 draws a frame or more:
+
+| | G1 off | `KYTY_GT7_G1=buffers` |
+|---|---|---|
+| frame rate, median (p25 to p75) | **14.4** (12.8 to 16.8) | **14.4** (11.4 to 15.8) |
+| us a draw, race windows of 500,000 draws | 11.1 to 13.8 | 11.1 to 13.7 |
+| buffers phase | 0.70 to 0.78 | 0.74 to 0.85 |
+| commit phase | 0.87 to 1.2 | 0.79 to 1.1 |
+
+No difference beyond the runs' spread (the buffers phase perhaps 0.05 us more: small reads now go
+to buffers with an address rather than the stream buffer). G1.1 is neutral, as intended: its point
+is that buffers no longer need the descriptor set.
