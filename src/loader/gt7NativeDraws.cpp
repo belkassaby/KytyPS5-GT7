@@ -1134,6 +1134,10 @@ uint64_t CurrentLearnedKey(uint32_t stage) {
 // N4: images compared, the same, another, and why the render thread had none.
 std::atomic<uint64_t> g_n4_draws {0}, g_n4_no_record {0}, g_n4_images {0}, g_n4_same {0},
     g_n4_other {0}, g_n4_no_desc {0}, g_n4_not_found {0}, g_n4_not_learned {0};
+// Coverage: marked pixel stages whose every image the record named right (a whole draw a record
+// could carry), and those with one image it could not name.
+std::atomic<uint64_t> g_n4_all_named {0}, g_n4_one_missing {0};
+std::atomic<uint64_t> g_n4_by_binding {0}; // of the same, named by the GPU thread's binding
 
 void CompareRecordImages(const uint32_t* image_ids, uint32_t count) {
 	g_n4_draws.fetch_add(1, std::memory_order_relaxed);
@@ -1146,6 +1150,19 @@ void CompareRecordImages(const uint32_t* image_ids, uint32_t count) {
 		g_n4_not_learned.fetch_add(count, std::memory_order_relaxed);
 		return;
 	}
+	uint32_t named = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		named += i < record->image_count &&
+		                 (record->image_states[i] == 1 || record->image_states[i] == 4) &&
+		                 record->image_ids[i] == image_ids[i]
+		             ? 1u
+		             : 0u;
+	}
+	if (named == count) {
+		g_n4_all_named.fetch_add(1, std::memory_order_relaxed);
+	} else if (named + 1 == count) {
+		g_n4_one_missing.fetch_add(1, std::memory_order_relaxed);
+	}
 	for (uint32_t i = 0; i < count; i++) {
 		g_n4_images.fetch_add(1, std::memory_order_relaxed);
 		if (i >= record->image_count || record->image_states[i] == 2) {
@@ -1154,6 +1171,9 @@ void CompareRecordImages(const uint32_t* image_ids, uint32_t count) {
 			g_n4_not_found.fetch_add(1, std::memory_order_relaxed);
 		} else if (record->image_ids[i] == image_ids[i]) {
 			g_n4_same.fetch_add(1, std::memory_order_relaxed);
+			if (record->image_states[i] == 4) {
+				g_n4_by_binding.fetch_add(1, std::memory_order_relaxed);
+			}
 		} else {
 			g_n4_other.fetch_add(1, std::memory_order_relaxed);
 		}
@@ -1161,12 +1181,13 @@ void CompareRecordImages(const uint32_t* image_ids, uint32_t count) {
 }
 
 void ReportImages() {
-	static std::array<uint64_t, 8> last {};
-	const std::array<uint64_t, 8>  now = {g_n4_draws.load(),   g_n4_no_record.load(),
-	                                      g_n4_images.load(),  g_n4_same.load(),
-	                                      g_n4_other.load(),   g_n4_no_desc.load(),
-	                                      g_n4_not_found.load(), g_n4_not_learned.load()};
-	std::array<double, 8>          d {};
+	static std::array<uint64_t, 10> last {};
+	const std::array<uint64_t, 10>  now = {g_n4_draws.load(),   g_n4_no_record.load(),
+	                                       g_n4_images.load(),  g_n4_same.load(),
+	                                       g_n4_other.load(),   g_n4_no_desc.load(),
+	                                       g_n4_not_found.load(), g_n4_not_learned.load(),
+	                                       g_n4_all_named.load(), g_n4_one_missing.load()};
+	std::array<double, 10>          d {};
 	for (size_t i = 0; i < now.size(); i++) {
 		d[i]    = static_cast<double>(now[i] - last[i]);
 		last[i] = now[i];
@@ -1176,9 +1197,12 @@ void ReportImages() {
 	    "Native records N4 images (10 s): {:.0f} marked pixel stages ({:.0f} without a record), "
 	    "{:.0f} images: {:.2f}% the image the GPU thread bound, {:.2f}% another, {:.2f}% no "
 	    "description learned, {:.2f}% no image with that backing | {:.0f} images of programs not "
-	    "learned yet\n",
+	    "learned yet | pixel stages with every image named: {:.1f}%, all but one: {:.1f}% | named by "
+	    "the GPU thread's binding: {:.2f}%\n",
 	    d[0], d[1], d[2], 100.0 * d[3] / images, 100.0 * d[4] / images, 100.0 * d[5] / images,
-	    100.0 * d[6] / images, d[7]));
+	    100.0 * d[6] / images, d[7], 100.0 * d[8] / std::max(1.0, d[0] - d[1]),
+	    100.0 * d[9] / std::max(1.0, d[0] - d[1]),
+	    100.0 * static_cast<double>(g_n4_by_binding.exchange(0)) / images));
 }
 
 void ReportUse() {

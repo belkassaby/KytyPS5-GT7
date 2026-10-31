@@ -244,3 +244,30 @@ the GPU thread compares with the image each binding got. Race, 10 s windows of 2
 
 Never a wrong image. The 22 % the render thread cannot name are the cases the texture
 investigations found (light grids, shadow maps): they stay with the GPU thread, per image.
+
+## N4: whole-draw coverage, and the GPU thread's bindings shared (2026-10-30)
+
+A record can carry a whole draw only if every image of the draw is named. Measured as the share
+of marked pixel stages whose every image the record named right: **18 to 21 %**, and only ~1 %
+missing exactly one. The unnamed were the shadow maps (reached by the GPU thread through overlap
+resolution, `no image with that backing`) and the light grids (`no description learned`).
+
+So the GPU thread now also publishes, for each image it binds in a marked pixel stage, its binding
+by descriptor: the image, the descriptor's memory and that memory's stamp
+(`TextureCache::RangeStamp`). Where its own lookup finds nothing, the render thread takes that
+binding while the stamp holds (no image over that memory made or dropped since: the texture
+memo's rule, shared). Race, 10 s windows of 240,000 to 290,000 marked pixel stages:
+
+| | before | now |
+|---|---|---|
+| images named right | 76 to 78 % | **92.3 to 92.5 %** (14 to 15 % by the GPU thread's binding) |
+| another image | 0.00 % | **0.00 %** |
+| no description learned | 7 % | 7 % (the light grids) |
+| no image with that backing | 15 to 16 % | 0.3 to 0.6 % |
+| pixel stages with every image named | 18 to 21 % | 12 to 19 % |
+| ... all but one | ~1 % | **80 to 87 %** |
+
+About 98 % of the marked pixel stages are now fully named but for one image: the light grid,
+which GT7 puts at a new address in its per-frame memory each draw. A record can carry the draw
+with that one image left for the GPU thread to resolve at the marker (the slow path it takes now,
+~0.3 us) and write into the record's descriptor set.

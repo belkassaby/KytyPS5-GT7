@@ -49,7 +49,8 @@ void ReadStats(uint64_t* reads, uint64_t* read_ns, uint64_t* probe_ns, uint64_t*
 // (by descriptor); the render thread finds, for each image of a prepared snapshot, the registered
 // image a read-only texture cache lookup gives (TextureCache::LookupImage). `states`: 1 found
 // (`ids` holds its index), 2 no description learned for the descriptor, 3 no registered image with
-// that backing. The count, or 0 when the program's images are not learned.
+// that backing, 4 found as the GPU thread bound the same descriptor, with no image over its memory
+// made or dropped since. The count, or 0 when the program's images are not learned.
 uint32_t ResolveImages(uint64_t key, const ShaderRecompiler::IR::ResourceSnapshot& resources,
                        uint32_t* ids, uint8_t* states, uint32_t max);
 

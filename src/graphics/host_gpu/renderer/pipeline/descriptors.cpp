@@ -985,6 +985,17 @@ std::unordered_map<TextureDescKey, ImageInfo, TextureDescKeyHash> g_gt7_n4_descs
 std::unordered_map<uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::IR::ImageResource>>>
                            g_gt7_n4_programs;
 std::atomic<TextureCache*> g_gt7_n4_texture_cache {nullptr};
+// The GPU thread's bindings by descriptor: the image it bound, and the stamp of the descriptor's
+// memory then (TextureCache::RangeStamp: no image over it made or dropped since while it holds).
+// What the render thread uses where its own lookup finds nothing: the images the GPU thread
+// reaches through overlap resolution (the shadow maps) or makes at a draw (light grids).
+struct Gt7Bound {
+	ImageId  id;
+	uint64_t address = 0;
+	uint64_t size    = 0;
+	uint64_t stamp   = 0;
+};
+std::unordered_map<TextureDescKey, Gt7Bound, TextureDescKeyHash> g_gt7_n4_bound;
 
 bool TextureDescCacheEnabled() {
 	static const bool enabled = [] {
@@ -3845,10 +3856,17 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			if (g_gt7_n4_descs.size() > (1u << 18u)) {
 				g_gt7_n4_descs.clear();
 			}
+			if (g_gt7_n4_bound.size() > (1u << 18u)) {
+				g_gt7_n4_bound.clear();
+			}
+			auto& texture_cache = m_context.GetTextureCache();
 			for (size_t i = 0; i < count && i < snapshot.images.size(); i++) {
-				g_gt7_n4_descs.try_emplace(
-				    MakeTextureDescKey(program.info.images[i], snapshot.images[i]),
-				    prepared.images[i].desc.info);
+				const auto  desc_key = MakeTextureDescKey(program.info.images[i], snapshot.images[i]);
+				const auto& info     = prepared.images[i].desc.info;
+				g_gt7_n4_descs.try_emplace(desc_key, info);
+				g_gt7_n4_bound[desc_key] = {
+				    prepared.images[i].image_id, info.data.address, info.data.size,
+				    texture_cache.RangeStamp(info.data.address, info.data.size)};
 			}
 		}
 		std::array<uint32_t, 32> ids {};
@@ -4930,6 +4948,8 @@ uint32_t ResolveImages(uint64_t key, const ShaderRecompiler::IR::ResourceSnapsho
 	std::shared_ptr<const std::vector<ShaderRecompiler::IR::ImageResource>> images;
 	std::array<ImageInfo, 32>                                               infos;
 	std::array<bool, 32>                                                    known {};
+	std::array<Gt7Bound, 32>                                                bound {};
+	std::array<bool, 32>                                                    has_bound {};
 	uint32_t                                                                count = 0;
 	{
 		std::shared_lock lock(g_gt7_n4_mutex);
@@ -4941,22 +4961,34 @@ uint32_t ResolveImages(uint64_t key, const ShaderRecompiler::IR::ResourceSnapsho
 		count  = static_cast<uint32_t>(
             std::min<size_t>({images->size(), resources.images.size(), max, infos.size()}));
 		for (uint32_t i = 0; i < count; i++) {
-			const auto found =
-			    g_gt7_n4_descs.find(MakeTextureDescKey((*images)[i], resources.images[i]));
+			const auto desc_key = MakeTextureDescKey((*images)[i], resources.images[i]);
+			const auto found    = g_gt7_n4_descs.find(desc_key);
 			if (found != g_gt7_n4_descs.end()) {
 				infos[i] = found->second;
 				known[i] = true;
 			}
+			if (const auto b = g_gt7_n4_bound.find(desc_key); b != g_gt7_n4_bound.end()) {
+				bound[i]     = b->second;
+				has_bound[i] = true;
+			}
 		}
 	}
 	for (uint32_t i = 0; i < count; i++) {
-		if (!known[i]) {
-			states[i] = 2;
+		ImageId id {};
+		if (known[i]) {
+			id = cache->LookupImage(infos[i]);
+		}
+		// Not found by its backing: the GPU thread's binding of the same descriptor, while no
+		// image over its memory was made or dropped since (as the texture memo).
+		if (!id && has_bound[i] && bound[i].stamp != 0 &&
+		    cache->RangeStamp(bound[i].address, bound[i].size) == bound[i].stamp) {
+			id        = bound[i].id;
+			states[i] = 4;
+			ids[i]    = id.index;
 			continue;
 		}
-		const auto id = cache->LookupImage(infos[i]);
-		states[i]     = id ? 1 : 3;
-		ids[i]        = id.index;
+		states[i] = id ? 1 : (known[i] ? 3 : 2);
+		ids[i]    = id.index;
 	}
 	return count;
 }
