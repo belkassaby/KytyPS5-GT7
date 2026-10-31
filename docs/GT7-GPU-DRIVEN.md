@@ -426,3 +426,20 @@ field by field with the record it writes (`G3Compare`). Race, 10 s windows
 
 So far: no field where the render thread's record is wrong, beyond the null bindings' encoding;
 images the GPU thread never bound (light grids) are the one real gap, as N4 found.
+
+Second race, null bindings encoded as the GPU thread does (`_g3-shadow2-race.txt`), 10 s windows of
+500,000 to 590,000 stages:
+
+| | |
+|---|---|
+| user data, buffer address, buffer size, sampler slots | **100.00 %** equal |
+| image slots | 91.8 to 92.0 % equal, 8.0 to 8.2 % not published (light grids), **0.00 % different** |
+| flattened SRT | 99.97 to 100 % equal |
+| stages with every word equal | 58 to 61 % (the pixel stages without a light grid, and the vertex stages) |
+| **stages with every word equal but unpublished image slots** | **99.4 to 99.8 %** |
+| shadows on the render threads | 1.38 to 1.47 us each |
+
+The render threads can build the whole record of 99.4 to 99.8 % of the marked stages, the GPU
+thread patching in the light grid's slot: G3.1's ground is there. A handful of differing words
+in the whole run (images and samplers of three pixel shaders, SRT words of three) were logged:
+G3.1 checks them per draw (stamps, the `ReadSet`) and falls back.
