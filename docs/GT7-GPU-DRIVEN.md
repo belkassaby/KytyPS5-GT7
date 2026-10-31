@@ -287,3 +287,22 @@ disk cache format 7), music rally, 10 s windows (`_g1-records-verify.txt`):
 | picture | as before (the user); 9 to 16 fps while every shader compiled |
 
 A covered draw now allocates and writes no descriptor set and pushes one dword a stage.
+
+Frame-rate race, `=records` without checks (`_g1-records-race.txt`), against this morning's
+(medians of the 10 s windows of 400,000 draws or more):
+
+| | G1 off | `=images` | `=records` |
+|---|---|---|---|
+| frame rate, median (p25 to p75) | 14.2 (12.5 to 16.3) | 14.2 (12.0 to 15.8) | **14.3** (12.0 to 16.3) |
+| us a draw | 12.0 | 11.8 | 12.9 |
+| buffers / commit | 0.74 / 1.02 | 0.75 / 1.08 | **0.56 / 1.67** |
+| commit of a marked draw: descriptor writes / recording and the rest | 0.24 / 0.34 to 0.51 | 0.13 / 0.08 to 0.10 | 0.13 / 0.17 to 0.18 |
+| records | | | 515,000 to 545,000 per 10 s, 148 to 156 dwords; cached set 94 to 99 % |
+
+The set work is gone, as intended (descriptor writes and the set's allocation and binding: about
+0.4 us of a marked draw's commit), but the frame rate did not move and the commit phase grew by
+~0.6 us while the buffers phase lost ~0.2 (the flattened SRT upload moved from `RebindBuffers` into
+the record). The record's writing (assembling ~150 dwords a stage, then `NativeUpload` into the
+ring, inside the commit's image step) costs more than the set it replaces. Next: time it on its
+own and make it cheap (written straight into the mapped ring, one upload for a draw's stages),
+before G3.
