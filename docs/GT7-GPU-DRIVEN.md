@@ -200,3 +200,31 @@ Same-day A/B (same build and warm cache; markers on in both; `_g1-buffers-race.t
 No difference beyond the runs' spread (the buffers phase perhaps 0.05 us more: small reads now go
 to buffers with an address rather than the stream buffer). G1.1 is neutral, as intended: its point
 is that buffers no longer need the descriptor set.
+
+## G1.2, verified: images and samplers by bindless slot (2026-10-31)
+
+`KYTY_GT7_G1=images` (level 2 of `ResourceSpecialization::draw_table`; level 1 is `=buffers`):
+in the draw table mode a program's plain sampled images (`IR::TableImage`: 2D, 2D array, cube or
+3D, any numeric class, comparison included; one view; not chosen by a key) and all its samplers
+are read from set 1's bindless arrays (`BindlessImageBinding`: the array of the image's
+dimension; the sampler array), at slots one dword each in the shader data
+(`ImageSlotDword`, `SamplerSlotDword`); they have no set 0 binding. Other images keep theirs.
+
+The host (`CommitBindings`, after the images' layout transitions) writes the slots:
+`BindlessTable::TableImageSlot` gives an image view in a layout one slot, written the first time
+and released with the view (`ReleaseViews`: repointed to the placeholder, freed once the work
+recorded with it is done); `TableSamplerSlot` gives a sampler one slot for good. The shader data
+buffer, when the shader data does not fit in push constants, is uploaded after them.
+`KYTY_GT7_G1_VERIFY=1` checks each slot holds the view or sampler the draw bound. Shader disk
+cache format 6.
+
+Race (first run, every shader recompiled), 10 s windows:
+
+| | |
+|---|---|
+| image slots used | 1.9 to 4.0 million; new 1,100 to 1,700 (38,600 in the session, reused slots included); none at the placeholder |
+| sampler slots used | 1.1 to 2.2 million; all made in the menus |
+| checks | **0 wrong** (images and samplers), buffers 0 wrong as in G1.1 |
+| shaders that gave up | 0 |
+| slot arrays full | never |
+| picture | textures as before (the user) |

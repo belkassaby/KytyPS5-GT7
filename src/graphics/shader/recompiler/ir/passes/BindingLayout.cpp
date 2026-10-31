@@ -135,7 +135,16 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		           return resource < program.info.buffers.size() &&
 		                  program.info.buffers[resource].write_tracked;
 	           });
-	next.draw_table = program.draw_table;
+	next.draw_table        = program.draw_table != 0;
+	const bool table_slots = program.draw_table >= 2u;
+	if (table_slots) {
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			if (TableImage(program.info.images[i])) {
+				next.table_images.push_back(i);
+			}
+		}
+		next.table_sampler_count = static_cast<uint32_t>(program.info.samplers.size());
+	}
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
@@ -149,6 +158,9 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 
 	std::array<std::vector<uint32_t>, ImageBindingCount> image_groups;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (std::ranges::find(next.table_images, i) != next.table_images.end()) {
+			continue; // by bindless slot (draw table mode)
+		}
 		const auto kind = DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {
 			EXIT("shader binding layout failed: image %u has an invalid binding class", i);
@@ -173,7 +185,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		}
 	}
 
-	if (!program.info.samplers.empty()) {
+	if (!table_slots && !program.info.samplers.empty()) {
 		std::vector<uint32_t> resources(program.info.samplers.size());
 		for (uint32_t i = 0; i < resources.size(); i++) {
 			resources[i] = i;

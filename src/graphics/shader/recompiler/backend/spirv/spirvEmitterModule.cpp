@@ -258,15 +258,7 @@ void DefineBindlessImages(EmitterState& state) {
 		if (state.bindless_image_variables.contains(type)) {
 			return;
 		}
-		uint32_t binding = IR::BindlessImages2D;
-		if (image.cube) {
-			binding = IR::BindlessImagesCube;
-		} else if (image.dimension == ImageDimension::Dim3D) {
-			binding = IR::BindlessImages3D;
-		} else if (image.dimension == ImageDimension::Dim2DArray ||
-		           image.dimension == ImageDimension::Dim2DMsaaArray) {
-			binding = IR::BindlessImages2DArray;
-		}
+		const uint32_t binding = IR::BindlessImageBinding(image);
 		const auto array    = state.builder.Type(spv::OpTypeRuntimeArray, type);
 		const auto variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassUniformConstant, array),
@@ -282,6 +274,10 @@ void DefineBindlessImages(EmitterState& state) {
 		state.builder.RequireVersion(0x00010500u);
 	};
 	bool runtime = false;
+	// The draw table mode's images by slot (BindingLayout::table_images).
+	for (const auto index: state.program.bindings.table_images) {
+		define(state.program.info.images.at(index));
+	}
 	for (const auto& image: state.program.info.images) {
 		if (!image.bindless) {
 			continue;
@@ -322,7 +318,8 @@ void DefineBindlessImages(EmitterState& state) {
 		state.runtime_image_requests_variable = requests;
 	}
 	if (state.bindless_sampler_variable == 0 &&
-	    std::ranges::any_of(state.program.info.samplers, &IR::SamplerResource::bindless)) {
+	    (state.program.bindings.table_sampler_count != 0 ||
+	     std::ranges::any_of(state.program.info.samplers, &IR::SamplerResource::bindless))) {
 		const auto array    = state.builder.Type(spv::OpTypeRuntimeArray,
 		                                         state.builder.Type(spv::OpTypeSampler));
 		const auto variable = state.builder.DefineGlobalVariable(

@@ -110,15 +110,21 @@ void AddResolveSteps(uint64_t key_ns, uint64_t memo_ns, uint64_t slow_ns, uint64
 void                   AddPixelBindings(bool hit, bool uncacheable, uint64_t nanoseconds);
 void                   AddBindingMismatch();
 
-// GPU-driven G1 (docs/GT7-GPU-DRIVEN.md; KYTY_GT7_G1=buffers, or =verify with the checks; needs
-// KYTY_GT7_NATIVE=1 for the markers): 0 off, 1 on, 2 on with checks. Marked draws' vertex and
-// pixel stages run in the draw table mode (buffers by device address). The renderer counts each
-// table-mode buffer binding (null: no buffer; addressed: a device address written) and each
-// check (right; the bound buffer mirrors the guest range, so its offset was checked too), for a
-// "GT7 G1:" line every 10 s.
-[[nodiscard]] int G1Mode();
-void              AddG1Buffer(bool null, bool addressed);
-void              AddG1Verify(bool ok, bool mirrored);
+// GPU-driven G1 (docs/GT7-GPU-DRIVEN.md; needs KYTY_GT7_NATIVE=1 for the markers). Marked
+// draws' vertex and pixel stages run in the draw table mode: KYTY_GT7_G1=buffers (level 1:
+// buffers by device address) or =images (level 2: also images and samplers by bindless slot);
+// =verify is buffers with the checks. KYTY_GT7_G1_VERIFY=1 adds the checks to either. The
+// renderer counts each table-mode buffer binding (null: no buffer; addressed: a device address
+// written), image and sampler slot, and each check (right; for a buffer, whether the bound
+// buffer mirrors the guest range, so its offset was checked too), for a "GT7 G1:" line every 10 s.
+[[nodiscard]] int  G1Level();
+[[nodiscard]] bool G1Verify();
+void               AddG1Buffer(bool null, bool addressed);
+void               AddG1Verify(bool ok, bool mirrored);
+// An image (sampler: false) slot written for a draw: new (allocated now), or 0 (none: the
+// placeholder or default sampler); and its check.
+void               AddG1Slot(bool sampler, bool fresh, bool none);
+void               AddG1SlotVerify(bool sampler, bool ok);
 
 } // namespace Loader::Gt7NativeDraws
 

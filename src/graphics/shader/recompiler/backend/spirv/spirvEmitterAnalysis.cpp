@@ -164,6 +164,24 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip,
                              uint32_t array_index) {
 	const auto& image_resource = state.program.info.images.at(resource);
+	const auto& table_images   = state.program.bindings.table_images;
+	if (const auto table = std::ranges::find(table_images, resource); table != table_images.end()) {
+		// The draw table mode: the slot is the draw's, in its shader data (uniform).
+		const auto type     = ImageType(state, image_resource);
+		const auto variable = state.bindless_image_variables.find(type);
+		EXIT_IF(variable == state.bindless_image_variables.end());
+		const auto slot = EmitShaderDataDwordLoad(
+		    state, state.program.bindings.ImageSlotDword() +
+		               static_cast<uint32_t>(table - table_images.begin()));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpAccessChain,
+		    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, type), pointer,
+		    variable->second, slot);
+		const auto image = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, type, image, pointer);
+		return image;
+	}
 	if (image_resource.bindless) {
 		EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
 		const auto type     = ImageType(state, image_resource);
@@ -200,6 +218,19 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
 		const auto sampler_id = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, sampler_type, sampler_id, pointer);
 		state.builder.AddAnnotation(spv::OpDecorate, sampler_id, spv::DecorationNonUniform);
+		return sampler_id;
+	}
+	if (state.program.bindings.table_sampler_count != 0) {
+		// The draw table mode: the slot is the draw's, in its shader data (uniform).
+		EXIT_IF(state.bindless_sampler_variable == 0 ||
+		        sampler >= state.program.bindings.table_sampler_count);
+		const auto slot =
+		    EmitShaderDataDwordLoad(state, state.program.bindings.SamplerSlotDword() + sampler);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer,
+		                          state.bindless_sampler_variable, slot);
+		const auto sampler_id = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, sampler_type, sampler_id, pointer);
 		return sampler_id;
 	}
 	const auto array_index =

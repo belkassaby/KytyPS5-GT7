@@ -1937,7 +1937,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	// A walk makes the specialization of the descriptors; the draw table mode is the host's
 	// choice for the draw, made after it (ProgramCache::Get).
-	specialization.draw_table = false;
+	specialization.draw_table = 0;
 	bool       served = false;
 	const bool ok     = MaterializeResourcesImpl(program, runtime, snapshot, specialization, served);
 	static const bool verify = std::getenv("KYTY_SRT_TRACE_VERIFY") != nullptr;

@@ -384,6 +384,8 @@ void ClassifyBuffers(uint32_t stage, uint32_t count, const uint8_t* states,
 // GPU-driven G1 counters: table-mode buffer bindings, null ones, addressed ones; checks, wrong
 // ones, mirrored ones.
 std::array<std::atomic<uint64_t>, 6> g_g1 {};
+// Slots: images, new, none; samplers, new, none; image checks, wrong; sampler checks, wrong.
+std::array<std::atomic<uint64_t>, 10> g_g1_slots {};
 
 void ReportG1() {
 	static std::array<uint64_t, 6> last {};
@@ -399,6 +401,19 @@ void ReportG1() {
 	    "neither {:.0f} | checks {:.0f}: wrong {:.0f}, guest range checked {:.1f}%\n",
 	    d[0], 100.0 * d[1] / bindings, 100.0 * d[2] / bindings, d[0] - d[1] - d[2], d[3], d[4],
 	    d[3] == 0 ? 0.0 : 100.0 * d[5] / d[3]));
+	static std::array<uint64_t, 10> last_slots {};
+	std::array<double, 10>          s {};
+	for (size_t i = 0; i < s.size(); i++) {
+		const auto now = g_g1_slots[i].load(std::memory_order_relaxed);
+		s[i]           = static_cast<double>(now - last_slots[i]);
+		last_slots[i]  = now;
+	}
+	if (s[0] + s[3] != 0) {
+		Log::WriteUnmuted(fmt::format(
+		    "GT7 G1 slots (10 s): images {:.0f} (new {:.0f}, none {:.0f}), samplers {:.0f} (new "
+		    "{:.0f}, none {:.0f}) | checks: images {:.0f} wrong {:.0f}, samplers {:.0f} wrong {:.0f}\n",
+		    s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9]));
+	}
 }
 
 void ReportDcbBuffers() {
@@ -1057,7 +1072,7 @@ void Report() {
 			ReportBuffers();
 			ReportDcbBuffers();
 		}
-		if (G1Mode() != 0) {
+		if (G1Level() != 0) {
 			ReportG1();
 		}
 		ReportCommit();
@@ -1198,18 +1213,50 @@ bool RecordsWalk() {
 	return RecordsWalkEnabled();
 }
 
-int G1Mode() {
-	static const int mode = [] {
+int G1Level() {
+	static const int level = [] {
 		const char* value = std::getenv("KYTY_GT7_G1");
 		if (value == nullptr) {
 			return 0;
 		}
-		if (std::strcmp(value, "verify") == 0) {
+		if (std::strcmp(value, "images") == 0) {
 			return 2;
 		}
-		return std::strcmp(value, "buffers") == 0 || std::strcmp(value, "1") == 0 ? 1 : 0;
+		return std::strcmp(value, "buffers") == 0 || std::strcmp(value, "verify") == 0 ||
+		               std::strcmp(value, "1") == 0
+		           ? 1
+		           : 0;
 	}();
-	return mode;
+	return level;
+}
+
+bool G1Verify() {
+	static const bool verify = [] {
+		const char* value = std::getenv("KYTY_GT7_G1");
+		const char* check = std::getenv("KYTY_GT7_G1_VERIFY");
+		return (value != nullptr && std::strcmp(value, "verify") == 0) ||
+		       (check != nullptr && check[0] == '1');
+	}();
+	return G1Level() != 0 && verify;
+}
+
+void AddG1Slot(bool sampler, bool fresh, bool none) {
+	const size_t base = sampler ? 3 : 0;
+	g_g1_slots[base].fetch_add(1, std::memory_order_relaxed);
+	if (fresh) {
+		g_g1_slots[base + 1].fetch_add(1, std::memory_order_relaxed);
+	}
+	if (none) {
+		g_g1_slots[base + 2].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void AddG1SlotVerify(bool sampler, bool ok) {
+	const size_t base = sampler ? 8 : 6;
+	g_g1_slots[base].fetch_add(1, std::memory_order_relaxed);
+	if (!ok) {
+		g_g1_slots[base + 1].fetch_add(1, std::memory_order_relaxed);
+	}
 }
 
 void AddG1Buffer(bool null, bool addressed) {

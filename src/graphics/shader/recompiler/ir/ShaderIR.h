@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
@@ -486,7 +487,12 @@ struct BindingLayout {
 	// offset and length words keep their meaning). table_buffers lists the buffer resources, as
 	// the Buffers binding's resources do in the other mode (BufferResourceList).
 	bool                           draw_table          = false;
+	// Level 2 (G1.2): the samplers (all of them) and table_images (the images TableImage
+	// takes) are read from set 1's bindless arrays, at the slots the shader data holds from
+	// ImageSlotDword() and SamplerSlotDword(), one dword each; no set 0 binding for them.
+	uint32_t                       table_sampler_count = 0;
 	std::vector<uint32_t>          table_buffers;
+	std::vector<uint32_t>          table_images;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
@@ -499,8 +505,14 @@ struct BindingLayout {
 	[[nodiscard]] uint32_t BufferAddressDword() const {
 		return WriteTrackDword() + (write_tracking ? 2u + 2u * memory_offset_count : 0u);
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t ImageSlotDword() const {
 		return BufferAddressDword() + (draw_table ? 2u * memory_offset_count : 0u);
+	}
+	[[nodiscard]] uint32_t SamplerSlotDword() const {
+		return ImageSlotDword() + static_cast<uint32_t>(table_images.size());
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return SamplerSlotDword() + table_sampler_count;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -513,6 +525,33 @@ struct BindingLayout {
 
 	bool operator==(const BindingLayout& other) const = default;
 };
+
+// An image the draw table mode (level 2) reads by bindless slot: a plain sampled image of a
+// dimension the bindless arrays have (2D, 2D array, cube, 3D), one view, not chosen by a key.
+[[nodiscard]] inline bool TableImage(const ImageResource& image) {
+	return image.resource_class == ImageResourceClass::Sampled && !image.atomic &&
+	       !image.bindless && !image.runtime && image.mip_mode != ImageMipMode::Dynamic &&
+	       image.mip_count == 1u && image.indirect_root == ImageResource::NoIndirectImage &&
+	       image.indirect_resources.empty() &&
+	       (image.dimension == Decoder::ImageDimension::Dim2D ||
+	        image.dimension == Decoder::ImageDimension::Dim2DArray ||
+	        image.dimension == Decoder::ImageDimension::Dim3D);
+}
+
+// The bindless array (BindlessBindings.h) a table or bindless image's view goes in.
+[[nodiscard]] inline uint32_t BindlessImageBinding(const ImageResource& image) {
+	if (image.cube) {
+		return BindlessImagesCube;
+	}
+	if (image.dimension == Decoder::ImageDimension::Dim3D) {
+		return BindlessImages3D;
+	}
+	if (image.dimension == Decoder::ImageDimension::Dim2DArray ||
+	    image.dimension == Decoder::ImageDimension::Dim2DMsaaArray) {
+		return BindlessImages2DArray;
+	}
+	return BindlessImages2D;
+}
 
 // The buffer resources of the memory bindings, in binding order: the Buffers binding's resources,
 // or in the draw table mode table_buffers.
@@ -764,7 +803,7 @@ struct Program: ResourcePlan {
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	// ResourceSpecialization::draw_table, applied (AllocateBindings lays the bindings out for it).
-	bool                          draw_table = false;
+	uint8_t                       draw_table = 0;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
 

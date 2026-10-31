@@ -4257,7 +4257,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& resources = ShaderRecompiler::IR::BufferResourceList(layout);
 	// GT7 GPU-driven G1: the draw table mode reads each binding by device address.
 	const bool table      = layout.draw_table;
-	const bool g1_verify  = table && ::Loader::Gt7NativeDraws::G1Mode() == 2;
+	const bool g1_verify  = table && ::Loader::Gt7NativeDraws::G1Verify();
 	for (uint32_t i = 0; i < layout.memory_offset_count; i++) {
 		const auto resource = resources[i];
 		uint32_t buffer_offset = 0;
@@ -4356,8 +4356,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills);
 		}
 	}
+	// The draw table mode's image and sampler slots are written in CommitBindings (after the
+	// images' layouts), which uploads the shader data then.
 	if (ShaderRecompiler::IR::FindBinding(
-	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
+	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr &&
+	    program.bindings.table_images.empty() && program.bindings.table_sampler_count == 0) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
 	}
 }
@@ -5035,6 +5038,44 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			binding.layout = image.CurrentLayout();
 		}
+		// GT7 GPU-driven G1.2, the draw table mode: the slots of the images and samplers read
+		// from set 1, in the shader data (the view in the layout it has now, as set 0's write
+		// would have had).
+		const auto& layout = program.bindings;
+		if (!layout.table_images.empty() || layout.table_sampler_count != 0) {
+			auto&      table  = m_context.GetBindlessTable();
+			const bool verify = ::Loader::Gt7NativeDraws::G1Verify();
+			for (uint32_t k = 0; k < layout.table_images.size(); k++) {
+				const auto  resource = layout.table_images[k];
+				const auto& binding  = descriptors.images.at(resource);
+				const auto  array    = ShaderRecompiler::IR::BindlessImageBinding(
+                    program.info.images.at(resource));
+				bool        fresh    = false;
+				const auto  slot = table.TableImageSlot(array, binding.image_view, binding.layout, fresh);
+				prepared->shader_data.at(layout.ImageSlotDword() + k) = slot;
+				::Loader::Gt7NativeDraws::AddG1Slot(false, fresh, slot == 0);
+				if (verify) {
+					::Loader::Gt7NativeDraws::AddG1SlotVerify(
+					    false, slot != 0 && binding.mip_views.empty() &&
+					               table.SlotView(array, slot) == binding.image_view);
+				}
+			}
+			for (uint32_t j = 0; j < layout.table_sampler_count; j++) {
+				const auto sampler = descriptors.samplers.at(j);
+				bool       fresh   = false;
+				const auto slot    = table.TableSamplerSlot(sampler, fresh);
+				prepared->shader_data.at(layout.SamplerSlotDword() + j) = slot;
+				::Loader::Gt7NativeDraws::AddG1Slot(true, fresh, slot == 0);
+				if (verify) {
+					::Loader::Gt7NativeDraws::AddG1SlotVerify(
+					    true, slot != 0 && table.TableSampler(slot) == sampler);
+				}
+			}
+			if (ShaderRecompiler::IR::FindBinding(
+			        layout, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
+				descriptors.shader_data_buffer = NativeUpload(m_context, prepared->shader_data);
+			}
+		}
 
 		gt7_lap(3);
 		m_image_occurrences.assign(descriptors.images.size(), 0);
@@ -5106,6 +5147,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			m_descriptor_writes.push_back(write);
 		}
 		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
+			if (std::ranges::find(program.bindings.table_images, i) !=
+			    program.bindings.table_images.end()) {
+				EXIT_IF(m_image_occurrences[i] != 0);
+				continue;
+			}
 			const auto expected =
 			    descriptors.images[i].mip_views.empty()
 			        ? 1u

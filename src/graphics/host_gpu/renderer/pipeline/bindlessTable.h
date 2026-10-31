@@ -243,6 +243,22 @@ public:
 
 	// The texture cache dropped a resolved image: point its slots back at the placeholder and
 	// make its keys pending again, so a draw that still needs it asks for it anew.
+	// GT7 GPU-driven G1.2 (the draw table mode, GPU thread): the slot of an image view in a
+	// layout in array `binding`, written the first time (*fresh), freed when the view is released
+	// (ReleaseViews); 0 (the grey placeholder) when the array is full. A sampler's slot, written
+	// the first time and kept (samplers live as long as the cache); 0 (the default) when full.
+	[[nodiscard]] uint32_t TableImageSlot(uint32_t binding, vk::ImageView view, vk::ImageLayout layout,
+	                                      bool& fresh);
+	[[nodiscard]] uint32_t TableSamplerSlot(vk::Sampler sampler, bool& fresh);
+	// KYTY_GT7_G1_VERIFY: what a slot holds, from the writes made.
+	[[nodiscard]] vk::ImageView SlotView(uint32_t binding, uint32_t slot) const {
+		return binding < ImageArrays && slot < m_slot_views[binding].size() ? m_slot_views[binding][slot]
+		                                                                    : vk::ImageView {};
+	}
+	[[nodiscard]] vk::Sampler TableSampler(uint32_t slot) const {
+		return slot < m_table_samplers.size() ? m_table_samplers[slot] : vk::Sampler {};
+	}
+
 	void OnImageUnregistered(ImageId id);
 	// Keys made pending because the texture cache dropped their image (statistics; reset on read).
 	[[nodiscard]] uint64_t TakeUnregisteredKeys() noexcept { return std::exchange(m_unregistered_keys, 0); }
@@ -315,6 +331,16 @@ private:
 	// The view each image slot holds, and the slots each view is in (placeholders excluded).
 	std::array<std::vector<vk::ImageView>, ImageArrays>                        m_slot_views;
 	std::unordered_map<VkImageView, std::vector<std::pair<uint32_t, uint32_t>>> m_view_slots;
+	// G1.2: per view, its table slots (binding, layout, slot); per sampler its slot, and per slot
+	// its sampler.
+	struct TableSlot {
+		uint32_t        binding = 0;
+		vk::ImageLayout layout  = vk::ImageLayout::eUndefined;
+		uint32_t        slot    = 0;
+	};
+	std::unordered_map<VkImageView, std::vector<TableSlot>> m_table_image_slots;
+	std::unordered_map<VkSampler, uint32_t>                 m_table_sampler_slots;
+	std::vector<vk::Sampler>                                m_table_samplers;
 };
 
 } // namespace Libs::Graphics

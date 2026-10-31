@@ -53,8 +53,9 @@ struct ResourceSpecialization {
 	std::vector<Image>   images;
 	std::vector<Sampler> samplers;
 	// GT7 GPU-driven G1 (docs/GT7-GPU-DRIVEN.md): the draw table binding mode
-	// (BindingLayout::draw_table). Set by the host for covered draws, after the walk.
-	bool                 draw_table = false;
+	// (BindingLayout::draw_table). Set by the host for covered draws, after the walk: 0 off,
+	// 1 buffers by device address, 2 also images (TableImage) and samplers by bindless slot.
+	uint8_t              draw_table = 0;
 
 	bool operator==(const ResourceSpecialization&) const = default;
 };

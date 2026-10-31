@@ -1378,11 +1378,9 @@ uint64_t SpecializationHash(const ShaderRecompiler::IR::ResourceSpecialization& 
 		             {static_cast<uint32_t>(sampler.bindless), sampler.bindless_mapping_offset});
 	}
 	auto hash = XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
-	// The draw table mode toggles a salt, so that the GPU thread can set or clear it on a hash the
-	// scanner made (ProgramCache::Get, Gt7G1).
-	if (specialization.draw_table) {
-		hash ^= DrawTableHashSalt;
-	}
+	// The draw table mode's level toggles a salt, so that the GPU thread can set or change it on
+	// a hash the scanner made (ProgramCache::Get, ApplyDrawTableMode).
+	hash ^= DrawTableHashSalt * specialization.draw_table;
 	return hash != 0 ? hash : 1u; // 0 means none (DrawPrep::StageResult)
 }
 
@@ -2667,31 +2665,35 @@ struct PipelineCache::ProgramCache {
 	}
 
 	// GT7 GPU-driven G1 (docs/GT7-GPU-DRIVEN.md, KYTY_GT7_G1): a marked draw's vertex and pixel
-	// stage are asked for in the draw table mode, when their program has no indirect buffer.
-	// Every other stage is not (a stage snapshot is reused by the next draw's walk). The scanner's
-	// hash is made without the mode; the mode toggles its salt.
-	static void ApplyDrawTableMode(ShaderType stage, StageSnapshot& snapshot) {
+	// stage are asked for in the draw table mode, at the level G1Level gives (images by slot only
+	// with the bindless table), when their program has no indirect buffer. Every other stage is
+	// not (a stage snapshot is reused by the next draw's walk). The scanner's hash is made without
+	// the mode; the level toggles its salt.
+	void ApplyDrawTableMode(ShaderType stage, StageSnapshot& snapshot) const {
 		auto& specialization = snapshot.specialization;
+		const auto level     = ::Loader::Gt7NativeDraws::G1Level();
 		const bool table =
-		    ::Loader::Gt7NativeDraws::G1Mode() != 0 && ::Loader::Gt7NativeDraws::CurrentMarked() &&
+		    level != 0 && ::Loader::Gt7NativeDraws::CurrentMarked() &&
 		    (stage == ShaderType::Pixel || stage == ShaderType::Vertex) &&
 		    std::ranges::none_of(specialization.buffers, [](const auto& buffer) {
 			    return buffer.indirect_root !=
 			               ShaderRecompiler::IR::BufferResource::NoIndirectBuffer ||
 			           buffer.indirect_search_iterations != 0;
 		    });
-		if (specialization.draw_table == table) {
+		const uint8_t want = !table ? 0u : level >= 2 && bindless_images ? 2u : 1u;
+		if (specialization.draw_table == want) {
 			return;
 		}
-		specialization.draw_table = table;
 		if (snapshot.specialization_hash_valid) {
-			snapshot.specialization_hash ^= DrawTableHashSalt;
+			snapshot.specialization_hash ^= DrawTableHashSalt * specialization.draw_table;
+			snapshot.specialization_hash ^= DrawTableHashSalt * want;
 			snapshot.specialization_hash_valid = snapshot.specialization_hash != 0;
 		}
+		specialization.draw_table = want;
 	}
 
 	// The first materialization of a new source; a failure skips this draw (see Get).
-	static bool MaterializeFirstUse(SourceEntry&                           source,
+	bool MaterializeFirstUse(SourceEntry&                           source,
 	                                const ShaderRecompiler::IR::SrtRuntime& runtime,
 	                                ShaderType stage, const char* stage_name, uint64_t hash) {
 		bool ok       = false;

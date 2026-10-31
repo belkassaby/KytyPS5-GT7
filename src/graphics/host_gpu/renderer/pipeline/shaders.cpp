@@ -289,7 +289,9 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 }
 
 static bool UsesBindless(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
-	return std::ranges::any_of(program.info.images, &ShaderRecompiler::IR::ImageResource::bindless) ||
+	// The draw table mode's images and samplers by slot (GT7 G1.2) are in set 1 too.
+	return !program.bindings.table_images.empty() || program.bindings.table_sampler_count != 0 ||
+	       std::ranges::any_of(program.info.images, &ShaderRecompiler::IR::ImageResource::bindless) ||
 	       std::ranges::any_of(program.info.samplers,
 	                           &ShaderRecompiler::IR::SamplerResource::bindless);
 }

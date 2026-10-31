@@ -733,9 +733,83 @@ void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView vie
 	}
 }
 
+uint32_t BindlessTable::TableImageSlot(uint32_t binding, vk::ImageView view, vk::ImageLayout layout,
+                                       bool& fresh) {
+	fresh = false;
+	if (m_set == nullptr || binding >= ImageArrays || view == nullptr) {
+		return 0;
+	}
+	auto& slots = m_table_image_slots[static_cast<VkImageView>(view)];
+	for (const auto& entry: slots) {
+		if (entry.binding == binding && entry.layout == layout) {
+			return entry.slot;
+		}
+	}
+	const auto slot = AllocateSlot(binding);
+	if (slot == 0) {
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 8) {
+			LOGF("Bindless: draw table image slots: array %u full\n", binding);
+		}
+		return 0;
+	}
+	WriteSlot(binding, slot, view, layout);
+	slots.push_back({binding, layout, slot});
+	fresh = true;
+	return slot;
+}
+
+uint32_t BindlessTable::TableSamplerSlot(vk::Sampler sampler, bool& fresh) {
+	fresh = false;
+	if (m_set == nullptr || sampler == nullptr) {
+		return 0;
+	}
+	if (const auto found = m_table_sampler_slots.find(static_cast<VkSampler>(sampler));
+	    found != m_table_sampler_slots.end()) {
+		return found->second;
+	}
+	if (m_next_sampler_slot >= m_samplers_per_array) {
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 8) {
+			LOGF("Bindless: draw table sampler slots: array full (%u)\n", m_samplers_per_array);
+		}
+		return 0;
+	}
+	const auto              slot = m_next_sampler_slot++;
+	vk::DescriptorImageInfo info {sampler, nullptr, vk::ImageLayout::eUndefined};
+	vk::WriteDescriptorSet  write {};
+	write.dstSet          = m_set;
+	write.dstBinding      = Samplers;
+	write.dstArrayElement = slot;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eSampler;
+	write.pImageInfo      = &info;
+	m_graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
+	m_table_sampler_slots.emplace(static_cast<VkSampler>(sampler), slot);
+	if (m_table_samplers.size() <= slot) {
+		m_table_samplers.resize(slot + 1u);
+	}
+	m_table_samplers[slot] = sampler;
+	fresh                  = true;
+	return slot;
+}
+
 bool BindlessTable::ReleaseViews(std::span<const vk::ImageView> views) {
 	bool held = false;
 	for (const auto view: views) {
+		// The draw table mode's slots of the view: repointed to the placeholder, and free once
+		// the work recorded with them is done (held: the view lives until then).
+		if (const auto table = m_table_image_slots.find(static_cast<VkImageView>(view));
+		    table != m_table_image_slots.end()) {
+			for (const auto& entry: table->second) {
+				WriteSlot(entry.binding, entry.slot,
+				          m_placeholder_views[entry.binding * PlaceholderColors],
+				          vk::ImageLayout::eShaderReadOnlyOptimal);
+				ReleaseSlot(entry.binding, entry.slot);
+				held = true;
+			}
+			m_table_image_slots.erase(table);
+		}
 		const auto found = m_view_slots.find(static_cast<VkImageView>(view));
 		if (found == m_view_slots.end()) {
 			continue;

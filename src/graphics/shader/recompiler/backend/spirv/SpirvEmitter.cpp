@@ -45,6 +45,13 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		expected[index]  = std::move(resources);
 	};
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		const auto& table = program.bindings.table_images;
+		if (std::ranges::find(table, i) != table.end()) {
+			if (!IR::TableImage(program.info.images[i])) {
+				Fail(program, "draw table image is not one TableImage takes");
+			}
+			continue;
+		}
 		const auto kind = IR::DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {
 			Fail(program, "native shader plan has an invalid image class");
@@ -58,7 +65,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		expected[static_cast<size_t>(*kind)].insert(expected[static_cast<size_t>(*kind)].end(),
 		                                            count, i);
 	}
-	if (!program.info.samplers.empty()) {
+	if (!program.info.samplers.empty() && program.bindings.table_sampler_count == 0) {
 		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
 	}
 	auto& buffers = expected[static_cast<size_t>(Kind::Buffers)];
