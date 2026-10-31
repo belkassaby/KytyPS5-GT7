@@ -137,6 +137,9 @@ void               AddG1SlotVerify(bool sampler, bool ok);
 // and bindings that went the usual way (no single buffer held the range).
 [[nodiscard]] bool G3Use();
 void               AddG3Buffers(bool stage_taken, uint32_t direct, uint32_t usual);
+// G3.1b: a stage's images taken from its record's slots, and those resolved the usual way though
+// their slot was published (the slot's image changed since).
+void               AddG3Images(uint32_t taken, uint32_t resolved);
 [[nodiscard]] const Libs::Graphics::Gt7NativeWalk::ShadowRecord* CurrentShadow(uint32_t stage);
 void AddG3Field(uint32_t field, uint32_t result, uint32_t count);
 // A stage compared: whether it had a shadow with a layout, whether every word was equal, and

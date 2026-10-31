@@ -471,3 +471,28 @@ The BDA walk's rule (the game's writes visible from its next submission) is the 
 the picture shows no stale geometry. The gain is small on its own (~0.2 us a draw): the buffers
 were the cheap part. Next, the expensive ones: the images (textures phase ~1.9 us) and the
 programs (~3.0 us).
+
+## G3.1b, verified: images from the records' slots (2026-10-31)
+
+Each table image slot keeps the binding it was given (image, view, description, the stamp of its
+memory: `g_g3_slot_bindings`); a covered stage's images whose record has a slot take that binding
+as a texture memo hit does (registered, not to rebind, stamp unchanged; `RebindImages` then checks
+the view as for a memo binding). The record comparison now runs only with `=shadow` or
+`KYTY_GT7_G1_VERIFY=1` (in `=use` it cost the commit ~0.5 to 1 us: dozens of counter updates a
+stage). Race with checks (`_g3-use-images-verify.txt`), 10 s windows:
+
+| | |
+|---|---|
+| images taken from the records' slots | 680,000 to 700,000; resolved though their slot was published: **2 to 3** |
+| slot checks | 0 wrong |
+| a marked pixel stage's texture resolution (key, memo, slow path, bind) | **0.1 to 0.2 us** (1.0 before) |
+| us a draw: programs / textures / images / buffers / commit | 2.2 to 2.8 / 1.4 to 2.0 / **0.82 to 0.95** / 0.38 to 0.44 / 1.7 to 2.1 |
+| all, us a draw | 10.0 to 12.3 (11.9 in G3.1a's race) |
+| picture | as before; frame rate ~15 fps (the user) |
+
+The resolution's saving moved partly into the images phase (memo bindings checked in
+`RebindImages`: 0.54 to ~0.9 us). The draw still runs the whole per-draw pipeline: the programs'
+take and check (`TakeScanned`, `ReadSet::Validate`), `PrepareBindings`, `RebindImages`,
+`RebindBuffers`, the transitions and the record in `CommitBindings`. Each piece replaced inside it
+saves a fraction of a microsecond: N4's lesson again (GT7-NATIVE-BACKEND.md). The frame rate moves
+only when a covered draw does not enter that pipeline at all.

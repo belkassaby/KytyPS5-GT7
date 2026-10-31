@@ -256,7 +256,7 @@ bool G3ShadowEnabled() {
 }
 
 // G3.1: stages that took the record's buffers, that could not; bindings direct, the usual way.
-std::array<std::atomic<uint64_t>, 4> g_g3_use {};
+std::array<std::atomic<uint64_t>, 6> g_g3_use {}; // + images taken, resolved
 
 void ReportG3() {
 	static std::array<uint64_t, 6> last {};
@@ -284,8 +284,8 @@ void ReportG3() {
 		                      names[f], v[0] + v[1] + v[2], 100.0 * v[0] / all, 100.0 * v[1] / all,
 		                      100.0 * v[2] / all);
 	}
-	static std::array<uint64_t, 4> last_use {};
-	std::array<double, 4>          u {};
+	static std::array<uint64_t, 6> last_use {};
+	std::array<double, 6>          u {};
 	for (size_t i = 0; i < u.size(); i++) {
 		const auto n = g_g3_use[i].load(std::memory_order_relaxed);
 		u[i]         = static_cast<double>(n - last_use[i]);
@@ -294,8 +294,9 @@ void ReportG3() {
 	if (G3UseEnabled()) {
 		Log::WriteUnmuted(fmt::format(
 		    "GT7 G3 use (10 s): stages with the record's buffers {:.0f}, without {:.0f} | bindings "
-		    "addressed without a sync {:.0f}, the usual way {:.0f}\n",
-		    u[0], u[1], u[2], u[3]));
+		    "addressed without a sync {:.0f}, the usual way {:.0f} | images from the records' slots "
+		    "{:.0f}, resolved though published {:.0f}\n",
+		    u[0], u[1], u[2], u[3], u[4], u[5]));
 	}
 	Log::WriteUnmuted(fmt::format(
 	    "GT7 G3 shadow records (10 s): built {:.0f} on the render threads, {:.2f} us each | stages "
@@ -1479,6 +1480,11 @@ bool G3Shadow() {
 
 bool G3Use() {
 	return G3UseEnabled();
+}
+
+void AddG3Images(uint32_t taken, uint32_t resolved) {
+	g_g3_use[4].fetch_add(taken, std::memory_order_relaxed);
+	g_g3_use[5].fetch_add(resolved, std::memory_order_relaxed);
 }
 
 void AddG3Buffers(bool stage_taken, uint32_t direct, uint32_t usual) {

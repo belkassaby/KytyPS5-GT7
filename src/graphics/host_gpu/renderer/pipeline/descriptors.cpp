@@ -1077,6 +1077,17 @@ std::unordered_map<uint64_t, std::shared_ptr<const G3Layout>>          g_g3_layo
 std::unordered_map<TextureDescKey, G3ImageSlot, TextureDescKeyHash>    g_g3_image_slots;
 std::unordered_map<G3SamplerKey, uint32_t, G3SamplerKeyHash>           g_g3_sampler_slots;
 
+// G3.1b (GPU thread): the binding each table image slot was given (the image, its view and
+// description, and the stamp of its memory then), by bindless array and slot; a record's slot is
+// turned back into its binding with the texture memo's checks (PrepareBindings).
+struct G3SlotBinding {
+	ImageId                 id;
+	vk::ImageView           view = nullptr;
+	TextureCache::ImageDesc desc;
+	uint64_t                stamp = 0;
+};
+std::array<std::vector<G3SlotBinding>, 4> g_g3_slot_bindings;
+
 G3SamplerKey MakeG3SamplerKey(const ShaderRecompiler::IR::SamplerResource& sampler,
                               const ShaderRecompiler::IR::DescriptorValue&  value) {
 	return {value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
@@ -3895,6 +3906,25 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const bool gt7_images = Gt7NativeImagesMode() != 0 && pixel &&
 	                        ::Loader::Gt7NativeDraws::RecordsUse() &&
 	                        ::Loader::Gt7NativeDraws::CurrentMarked();
+	// GT7 G3.1b: a marked record-mode stage's table images from its record's slots (the bindings
+	// those slots were given), with the texture memo's checks; the rest (the light grid among
+	// them: no slot published) resolved as usual.
+	thread_local std::vector<uint32_t> g3_slot_of;
+	g3_slot_of.assign(program.info.images.size(), 0u);
+	uint32_t g3_taken = 0;
+	uint32_t g3_asked = 0;
+	if (program.bindings.record && ::Loader::Gt7NativeDraws::G3Use() &&
+	    ::Loader::Gt7NativeDraws::CurrentMarked() &&
+	    (pixel || program.stage == ShaderType::Vertex)) {
+		const auto* shadow = ::Loader::Gt7NativeDraws::CurrentShadow(pixel ? 1u : 0u);
+		const auto& table  = program.bindings.table_images;
+		if (shadow != nullptr && shadow->layout && shadow->shader_hash == program.shader_hash &&
+		    shadow->image_slots.size() == table.size()) {
+			for (size_t k = 0; k < table.size(); k++) {
+				g3_slot_of[table[k]] = shadow->image_slots[k];
+			}
+		}
+	}
 	for (uint32_t i = 0; !gt7_hit && i < program.info.images.size(); i++) {
 		// N4 step 1: the record's binding (the GPU thread's own of the same descriptor, published
 		// with its view), while the image is still the one over that memory; RebindImages then
@@ -3918,6 +3948,23 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 					g_gt7_image_use.used++;
 				} else {
 					g_gt7_image_use.stale++;
+				}
+			}
+		}
+		if (const auto slot = g3_slot_of[i]; slot != 0 && !from_record) {
+			g3_asked++;
+			const auto array = ShaderRecompiler::IR::BindlessImageBinding(program.info.images[i]);
+			if (array < g_g3_slot_bindings.size() && slot < g_g3_slot_bindings[array].size()) {
+				const auto& kept  = g_g3_slot_bindings[array][slot];
+				const auto* image = texture_cache.m_slot_images.try_get(kept.id);
+				if (kept.view != nullptr && image != nullptr && image->registered &&
+				    !image->depth_id && !image->binding.needs_rebind &&
+				    texture_cache.RangeStamp(kept.desc.info.data.address,
+				                             kept.desc.info.data.size) == kept.stamp) {
+					binding           = {kept.id, nullptr, kept.desc};
+					binding.memo_view = kept.view;
+					from_record       = true;
+					g3_taken++;
 				}
 			}
 		}
@@ -3957,6 +4004,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
+	}
+	if (g3_asked != 0) {
+		::Loader::Gt7NativeDraws::AddG3Images(g3_taken, g3_asked - g3_taken);
 	}
 	if (t_gt7_resolve.on) {
 		const auto& r = t_gt7_resolve;
@@ -4789,7 +4839,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 // publishes the stage's record layout for its learned key, and compares the shadow the render
 // thread built (Gt7NativeWalk::BuildShadow) with the record written here, field by field.
 static void G3Compare(TextureCache& textures, const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                      const PreparedBindings& prepared) {
+                      const PreparedBindings& prepared, bool compare) {
 	g_gt7_n4_texture_cache.store(&textures, std::memory_order_release);
 	const uint32_t stage  = program.stage == ShaderType::Pixel ? 1u : 0u;
 	const auto&    layout = program.bindings;
@@ -4814,6 +4864,9 @@ static void G3Compare(TextureCache& textures, const ShaderRecompiler::IR::Compil
 			std::unique_lock lock(g_g3_mutex);
 			g_g3_layouts[key] = std::move(g3);
 		}
+	}
+	if (!compare) {
+		return;
 	}
 	const auto* shadow = ::Loader::Gt7NativeDraws::CurrentShadow(stage);
 	if (shadow == nullptr || !shadow->layout || shadow->shader_hash != program.shader_hash) {
@@ -5229,6 +5282,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				bool        fresh    = false;
 				const auto  slot = table.TableImageSlot(array, binding.image_view, binding.layout, fresh);
 				prepared->shader_data[layout.ImageSlotDword() + k] = slot;
+				if (g3 && slot != 0 && array < g_g3_slot_bindings.size() && binding.mip_views.empty()) {
+					auto& slots = g_g3_slot_bindings[array];
+					if (slots.size() <= slot) {
+						slots.resize(slot + 1u);
+					}
+					auto&       kept  = slots[slot];
+					const auto& data  = binding.desc.info.data;
+					const auto  stamp = m_context.GetTextureCache().RangeStamp(data.address, data.size);
+					if (kept.id != binding.image_id || kept.view != binding.image_view ||
+					    kept.stamp != stamp) {
+						kept = {binding.image_id, binding.image_view, binding.desc, stamp};
+					}
+				}
 				if (g3 && slot != 0) {
 					const auto  key   = MakeTextureDescKey(program.info.images.at(resource),
 					                                       prepared->runtime->resources->images.at(resource));
@@ -5328,7 +5394,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			record_offset = static_cast<uint32_t>(at / sizeof(uint32_t));
 			if (::Loader::Gt7NativeDraws::G3Shadow() && ::Loader::Gt7NativeDraws::CurrentMarked() &&
 			    (program.stage == ShaderType::Pixel || program.stage == ShaderType::Vertex)) {
-				G3Compare(m_context.GetTextureCache(), program, *prepared);
+				G3Compare(m_context.GetTextureCache(), program, *prepared,
+				          !::Loader::Gt7NativeDraws::G3Use() || ::Loader::Gt7NativeDraws::G1Verify());
 			}
 			::Loader::Gt7NativeDraws::AddG1Record(
 			    static_cast<uint32_t>(dwords),
