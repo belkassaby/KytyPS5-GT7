@@ -244,3 +244,31 @@ Neutral again: the slot lookups in `CommitBindings` cost about what the set 0 im
 writes they replace did. The work per draw is still all there (the walk, the texture resolution,
 the transitions, a descriptor set for the flattened SRT and the images that do not qualify);
 G1.3 is the step that removes the set.
+
+## G1.3, design: records in the stream ring, one cached set (2026-10-31)
+
+Level 3 of the draw table mode (`KYTY_GT7_G1=records`), refined from the plan above with what
+G1.1 and G1.2 showed:
+
+- **The record** is the stage's whole shader data (user data, buffer offsets, lengths and
+  addresses, write tracking, image and sampler slots) followed by its flattened SRT. The GPU
+  thread writes it into the buffer cache's stream ring (`NativeUpload`: one fixed 64 MB buffer,
+  256-byte aligned, retired by tick) after the images' layouts (the slots need them), at the
+  place it uploads the shader data buffer today.
+- **The push data** of a record-mode stage is one dword, the record's offset in dwords, given out
+  by the pipeline's push data cursor as shader data is now (`BindingLayout::PushDwords`), so
+  record and other stages mix in one pipeline. Without room for it the stage stays at level 2.
+- **The shader** reads its shader data at `ring[push + i]` and its flattened SRT at
+  `ring[push + ShaderDataDwords() + i]`, through the `ShaderData` binding, which is the whole
+  stream ring; no `FlattenedSrt` binding.
+- **The set.** A pipeline whose stages are all record-mode and whose set 0 holds nothing but the
+  stream ring, the BDA page table and the fault buffer (`Pipeline::static_bindings`) uses no
+  push descriptors: one set per set layout, written once from a persistent pool
+  (`DescriptorHeap::Persistent`) and checked against the buffers each draw would write, is
+  bound instead of allocating and writing a set per draw. The CPU still prepares the draw as
+  before (G3 removes that); what goes is the set's allocation and writes, and the shader data's
+  size in push constants.
+
+The "GT7 G1 records" line counts records, their size, and the draws that bound the cached set
+(and why the others did not). Verified by picture: the record holds the words the shader data
+and flattened SRT bindings held before, from the same code.
