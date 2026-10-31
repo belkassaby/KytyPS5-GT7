@@ -289,3 +289,36 @@ the buffers, whose slots move as the cache grows). Race, 10 s windows:
 With the images (98 % of pixel stages named but for the light grid), a record names nearly every
 resource of nearly every marked draw from GT7's render thread. What stays for the GPU thread at
 the marker: the light grid, and the rare buffer the GPU thread makes or extends at the draw.
+
+## N4 step 1: image bindings from the records, measured (2026-10-30)
+
+`KYTY_GT7_NATIVE_IMAGES=1` (with `KYTY_GT7_NATIVE_RECORDS=use`): the GPU thread publishes, once
+the views are made (`RebindImages`), each marked pixel stage's plain sampled bindings by
+descriptor (image, description, view, memory and its stamp); the render thread attaches them to
+its record while the stamp holds; the GPU thread takes them in place of `ResolveTexture`, as memo
+bindings (`RebindImages` checks them unchanged before it uses their view). `=verify`: 0 another
+image in 670,000 to 940,000 bindings taken per 10 s, 98 to 99 % of those offered used.
+
+The checks and coverage counts are now behind `KYTY_GT7_NATIVE_CHECK=1` (the lean records path
+learns programs once and publishes a binding only when it changed). A/B, music rally, against
+run B (no records):
+
+| us a draw | records, image bindings | without records |
+|---|---|---|
+| all | 11.5 to 11.9 | 10.9 to 11.0 |
+| programs | 2.65 to 2.74 | 2.61 to 2.72 |
+| textures | **1.68 to 1.74** | 2.01 to 2.05 |
+| images | 1.19 to 1.28 | 0.65 to 0.67 |
+| commit | 1.74 to 1.77 | 0.87 to 0.99 |
+| other | 1.28 to 1.30 | 0.99 to 1.00 |
+| frame rate, median | 14.9 | 16.2 |
+
+The textures phase gains 0.3 us; the images and commit phases lose 1.4 between them (the
+publishing, and the memo bindings' layouts and transitions done later, in `CommitBindings`), and
+the records' marker and per-draw bookkeeping ~0.3. Net: ~0.7 us a draw worse.
+
+The lesson is the one prepare-ahead taught (GT7-PARALLEL-RENDERER.md): handing the GPU thread
+prepared pieces of a draw costs it about what the pieces saved, because it still takes, checks and
+applies each one inside its own per-draw pipeline. The records only pay when the GPU thread does
+not run that pipeline for the draw at all: the record's commands recorded on the render thread and
+spliced at the marker (N4's last step). Image bindings stay off by default.

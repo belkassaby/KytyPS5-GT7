@@ -985,6 +985,50 @@ std::unordered_map<TextureDescKey, ImageInfo, TextureDescKeyHash> g_gt7_n4_descs
 std::unordered_map<uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::IR::ImageResource>>>
                            g_gt7_n4_programs;
 std::atomic<TextureCache*> g_gt7_n4_texture_cache {nullptr};
+// N4 step 1 (KYTY_GT7_NATIVE_IMAGES=1, =verify): the GPU thread's whole bindings of marked pixel
+// stages' images, by descriptor, published once their views are made (RebindImages).
+struct Gt7Binding {
+	ImageId                 id;
+	TextureCache::ImageDesc desc;
+	vk::ImageView           view    = nullptr;
+	uint64_t                address = 0;
+	uint64_t                size    = 0;
+	uint64_t                stamp   = 0;
+};
+std::unordered_map<TextureDescKey, std::shared_ptr<const Gt7Binding>, TextureDescKeyHash>
+    g_gt7_n4_bindings;
+
+int Gt7NativeImagesMode() { // 0 off, 1 use, 2 use and verify
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_GT7_NATIVE_IMAGES");
+		return value == nullptr ? 0 : std::strcmp(value, "verify") == 0 ? 2 : value[0] == '1' ? 1 : 0;
+	}();
+	return mode;
+}
+
+struct Gt7ImageUse {
+	uint64_t offered = 0, used = 0, stale = 0, verified = 0, differ = 0;
+	std::chrono::steady_clock::time_point last {};
+};
+Gt7ImageUse g_gt7_image_use; // GPU thread
+
+void ReportGt7ImageUse() {
+	auto&      u   = g_gt7_image_use;
+	const auto now = std::chrono::steady_clock::now();
+	if (u.last.time_since_epoch().count() == 0) {
+		u.last = now;
+		return;
+	}
+	if (now - u.last < std::chrono::seconds(10)) {
+		return;
+	}
+	LOGF("Native records N4 image bindings (10 s): %" PRIu64 " offered by records, %" PRIu64
+	     " used in place of resolving, %" PRIu64 " stale | verify: %" PRIu64 " resolved again, %" PRIu64
+	     " another image\n",
+	     u.offered, u.used, u.stale, u.verified, u.differ);
+	u      = {};
+	u.last = now;
+}
 // The GPU thread's bindings by descriptor: the image it bound, and the stamp of the descriptor's
 // memory then (TextureCache::RangeStamp: no image over it made or dropped since while it holds).
 // What the render thread uses where its own lookup finds nothing: the images the GPU thread
@@ -3804,8 +3848,42 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 	t_gt7_resolve = {};
 	t_gt7_resolve.on = pixel && ::Loader::Gt7NativeDraws::CurrentMarked();
+	const bool gt7_images = Gt7NativeImagesMode() != 0 && pixel &&
+	                        ::Loader::Gt7NativeDraws::RecordsUse() &&
+	                        ::Loader::Gt7NativeDraws::CurrentMarked();
 	for (uint32_t i = 0; !gt7_hit && i < program.info.images.size(); i++) {
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
+		// N4 step 1: the record's binding (the GPU thread's own of the same descriptor, published
+		// with its view), while the image is still the one over that memory; RebindImages then
+		// checks it is unchanged before it uses the view (the memo's path), and resolves it again
+		// otherwise.
+		TextureBinding binding;
+		bool           from_record = false;
+		if (gt7_images) {
+			if (const auto* b = static_cast<const Gt7Binding*>(
+			        ::Loader::Gt7NativeDraws::RecordImageBinding(i));
+			    b != nullptr) {
+				g_gt7_image_use.offered++;
+				auto&       texture_cache = m_context.GetTextureCache();
+				const auto* image         = texture_cache.m_slot_images.try_get(b->id);
+				if (image != nullptr && image->registered && !image->depth_id &&
+				    !image->binding.needs_rebind &&
+				    texture_cache.RangeStamp(b->address, b->size) == b->stamp) {
+					binding           = {b->id, nullptr, b->desc};
+					binding.memo_view = b->view;
+					from_record       = true;
+					g_gt7_image_use.used++;
+				} else {
+					g_gt7_image_use.stale++;
+				}
+			}
+		}
+		if (!from_record) {
+			binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
+		} else if (Gt7NativeImagesMode() == 2) {
+			const auto again = ResolveTexture(program.info.images[i], snapshot.images[i], false);
+			g_gt7_image_use.verified++;
+			g_gt7_image_use.differ += again.image_id != binding.image_id ? 1 : 0;
+		}
 		if (hiz_off &&
 		    program.info.images[i].resource_class !=
 		        ShaderRecompiler::IR::ImageResourceClass::Storage &&
@@ -3849,13 +3927,22 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		g_gt7_n4_texture_cache.store(&m_context.GetTextureCache(), std::memory_order_release);
 		const uint64_t key   = ::Loader::Gt7NativeDraws::CurrentLearnedKey(1);
 		const auto     count = std::min<size_t>(program.info.images.size(), prepared.images.size());
+		const bool check = ::Loader::Gt7NativeDraws::RecordsCheck();
+		bool       learned = false;
 		{
+			std::shared_lock lock(g_gt7_n4_mutex);
+			learned = key == 0 || g_gt7_n4_programs.contains(key);
+		}
+		if (!learned || check) {
 			std::unique_lock lock(g_gt7_n4_mutex);
 			if (key != 0 && !g_gt7_n4_programs.contains(key)) {
 				g_gt7_n4_programs.emplace(
 				    key, std::make_shared<const std::vector<ShaderRecompiler::IR::ImageResource>>(
 				             program.info.images));
 			}
+		}
+		if (check) {
+			std::unique_lock lock(g_gt7_n4_mutex);
 			if (g_gt7_n4_descs.size() > (1u << 18u)) {
 				g_gt7_n4_descs.clear();
 			}
@@ -3872,12 +3959,14 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				    texture_cache.RangeStamp(info.data.address, info.data.size)};
 			}
 		}
-		std::array<uint32_t, 32> ids {};
-		const auto               n = static_cast<uint32_t>(std::min<size_t>(count, ids.size()));
-		for (uint32_t i = 0; i < n; i++) {
-			ids[i] = prepared.images[i].image_id.index;
+		if (check) {
+			std::array<uint32_t, 32> ids {};
+			const auto               n = static_cast<uint32_t>(std::min<size_t>(count, ids.size()));
+			for (uint32_t i = 0; i < n; i++) {
+				ids[i] = prepared.images[i].image_id.index;
+			}
+			::Loader::Gt7NativeDraws::CompareRecordImages(ids.data(), n);
 		}
-		::Loader::Gt7NativeDraws::CompareRecordImages(ids.data(), n);
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	// KYTY_BISECT lit:big: whether a sampler samples a depth image 4096 or more texels wide. One
@@ -4092,7 +4181,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	const bool gt7_stage = program.stage == ShaderType::Pixel || program.stage == ShaderType::Vertex ||
 	                       program.stage == ShaderType::Mesh;
 	if (gt7_stage && ::Loader::Gt7NativeDraws::RecordsUse() &&
-	    ::Loader::Gt7NativeDraws::CurrentMarked()) {
+	    ::Loader::Gt7NativeDraws::RecordsCheck() && ::Loader::Gt7NativeDraws::CurrentMarked()) {
 		const uint32_t stage = program.stage == ShaderType::Pixel ? 1u : 0u;
 		g_gt7_n4_buffer_cache.store(&cache, std::memory_order_release);
 		if (const uint64_t key = ::Loader::Gt7NativeDraws::CurrentLearnedKey(stage); key != 0) {
@@ -4398,6 +4487,47 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
+	}
+	// N4 step 1: a marked pixel stage's plain sampled bindings, with their views, for the records.
+	if (Gt7NativeImagesMode() != 0 && program.stage == ShaderType::Pixel &&
+	    ::Loader::Gt7NativeDraws::RecordsUse() && ::Loader::Gt7NativeDraws::CurrentMarked()) {
+		ReportGt7ImageUse();
+		const auto count = std::min<size_t>(images.size(), snapshot.images.size());
+		for (size_t i = 0; i < count; i++) {
+			const auto& binding = images[i];
+			if (binding.image_view == nullptr || !binding.mip_views.empty() ||
+			    binding.desc.type != TextureCache::BindingType::Texture ||
+			    binding.desc.info.data.Empty()) {
+				continue;
+			}
+			const auto key   = MakeTextureDescKey(program.info.images[i], snapshot.images[i]);
+			const auto stamp = texture_cache.RangeStamp(binding.desc.info.data.address,
+			                                            binding.desc.info.data.size);
+			// What this thread published last for the descriptor: the same binding is not
+			// published again (a lookup, no lock, no allocation).
+			struct Published {
+				ImageId       id;
+				vk::ImageView view  = nullptr;
+				uint64_t      stamp = 0;
+			};
+			thread_local std::unordered_map<TextureDescKey, Published, TextureDescKeyHash> sent;
+			if (sent.size() > (1u << 18u)) {
+				sent.clear();
+			}
+			auto& last = sent[key];
+			if (last.id == binding.image_id && last.view == binding.image_view && last.stamp == stamp) {
+				continue;
+			}
+			last = {binding.image_id, binding.image_view, stamp};
+			auto published = std::make_shared<const Gt7Binding>(Gt7Binding {
+			    binding.image_id, binding.desc, binding.image_view, binding.desc.info.data.address,
+			    binding.desc.info.data.size, stamp});
+			std::unique_lock lock(g_gt7_n4_mutex);
+			if (g_gt7_n4_bindings.size() > (1u << 18u)) {
+				g_gt7_n4_bindings.clear();
+			}
+			g_gt7_n4_bindings[key] = std::move(published);
+		}
 	}
 }
 
@@ -4976,8 +5106,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 namespace Gt7NativeWalk {
 
 uint32_t ResolveImages(uint64_t key, const ShaderRecompiler::IR::ResourceSnapshot& resources,
-                       uint32_t* ids, uint8_t* states, uint32_t max) {
-	auto* cache = g_gt7_n4_texture_cache.load(std::memory_order_acquire);
+                       uint32_t* ids, uint8_t* states, uint32_t max,
+                       std::shared_ptr<const void>* bindings) {
+	const bool check = ::Loader::Gt7NativeDraws::RecordsCheck();
+	auto*      cache = g_gt7_n4_texture_cache.load(std::memory_order_acquire);
 	std::shared_ptr<const std::vector<ShaderRecompiler::IR::ImageResource>> images;
 	std::array<ImageInfo, 32>                                               infos;
 	std::array<bool, 32>                                                    known {};
@@ -4995,16 +5127,29 @@ uint32_t ResolveImages(uint64_t key, const ShaderRecompiler::IR::ResourceSnapsho
             std::min<size_t>({images->size(), resources.images.size(), max, infos.size()}));
 		for (uint32_t i = 0; i < count; i++) {
 			const auto desc_key = MakeTextureDescKey((*images)[i], resources.images[i]);
-			const auto found    = g_gt7_n4_descs.find(desc_key);
-			if (found != g_gt7_n4_descs.end()) {
-				infos[i] = found->second;
-				known[i] = true;
+			if (check) {
+				const auto found = g_gt7_n4_descs.find(desc_key);
+				if (found != g_gt7_n4_descs.end()) {
+					infos[i] = found->second;
+					known[i] = true;
+				}
+				if (const auto b = g_gt7_n4_bound.find(desc_key); b != g_gt7_n4_bound.end()) {
+					bound[i]     = b->second;
+					has_bound[i] = true;
+				}
 			}
-			if (const auto b = g_gt7_n4_bound.find(desc_key); b != g_gt7_n4_bound.end()) {
-				bound[i]     = b->second;
-				has_bound[i] = true;
+			if (bindings != nullptr) {
+				const auto whole = g_gt7_n4_bindings.find(desc_key);
+				bindings[i]      = whole != g_gt7_n4_bindings.end() &&
+				                       cache->RangeStamp(whole->second->address,
+				                                         whole->second->size) == whole->second->stamp
+				                       ? std::shared_ptr<const void>(whole->second)
+				                       : nullptr;
 			}
 		}
+	}
+	if (!check) {
+		return count;
 	}
 	for (uint32_t i = 0; i < count; i++) {
 		ImageId id {};

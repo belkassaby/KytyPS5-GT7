@@ -2962,7 +2962,8 @@ struct PipelineCache::ProgramCache {
 					    stage == ShaderType::Pixel ? 1u : 0u,
 					    Gt7NativeWalk::Learned {&source, params.Base(), params.user_data_count,
 					                            static_cast<uint32_t>(stage)},
-					    Gt7NativeWalk::Hash(snapshot.resources));
+					    ::Loader::Gt7NativeDraws::RecordsCheck() ? Gt7NativeWalk::Hash(snapshot.resources)
+					                                             : 0);
 				}
 			}
 			// Round 79: by the hash the scanner made, when there is one (comparing the

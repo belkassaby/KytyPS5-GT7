@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_GT7NATIVEWALK_H_
 
 #include <cstdint>
+#include <memory>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 struct ResourceSnapshot;
@@ -51,8 +52,12 @@ void ReadStats(uint64_t* reads, uint64_t* read_ns, uint64_t* probe_ns, uint64_t*
 // (`ids` holds its index), 2 no description learned for the descriptor, 3 no registered image with
 // that backing, 4 found as the GPU thread bound the same descriptor, with no image over its memory
 // made or dropped since. The count, or 0 when the program's images are not learned.
+// `bindings` (KYTY_GT7_NATIVE_IMAGES): for each image, the GPU thread's whole binding of the same
+// descriptor (image, description, view), while no image over its memory was made or dropped
+// since, for the GPU thread to take in place of resolving it; else null.
 uint32_t ResolveImages(uint64_t key, const ShaderRecompiler::IR::ResourceSnapshot& resources,
-                       uint32_t* ids, uint8_t* states, uint32_t max);
+                       uint32_t* ids, uint8_t* states, uint32_t max,
+                       std::shared_ptr<const void>* bindings = nullptr);
 
 // N4 buffers: the buffers of a prepared snapshot (the program's buffer resources, learned by
 // key from the GPU thread), found in the buffer cache's page table (BufferCache::PeekOwner).

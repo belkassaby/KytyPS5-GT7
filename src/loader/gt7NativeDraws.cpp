@@ -223,6 +223,8 @@ struct Record {
 	uint32_t image_ids[32] {};
 	uint8_t  image_states[32] {};
 	uint8_t  image_count = 0;
+	// N4 step 1: the pixel images' whole bindings (heap, freed by the GPU thread after the draw).
+	std::array<std::shared_ptr<const void>, 32>* image_bindings = nullptr;
 	// The vertex and pixel stages' buffers (Gt7NativeWalk::ResolveBuffers).
 	uint32_t buffer_ids[2][32] {};
 	uint8_t  buffer_states[2][32] {};
@@ -272,14 +274,17 @@ void WalkRecord(Record& record) {
 			        prepared)) {
 				record.prepared[s]   = prepared;
 				record.walk_state[s] = 1;
-				record.walk_hash[s]  = Libs::Graphics::Gt7NativeWalk::Hash(prepared->resources);
-				record.buffer_count[s] = static_cast<uint8_t>(Libs::Graphics::Gt7NativeWalk::ResolveBuffers(
-				    LearnedKey(t_identity.state, t_identity.material, s), prepared->resources,
-				    record.buffer_ids[s], record.buffer_states[s], 32));
+				if (RecordsCheck()) {
+					record.walk_hash[s]    = Libs::Graphics::Gt7NativeWalk::Hash(prepared->resources);
+					record.buffer_count[s] = static_cast<uint8_t>(Libs::Graphics::Gt7NativeWalk::ResolveBuffers(
+					    LearnedKey(t_identity.state, t_identity.material, s), prepared->resources,
+					    record.buffer_ids[s], record.buffer_states[s], 32));
+				}
 				if (s == 1) {
+					record.image_bindings = new std::array<std::shared_ptr<const void>, 32>;
 					record.image_count = static_cast<uint8_t>(Libs::Graphics::Gt7NativeWalk::ResolveImages(
 					    LearnedKey(t_identity.state, t_identity.material, 1), prepared->resources,
-					    record.image_ids, record.image_states, 32));
+					    record.image_ids, record.image_states, 32, record.image_bindings->data()));
 				}
 			} else {
 				delete prepared;
@@ -1015,7 +1020,7 @@ void OnDraw(const uint32_t* ps_user_sgprs, uint32_t count, const uint32_t* gs_us
 	}
 	g_pending = false;
 	const auto& id = g_pending_identity;
-	if (id.record != 0) {
+	if (id.record != 0 && RecordsCheck()) {
 		// The serial is the record's (it went into the marker's sequence dword).
 		const uint32_t* sgprs[2]  = {gs_user_sgprs, ps_user_sgprs};
 		const uint32_t  counts[2] = {gs_count, count};
@@ -1085,6 +1090,16 @@ bool RecordsWalk() {
 	return RecordsWalkEnabled();
 }
 
+bool RecordsCheck() {
+	static const bool enabled = [] {
+		const char* check   = std::getenv("KYTY_GT7_NATIVE_CHECK");
+		const char* records = std::getenv("KYTY_GT7_NATIVE_RECORDS");
+		return (check != nullptr && check[0] == '1') ||
+		       (records != nullptr && std::strcmp(records, "walk") == 0);
+	}();
+	return enabled;
+}
+
 bool RecordsUse() {
 	return RecordsUseEnabled();
 }
@@ -1122,6 +1137,8 @@ void FreeRecordStages() {
 	if (record == nullptr) {
 		return;
 	}
+	delete record->image_bindings;
+	record->image_bindings = nullptr;
 	for (auto*& prepared: record->prepared) {
 		if (prepared == nullptr) {
 			continue;
@@ -1133,6 +1150,14 @@ void FreeRecordStages() {
 		delete prepared;
 		prepared = nullptr;
 	}
+}
+
+const void* RecordImageBinding(uint32_t i) {
+	const auto* record = CurrentRecord();
+	if (record == nullptr || record->image_bindings == nullptr || i >= 32) {
+		return nullptr;
+	}
+	return (*record->image_bindings)[i].get();
 }
 
 uint64_t CurrentLearnedKey(uint32_t stage) {
@@ -1291,14 +1316,23 @@ void OnStageWalk(uint32_t stage, const Libs::Graphics::Gt7NativeWalk::Learned& l
 	if (id.state == 0 || stage > 1) {
 		return;
 	}
+	const uint64_t key = LearnedKey(id.state, id.material, stage);
+	bool           known = false;
 	{
+		std::shared_lock lock(g_learned_mutex);
+		const auto       it = g_learned.find(key);
+		known = it != g_learned.end() && it->second.entry == learned.entry &&
+		        it->second.shader_base == learned.shader_base &&
+		        it->second.user_data_count == learned.user_data_count;
+	}
+	if (!known) {
 		std::unique_lock lock(g_learned_mutex);
 		if (g_learned.size() > (1u << 18u)) {
 			g_learned.clear();
 		}
-		g_learned[LearnedKey(id.state, id.material, stage)] = learned;
+		g_learned[key] = learned;
 	}
-	if (id.record == 0) {
+	if (id.record == 0 || !RecordsCheck()) {
 		return;
 	}
 	const auto* record = reinterpret_cast<const Record*>(id.record);

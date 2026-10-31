@@ -70,6 +70,10 @@ void NoteTemplate(uint64_t programs, uint64_t pipeline);
 // the same state key and material with, and the hash of the refresh, compared with the walk the
 // draw's record carries.
 [[nodiscard]] bool RecordsWalk();
+// The records' checks and coverage counts (KYTY_GT7_NATIVE_CHECK=1, or KYTY_GT7_NATIVE_RECORDS=walk):
+// the walks' hashes compared, the images and buffers the records found compared with the GPU
+// thread's. Off, the records path does only what it uses.
+[[nodiscard]] bool RecordsCheck();
 // N3 step 3 (KYTY_GT7_NATIVE_RECORDS=use): the record's prepared stage (ShaderType `stage`: the
 // pixel stage, or the vertex one) for ProgramCache to take in place of its walk, or null.
 [[nodiscard]] bool                                RecordsUse();
@@ -77,6 +81,9 @@ void NoteTemplate(uint64_t programs, uint64_t pipeline);
 // and the images its bindings got, compared with the ones its record found.
 [[nodiscard]] uint64_t CurrentLearnedKey(uint32_t stage);
 void                   CompareRecordImages(const uint32_t* image_ids, uint32_t count);
+// N4 step 1: the current marked draw's record's binding of pixel image i (the GPU thread's own
+// of the same descriptor; Gt7NativeWalk), or null.
+[[nodiscard]] const void* RecordImageBinding(uint32_t i);
 // The buffers a marked draw's stage (0 vertex, 1 pixel) got (UINT32_MAX: none), compared with
 // the ones its record found.
 void CompareRecordBuffers(uint32_t stage, const uint32_t* buffer_ids, uint32_t count);
