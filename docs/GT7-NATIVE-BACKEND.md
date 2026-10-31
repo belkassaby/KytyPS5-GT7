@@ -322,3 +322,38 @@ prepared pieces of a draw costs it about what the pieces saved, because it still
 applies each one inside its own per-draw pipeline. The records only pay when the GPU thread does
 not run that pipeline for the draw at all: the record's commands recorded on the render thread and
 spliced at the marker (N4's last step). Image bindings stay off by default.
+
+## N4 step 3, design: draws recorded on the render threads
+
+The GPU thread must not run its per-draw pipeline for a covered draw. At the marker it validates
+the record, patches what only it can know, stitches barriers and splices the record's command list
+(slice 2's lists: `CommandScheduler::BeginList` / `SpliceList`, `ImageStateOverlay`). What a
+draw's commands need, from the GPU thread's code (`PrepareBindings`, `FindBuffers`,
+`RebindBuffers`, `RebindImages`, `CommitBindings`, `ExecutePreparedDraw`):
+
+| what | the GPU thread today | a record |
+|---|---|---|
+| programs, pipeline | `GetGraphicsPrograms`, `TryGetGraphicsPipeline` | learned by state key and material (N1: determined by them) |
+| descriptor walk | scanner or own walk | the render thread's prepared stage (N3) |
+| storage buffers | `NativeStorageBuffer`: the buffer cache's host copy (synced from guest memory), offset and length packed into the push data, write tracking | blocks in GT7's command buffer memory (constants, material block copies, transforms: written by the render thread, never by the GPU) copied into a per-render-thread host-visible ring and bound there; other buffers by the buffer cache's binding, published as the image bindings are |
+| images | `ResolveTexture`, `RebindImages` (views, layouts) | the GPU thread's bindings by descriptor (N4 step 1), all but the light grid |
+| samplers, flattened SRT, push data | `CommitBindings` | made the same way from the prepared stage |
+| descriptor set | allocated and written in `CommitBindings` | a per-render-thread pool, written on the render thread |
+| vertex and index buffers | `CommitVertexBuffers`, `CommitIndexBuffer` | the mesh's buffers (the vertex buffer table, `gt7_DrawMeshClusters`' arguments) |
+| targets, render pass | `AcquireRenderTargets` | the GPU thread at the marker, as now (shared with translated draws) |
+| barriers | per image use | `ImageStateOverlay` per record, stitched at the splice |
+| the light grid | slow path | resolved by the GPU thread at the marker and written into the record's set |
+
+Order, each verified before the next (a record's piece compared with the GPU thread's for the same
+draw, as N3 and N4 did):
+
+1. **Constant blocks in a ring.** Per render thread, a host-visible buffer ring; the record copies
+   each stage's buffers that lie in its command buffer memory and holds (buffer, offset, range);
+   checked: the bytes equal what the GPU thread's binding of the same buffer reads.
+2. **Push data and descriptor contents.** The record builds the stage's shader data (offsets,
+   lengths, flattened SRT) and descriptor infos as `RebindBuffers` / `CommitBindings` would;
+   checked word for word.
+3. **Descriptor sets on the render thread** (per-thread pools), and the pipeline handle learned.
+4. **Command lists**: pipeline, set, vertex and index buffers, dynamic state, draw, recorded on the
+   render thread; at the marker the GPU thread validates, patches the light grid, opens the render
+   pass, stitches, splices, and skips the draw packet. Verified by picture, then the A/B.
