@@ -271,3 +271,21 @@ About 98 % of the marked pixel stages are now fully named but for one image: the
 which GT7 puts at a new address in its per-frame memory each draw. A record can carry the draw
 with that one image left for the GPU thread to resolve at the marker (the slow path it takes now,
 ~0.3 us) and write into the record's descriptor set.
+
+## N4: buffer coverage (2026-10-30)
+
+The vertex and pixel stages' buffers, as the images: the GPU thread teaches each marked program's
+buffer resources after `FindBuffers` and compares; the render thread decodes each buffer
+descriptor of its prepared snapshot and takes the buffer owning its page from the buffer cache's
+page table (`BufferCache::PeekOwner`: the page table only, whose queries never allocate; never
+the buffers, whose slots move as the cache grows). Race, 10 s windows:
+
+| | vertex stages | pixel stages |
+|---|---|---|
+| stages compared | 225,000 to 236,000 | 206,000 to 221,000 |
+| every buffer named right | **98.8 to 99.7 %** | **100.0 %** |
+| buffers the same / another / none found | 98.7 to 99.7 % / 0.3 to 1.2 % / ~0.1 % | 100.00 % / 0 / 0 |
+
+With the images (98 % of pixel stages named but for the light grid), a record names nearly every
+resource of nearly every marked draw from GT7's render thread. What stays for the GPU thread at
+the marker: the light grid, and the rare buffer the GPU thread makes or extends at the draw.

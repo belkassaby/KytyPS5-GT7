@@ -54,6 +54,13 @@ void ReadStats(uint64_t* reads, uint64_t* read_ns, uint64_t* probe_ns, uint64_t*
 uint32_t ResolveImages(uint64_t key, const ShaderRecompiler::IR::ResourceSnapshot& resources,
                        uint32_t* ids, uint8_t* states, uint32_t max);
 
+// N4 buffers: the buffers of a prepared snapshot (the program's buffer resources, learned by
+// key from the GPU thread), found in the buffer cache's page table (BufferCache::PeekOwner).
+// `states`: 0 none bound (address in page 0, or no size), 1 found (`ids` holds its index),
+// 3 no buffer owns the page. The count, or 0 when the program's buffers are not learned.
+uint32_t ResolveBuffers(uint64_t key, const ShaderRecompiler::IR::ResourceSnapshot& resources,
+                        uint32_t* ids, uint8_t* states, uint32_t max);
+
 // Both sides: a hash of a snapshot's buffers, images, samplers and flattened SRT.
 [[nodiscard]] uint64_t Hash(const ShaderRecompiler::IR::ResourceSnapshot& snapshot);
 

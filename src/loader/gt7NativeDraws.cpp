@@ -33,6 +33,7 @@ namespace Loader::Gt7NativeDraws {
 // N3 step 3 (defined with the public functions below, used by the report and the draws).
 void ReportUse();
 void ReportImages();
+void ReportBuffers();
 void FreeRecordStages();
 
 namespace Pm4 = Libs::Graphics::Pm4;
@@ -222,6 +223,10 @@ struct Record {
 	uint32_t image_ids[32] {};
 	uint8_t  image_states[32] {};
 	uint8_t  image_count = 0;
+	// The vertex and pixel stages' buffers (Gt7NativeWalk::ResolveBuffers).
+	uint32_t buffer_ids[2][32] {};
+	uint8_t  buffer_states[2][32] {};
+	uint8_t  buffer_count[2] {};
 };
 struct RecordRing {
 	std::unique_ptr<uint8_t[]> bytes {new uint8_t[RingBytes]};
@@ -268,6 +273,9 @@ void WalkRecord(Record& record) {
 				record.prepared[s]   = prepared;
 				record.walk_state[s] = 1;
 				record.walk_hash[s]  = Libs::Graphics::Gt7NativeWalk::Hash(prepared->resources);
+				record.buffer_count[s] = static_cast<uint8_t>(Libs::Graphics::Gt7NativeWalk::ResolveBuffers(
+				    LearnedKey(t_identity.state, t_identity.material, s), prepared->resources,
+				    record.buffer_ids[s], record.buffer_states[s], 32));
 				if (s == 1) {
 					record.image_count = static_cast<uint8_t>(Libs::Graphics::Gt7NativeWalk::ResolveImages(
 					    LearnedKey(t_identity.state, t_identity.material, 1), prepared->resources,
@@ -937,6 +945,7 @@ void Report() {
 		if (RecordsUseEnabled()) {
 			ReportUse();
 			ReportImages();
+			ReportBuffers();
 		}
 		ReportCommit();
 		ReportResolve();
@@ -1178,6 +1187,61 @@ void CompareRecordImages(const uint32_t* image_ids, uint32_t count) {
 			g_n4_other.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
+}
+
+// N4 buffers, by stage: stages compared, every buffer named right, buffers, the same, another,
+// none found, and stages whose program was not learned yet.
+std::array<std::array<std::atomic<uint64_t>, 7>, 2> g_n4_buffers {};
+
+void CompareRecordBuffers(uint32_t stage, const uint32_t* buffer_ids, uint32_t count) {
+	auto* record = CurrentRecord();
+	if (record == nullptr || stage > 1) {
+		return;
+	}
+	auto& c = g_n4_buffers[stage];
+	if (record->buffer_count[stage] == 0 && count != 0) {
+		c[6].fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	c[0].fetch_add(1, std::memory_order_relaxed);
+	uint32_t named = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		c[2].fetch_add(1, std::memory_order_relaxed);
+		const uint8_t  state = i < record->buffer_count[stage] ? record->buffer_states[stage][i] : 3;
+		const uint32_t id    = state == 0 ? UINT32_MAX : record->buffer_ids[stage][i];
+		if (state == 3) {
+			c[5].fetch_add(1, std::memory_order_relaxed);
+		} else if (id == buffer_ids[i]) {
+			c[3].fetch_add(1, std::memory_order_relaxed);
+			named++;
+		} else {
+			c[4].fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	if (named == count) {
+		c[1].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void ReportBuffers() {
+	static std::array<std::array<uint64_t, 7>, 2> last {};
+	std::string                                   text;
+	for (uint32_t s = 0; s < 2; s++) {
+		std::array<double, 7> d {};
+		for (size_t i = 0; i < d.size(); i++) {
+			const uint64_t now = g_n4_buffers[s][i].load();
+			d[i]               = static_cast<double>(now - last[s][i]);
+			last[s][i]         = now;
+		}
+		const double stages  = std::max(1.0, d[0]);
+		const double buffers = std::max(1.0, d[2]);
+		text += fmt::format(
+		    " | {} stages {:.0f} ({:.0f} not learned): every buffer named {:.1f}%; {:.0f} buffers: "
+		    "the same {:.2f}%, another {:.2f}%, none found {:.2f}%",
+		    s == 0 ? "vertex" : "pixel", d[0], d[6], 100.0 * d[1] / stages, d[2],
+		    100.0 * d[3] / buffers, 100.0 * d[4] / buffers, 100.0 * d[5] / buffers);
+	}
+	Log::WriteUnmuted(fmt::format("Native records N4 buffers (10 s){}\n", text));
 }
 
 void ReportImages() {

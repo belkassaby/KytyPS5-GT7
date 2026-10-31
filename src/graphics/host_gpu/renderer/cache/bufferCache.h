@@ -93,6 +93,12 @@ public:
 	};
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// GT7 native backend N4 (any thread): the buffer owning the page of `vaddr` in the page table,
+	// or an invalid id. Reads only the page table (whose queries never allocate), not the buffers.
+	[[nodiscard]] BufferId PeekOwner(uint64_t vaddr) const {
+		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+		return owner != nullptr ? *owner : BufferId {};
+	}
 	// needs_device_address: the caller reads the data through a buffer device address, which
 	// the stream buffer used for small CPU-written reads does not have.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,

@@ -77,6 +77,9 @@ void NoteTemplate(uint64_t programs, uint64_t pipeline);
 // and the images its bindings got, compared with the ones its record found.
 [[nodiscard]] uint64_t CurrentLearnedKey(uint32_t stage);
 void                   CompareRecordImages(const uint32_t* image_ids, uint32_t count);
+// The buffers a marked draw's stage (0 vertex, 1 pixel) got (UINT32_MAX: none), compared with
+// the ones its record found.
+void CompareRecordBuffers(uint32_t stage, const uint32_t* buffer_ids, uint32_t count);
 [[nodiscard]] Libs::Graphics::DrawPrep::StageResult* TakeRecordStage(uint32_t stage);
 void OnStageWalk(uint32_t stage, const Libs::Graphics::Gt7NativeWalk::Learned& learned,
                  uint64_t hash);

@@ -996,6 +996,9 @@ struct Gt7Bound {
 	uint64_t stamp   = 0;
 };
 std::unordered_map<TextureDescKey, Gt7Bound, TextureDescKeyHash> g_gt7_n4_bound;
+// Buffers: each program's buffer resources (by learned key and stage), and the buffer cache.
+std::unordered_map<uint64_t, std::shared_ptr<const std::vector<uint32_t>>> g_gt7_n4_buffer_programs;
+std::atomic<BufferCache*> g_gt7_n4_buffer_cache {nullptr};
 
 bool TextureDescCacheEnabled() {
 	static const bool enabled = [] {
@@ -4084,6 +4087,36 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		}
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
+	// GT7 native backend N4: a marked draw's vertex or pixel stage teaches the render threads its
+	// program's buffer resources, and checks the buffers its record found.
+	const bool gt7_stage = program.stage == ShaderType::Pixel || program.stage == ShaderType::Vertex ||
+	                       program.stage == ShaderType::Mesh;
+	if (gt7_stage && ::Loader::Gt7NativeDraws::RecordsUse() &&
+	    ::Loader::Gt7NativeDraws::CurrentMarked()) {
+		const uint32_t stage = program.stage == ShaderType::Pixel ? 1u : 0u;
+		g_gt7_n4_buffer_cache.store(&cache, std::memory_order_release);
+		if (const uint64_t key = ::Loader::Gt7NativeDraws::CurrentLearnedKey(stage); key != 0) {
+			{
+				std::shared_lock lock(g_gt7_n4_mutex);
+				if (g_gt7_n4_buffer_programs.contains(key)) {
+					goto learned;
+				}
+			}
+			{
+				std::unique_lock lock(g_gt7_n4_mutex);
+				g_gt7_n4_buffer_programs.try_emplace(
+				    key, std::make_shared<const std::vector<uint32_t>>(resources.begin(), resources.end()));
+			}
+		learned:;
+		}
+		std::array<uint32_t, 32> ids {};
+		const auto n = static_cast<uint32_t>(std::min<size_t>(prepared.buffer_sources.size(), ids.size()));
+		for (uint32_t i = 0; i < n; i++) {
+			const auto& source = prepared.buffer_sources[i];
+			ids[i]             = source.size == 0 ? UINT32_MAX : source.id.index;
+		}
+		::Loader::Gt7NativeDraws::CompareRecordBuffers(stage, ids.data(), n);
+	}
 }
 
 // The length in dwords that a binding's bounds checks compare with (round 84). Byte and halfword
@@ -4989,6 +5022,40 @@ uint32_t ResolveImages(uint64_t key, const ShaderRecompiler::IR::ResourceSnapsho
 		}
 		states[i] = id ? 1 : (known[i] ? 3 : 2);
 		ids[i]    = id.index;
+	}
+	return count;
+}
+
+uint32_t ResolveBuffers(uint64_t key, const ShaderRecompiler::IR::ResourceSnapshot& resources,
+                        uint32_t* ids, uint8_t* states, uint32_t max) {
+	auto*                                       cache = g_gt7_n4_buffer_cache.load(std::memory_order_acquire);
+	std::shared_ptr<const std::vector<uint32_t>> list;
+	{
+		std::shared_lock lock(g_gt7_n4_mutex);
+		const auto       it = g_gt7_n4_buffer_programs.find(key);
+		if (cache == nullptr || it == g_gt7_n4_buffer_programs.end()) {
+			return 0;
+		}
+		list = it->second;
+	}
+	const auto count = static_cast<uint32_t>(std::min<size_t>(list->size(), max));
+	for (uint32_t i = 0; i < count; i++) {
+		const auto resource = (*list)[i];
+		if (resource >= resources.buffers.size()) {
+			states[i] = 0;
+			ids[i]    = UINT32_MAX;
+			continue;
+		}
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[resource]);
+		const auto address    = descriptor.Base48();
+		if (address < BufferCache::CACHING_PAGESIZE || descriptor.GetSize() == 0) {
+			states[i] = 0;
+			ids[i]    = UINT32_MAX;
+			continue;
+		}
+		const auto owner = cache->PeekOwner(address);
+		states[i]        = owner ? 1 : 3;
+		ids[i]           = owner.index;
 	}
 	return count;
 }
