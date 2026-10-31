@@ -63,7 +63,10 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	}
 	auto& buffers = expected[static_cast<size_t>(Kind::Buffers)];
 	const auto shared = IR::CollectMemoryResources(program, buffers);
-	present[static_cast<size_t>(Kind::Buffers)] = !buffers.empty();
+	present[static_cast<size_t>(Kind::Buffers)] = !buffers.empty() && !program.bindings.draw_table;
+	if (program.bindings.draw_table && program.bindings.table_buffers != buffers) {
+		Fail(program, "draw table buffers do not match shader topology");
+	}
 	if (shared.gds) {
 		Expect(Kind::Gds);
 	}
@@ -110,7 +113,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	                              program.bindings.partition_target_dword !=
 	                                  user_data_dwords + (has_dispatch_threads ? 3u : 0u))) ||
 	    program.bindings.memory_offset_dword != user_data_dwords + extra_dwords ||
-	    program.bindings.memory_offset_count != buffers.size() ||
+	    program.bindings.memory_offset_count != IR::BufferResourceList(program.bindings).size() ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||

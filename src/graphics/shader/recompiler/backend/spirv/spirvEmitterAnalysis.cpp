@@ -61,6 +61,15 @@ uint32_t          ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t ResourceForDescriptor(const EmitterState& state, IR::DescriptorBindingKind kind,
                                uint32_t resource) {
+	if (kind == IR::DescriptorBindingKind::Buffers && state.program.bindings.draw_table) {
+		const auto& list  = state.program.bindings.table_buffers;
+		const auto  found = std::find(list.begin(), list.end(), resource);
+		if (found == list.end()) {
+			ExitDescriptorBindingFailure(state, kind, resource,
+			                             "resource is absent from the draw table's buffers");
+		}
+		return static_cast<uint32_t>(found - list.begin());
+	}
 	const auto* descriptor = IR::FindBinding(state.program.bindings, kind);
 	if (descriptor == nullptr) {
 		ExitDescriptorBindingFailure(state, kind, resource, "descriptor group was not allocated");

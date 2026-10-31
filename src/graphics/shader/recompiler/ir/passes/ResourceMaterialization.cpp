@@ -1935,6 +1935,9 @@ void VerifyTracedRefresh(const ResourcePlan& program, const SrtRuntime& runtime,
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	// A walk makes the specialization of the descriptors; the draw table mode is the host's
+	// choice for the draw, made after it (ProgramCache::Get).
+	specialization.draw_table = false;
 	bool       served = false;
 	const bool ok     = MaterializeResourcesImpl(program, runtime, snapshot, specialization, served);
 	static const bool verify = std::getenv("KYTY_SRT_TRACE_VERIFY") != nullptr;
@@ -1946,6 +1949,16 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 
 const char* UnsupportedResourceSpecialization(const Program&                program,
                                               const ResourceSpecialization& specialization) {
+	// The draw table mode (GT7 GPU-driven G1) addresses each buffer binding on its own: a buffer
+	// chosen by a key among several (an indirect buffer) is not supported in it. The host asks
+	// for the mode only for programs without one.
+	if (specialization.draw_table &&
+	    std::ranges::any_of(specialization.buffers, [](const ResourceSpecialization::Buffer& buffer) {
+		    return buffer.indirect_root != BufferResource::NoIndirectBuffer ||
+		           buffer.indirect_search_iterations != 0;
+	    })) {
+		return "the draw table mode does not support indirect buffers";
+	}
 	// ApplyResourceSpecialization's check, before it changes anything: enumerated candidates only
 	// sample (EmitImageSample), and an image load or query through one stopped the emulator in
 	// GT7's cafe. The shader is skipped for this specialization instead.
@@ -1978,6 +1991,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	        program.binding_layout_complete);
 	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||
 	        program.info.images.size() > specialization.images.size());
+	program.draw_table = specialization.draw_table;
 
 	auto& buffers = program.info.buffers;
 	const auto original_buffer_count = buffers.size();

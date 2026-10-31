@@ -480,6 +480,13 @@ struct BindingLayout {
 	// (2 dwords), then the guest address of each memory binding's range start (2 dwords each; 0 =
 	// not tracked in this draw).
 	bool                           write_tracking      = false;
+	// GT7 GPU-driven G1 (docs/GT7-GPU-DRIVEN.md), the draw table mode: no Buffers binding in set
+	// 0. Each memory binding is read through a PhysicalStorageBuffer pointer from the device
+	// address at BufferAddressDword() + 2 * i (the 256-aligned start of the bound range: the byte
+	// offset and length words keep their meaning). table_buffers lists the buffer resources, as
+	// the Buffers binding's resources do in the other mode (BufferResourceList).
+	bool                           draw_table          = false;
+	std::vector<uint32_t>          table_buffers;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
@@ -489,8 +496,11 @@ struct BindingLayout {
 	[[nodiscard]] uint32_t WriteTrackDword() const {
 		return BufferLengthDword() + memory_offset_count;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t BufferAddressDword() const {
 		return WriteTrackDword() + (write_tracking ? 2u + 2u * memory_offset_count : 0u);
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return BufferAddressDword() + (draw_table ? 2u * memory_offset_count : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -503,6 +513,16 @@ struct BindingLayout {
 
 	bool operator==(const BindingLayout& other) const = default;
 };
+
+// The buffer resources of the memory bindings, in binding order: the Buffers binding's resources,
+// or in the draw table mode table_buffers.
+[[nodiscard]] inline const std::vector<uint32_t>& BufferResourceList(const BindingLayout& layout) {
+	static const std::vector<uint32_t> none;
+	if (layout.draw_table) {
+		return layout.table_buffers;
+	}
+	return layout.memory_offset_count != 0 ? layout.descriptors.front().resources : none;
+}
 
 // Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct ShaderInfo {
@@ -743,6 +763,8 @@ struct Program: ResourcePlan {
 	std::vector<ExportInfo>       export_info;
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
+	// ResourceSpecialization::draw_table, applied (AllocateBindings lays the bindings out for it).
+	bool                          draw_table = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
 

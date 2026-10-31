@@ -753,7 +753,7 @@ public:
 		// map each slot to its resource. Indexing it by resource read past the slots and
 		// handed FindBuffer garbage ranges (the GT7 Cafe "invalid buffer discovery request").
 		for (size_t i = 0; i < bindings.buffer_sources.size(); ++i) {
-			const auto  resource = program.bindings.descriptors.front().resources[i];
+			const auto  resource = ShaderRecompiler::IR::BufferResourceList(program.bindings)[i];
 			const auto& source   = bindings.buffer_sources[i];
 			if (resource >= program.info.buffers.size() || !program.info.buffers[resource].written ||
 			    source.size == 0) {

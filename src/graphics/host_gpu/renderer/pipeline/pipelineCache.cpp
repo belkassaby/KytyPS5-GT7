@@ -1336,6 +1336,8 @@ bool UnnormalizedSamplingFix() {
 
 namespace {
 
+constexpr uint64_t DrawTableHashSalt = 0x9e3779b97f4a7c15ull;
+
 // Round 79: a hash of a stage's specialization, field by field (the structs hold padding), for
 // ProgramCache::Get's permutation lookup. A field added to them must be hashed too: the sizes
 // below change with one.
@@ -1343,7 +1345,7 @@ uint64_t SpecializationHash(const ShaderRecompiler::IR::ResourceSpecialization& 
 	using Specialization = ShaderRecompiler::IR::ResourceSpecialization;
 	static_assert(sizeof(Specialization::Buffer) == 28 && sizeof(Specialization::Image) == 40 &&
 	                  sizeof(Specialization::Sampler) == 8 &&
-	                  sizeof(Specialization) == 3 * sizeof(std::vector<uint32_t>),
+	                  sizeof(Specialization) == 3 * sizeof(std::vector<uint32_t>) + 8,
 	              "ResourceSpecialization changed: hash its new fields in SpecializationHash");
 	thread_local std::vector<uint32_t> words;
 	words.clear();
@@ -1375,7 +1377,12 @@ uint64_t SpecializationHash(const ShaderRecompiler::IR::ResourceSpecialization& 
 		words.insert(words.end(),
 		             {static_cast<uint32_t>(sampler.bindless), sampler.bindless_mapping_offset});
 	}
-	const auto hash = XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
+	auto hash = XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
+	// The draw table mode toggles a salt, so that the GPU thread can set or clear it on a hash the
+	// scanner made (ProgramCache::Get, Gt7G1).
+	if (specialization.draw_table) {
+		hash ^= DrawTableHashSalt;
+	}
 	return hash != 0 ? hash : 1u; // 0 means none (DrawPrep::StageResult)
 }
 
@@ -2659,6 +2666,30 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
+	// GT7 GPU-driven G1 (docs/GT7-GPU-DRIVEN.md, KYTY_GT7_G1): a marked draw's vertex and pixel
+	// stage are asked for in the draw table mode, when their program has no indirect buffer.
+	// Every other stage is not (a stage snapshot is reused by the next draw's walk). The scanner's
+	// hash is made without the mode; the mode toggles its salt.
+	static void ApplyDrawTableMode(ShaderType stage, StageSnapshot& snapshot) {
+		auto& specialization = snapshot.specialization;
+		const bool table =
+		    ::Loader::Gt7NativeDraws::G1Mode() != 0 && ::Loader::Gt7NativeDraws::CurrentMarked() &&
+		    (stage == ShaderType::Pixel || stage == ShaderType::Vertex) &&
+		    std::ranges::none_of(specialization.buffers, [](const auto& buffer) {
+			    return buffer.indirect_root !=
+			               ShaderRecompiler::IR::BufferResource::NoIndirectBuffer ||
+			           buffer.indirect_search_iterations != 0;
+		    });
+		if (specialization.draw_table == table) {
+			return;
+		}
+		specialization.draw_table = table;
+		if (snapshot.specialization_hash_valid) {
+			snapshot.specialization_hash ^= DrawTableHashSalt;
+			snapshot.specialization_hash_valid = snapshot.specialization_hash != 0;
+		}
+	}
+
 	// The first materialization of a new source; a failure skips this draw (see Get).
 	static bool MaterializeFirstUse(SourceEntry&                           source,
 	                                const ShaderRecompiler::IR::SrtRuntime& runtime,
@@ -2674,6 +2705,7 @@ struct PipelineCache::ProgramCache {
 			                                                snapshot.resources, snapshot.specialization);
 		}
 		if (ok) {
+			ApplyDrawTableMode(stage, snapshot);
 			return true;
 		}
 		if (!ShaderFailureNonFatal()) {
@@ -2966,6 +2998,7 @@ struct PipelineCache::ProgramCache {
 					                                             : 0);
 				}
 			}
+			ApplyDrawTableMode(stage, snapshot);
 			// Round 79: by the hash the scanner made, when there is one (comparing the
 			// specializations themselves read the scanner's freshly written vectors: ~2 % of the
 			// GPU thread in a race). KYTY_BISECT's spechash:off compares them again.

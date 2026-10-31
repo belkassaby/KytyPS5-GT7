@@ -280,9 +280,13 @@ static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource&    resource,
                     const ShaderRecompiler::IR::BufferWriteExtent* extent, uint32_t& buffer_offset,
-                    bool track_writes, uint64_t& tracked_base) {
+                    bool track_writes, uint64_t& tracked_base,
+                    const Buffer** bound_buffer = nullptr) {
 	buffer_offset = 0;
 	tracked_base  = 0;
+	if (bound_buffer != nullptr) {
+		*bound_buffer = nullptr;
+	}
 
 	const auto& [address, size, id] = source;
 	if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
@@ -313,7 +317,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	                                                       id)
 	    : tracked ? context.GetBufferCache().ObtainBufferTracked(address, size, id)
 	              : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
-	                                                      resource.formatted, id);
+	                                                      resource.formatted, id,
+	                                                      bound_buffer != nullptr);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -325,6 +330,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		tracked_base = address - adjustment; // the guest address of the bound range's first byte
 	}
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
+	if (bound_buffer != nullptr) {
+		*bound_buffer = buffer;
+	}
 	if (resource.written && written_end > written_begin) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address + written_begin,
 		                                                  written_end - written_begin);
@@ -4114,7 +4122,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	if (layout.memory_offset_count == 0) {
 		return;
 	}
-	const auto& resources = layout.descriptors.front().resources;
+	const auto& resources = ShaderRecompiler::IR::BufferResourceList(layout);
 	prepared.buffer_sources.reserve(resources.size());
 	for (const auto resource: resources) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
@@ -4246,16 +4254,60 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
+	const auto& resources = ShaderRecompiler::IR::BufferResourceList(layout);
+	// GT7 GPU-driven G1: the draw table mode reads each binding by device address.
+	const bool table      = layout.draw_table;
+	const bool g1_verify  = table && ::Loader::Gt7NativeDraws::G1Mode() == 2;
 	for (uint32_t i = 0; i < layout.memory_offset_count; i++) {
-		const auto resource = layout.descriptors.front().resources[i];
+		const auto resource = resources[i];
 		uint32_t buffer_offset = 0;
 		uint64_t tracked_base  = 0;
+		const Buffer* bound    = nullptr;
+		bool          no_address = false; // the draw table mode without an address: no access
 		prepared.buffers.push_back(NativeStorageBuffer(
 		    m_context, prepared.buffer_sources[i], program.info.buffers[resource],
 		    resource < snapshot.buffer_write_extents.size() ? &snapshot.buffer_write_extents[resource]
 		                                                    : nullptr,
 		    buffer_offset, write_tracking && program.info.buffers[resource].write_tracked,
-		    tracked_base));
+		    tracked_base, table ? &bound : nullptr));
+		if (table) {
+			// The bound range's 256-aligned start; null bindings (no buffer) keep 0, their length 0.
+			const auto& info    = prepared.buffers.back();
+			const auto  address = bound != nullptr && bound->HasDeviceAddress()
+			                          ? bound->BufferDeviceAddress() + info.offset
+			                          : vk::DeviceAddress {0};
+			const auto  dword   = layout.BufferAddressDword() + 2u * i;
+			prepared.shader_data[dword]      = static_cast<uint32_t>(address);
+			prepared.shader_data[dword + 1u] = static_cast<uint32_t>(address >> 32u);
+			no_address = address == 0;
+			::Loader::Gt7NativeDraws::AddG1Buffer(prepared.buffer_sources[i].size == 0, address != 0);
+			if (g1_verify && prepared.buffer_sources[i].size != 0) {
+				// The address is the descriptor's buffer at its offset, and that buffer holds the
+				// guest range at the offset the shader adds (buffer_offset): what the set had.
+				const auto& source  = prepared.buffer_sources[i];
+				const bool  mirrors = bound != nullptr && source.address >= bound->CpuAddress() &&
+				                     source.address + source.size <= bound->CpuAddress() + bound->Size();
+				const bool ok =
+				    bound != nullptr && bound->Handle() == info.buffer && address != 0 &&
+				    info.offset + info.range <= bound->Size() &&
+				    (!mirrors || bound->CpuAddress() + info.offset + buffer_offset == source.address);
+				::Loader::Gt7NativeDraws::AddG1Verify(ok, mirrors);
+				if (!ok) {
+					static std::atomic<uint32_t> reported = 0;
+					if (reported.fetch_add(1) < 16) {
+						LOGF("GT7 G1 verify: stage=%s buffer %u guest=0x%016" PRIx64 "+0x%" PRIx64
+						     " bound=%p cpu=0x%016" PRIx64 " size=0x%" PRIx64 " offset=0x%" PRIx64
+						     " adjustment=%u range=0x%" PRIx64 " address=0x%016" PRIx64 "\n",
+						     ShaderStageResourceName(program.stage), resource, source.address,
+						     source.size, static_cast<const void*>(bound),
+						     bound != nullptr ? bound->CpuAddress() : 0,
+						     bound != nullptr ? bound->Size() : 0, static_cast<uint64_t>(info.offset),
+						     buffer_offset, static_cast<uint64_t>(info.range),
+						     static_cast<uint64_t>(address));
+					}
+				}
+			}
+		}
 		if (write_tracking) {
 			const auto dword                     = layout.WriteTrackDword() + 2u + 2u * i;
 			prepared.shader_data[dword]          = static_cast<uint32_t>(tracked_base);
@@ -4266,7 +4318,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		// buffer still has no accessible elements. In particular, never let a null store
 		// modify the shared fallback and affect subsequent null reads.
 		prepared.shader_data[layout.BufferLengthDword() + i] =
-		    prepared.buffer_sources[i].size == 0
+		    prepared.buffer_sources[i].size == 0 || no_address
 		        ? 0u
 		        : BindingLengthDwords(prepared.buffers.back().range,
 		                              program.info.buffers[resource].written);
@@ -4761,7 +4813,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				const auto& program = *writer->runtime->program;
 				const auto& extents = writer->runtime->resources->buffer_write_extents;
 				for (uint32_t i = 0; i < writer->buffer_sources.size(); ++i) {
-					const auto resource = program.bindings.descriptors.front().resources[i];
+					const auto resource =
+					    ShaderRecompiler::IR::BufferResourceList(program.bindings)[i];
 					if (!program.info.buffers[resource].written) continue;
 					const auto& written = writer->buffer_sources[i];
 					// The bytes the dispatch can store to, when its stores are bounded

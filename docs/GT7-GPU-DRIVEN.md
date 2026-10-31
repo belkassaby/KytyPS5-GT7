@@ -154,3 +154,27 @@ G1.3, where it cannot: its pipeline is table mode as a whole or not at all).
 Then G3's batching applies to runs of covered draws. Who writes the records changes later (G3:
 GT7's render threads, from the records N3 and N4 built: 98 % of images but the light grid,
 99-100 % of buffers); their format does not.
+
+## G1.1, verified: buffers by device address (2026-10-31)
+
+`KYTY_GT7_G1=buffers` (with `KYTY_GT7_NATIVE=1`): marked draws' vertex and pixel stages whose
+programs have no indirect buffer are compiled in the draw table mode (`ResourceSpecialization::
+draw_table`, set on the GPU thread at the permutation lookup, `ApplyDrawTableMode`; a walk resets
+it; the scanner's hash takes it as a salt). Their memory bindings have no descriptor: the shader
+data carries each binding's device address (the buffer cache's buffer, `BufferDeviceAddress()`,
+plus the bound range's 256-aligned offset), and the emitter makes each element pointer
+`PhysicalStorageBuffer` from it (`Aligned` on its loads and stores); offsets, lengths and bounds
+checks as before. The shader disk cache's format is 5.
+
+Race with `=verify` (each table-mode binding checked against the descriptor the set would have
+had: same buffer, its guest range at the offset the shader adds), first run (every shader
+recompiled), 10 s windows:
+
+| | |
+|---|---|
+| table-mode buffer bindings | 0.86 to 2.1 million |
+| null (no buffer: size 0 or outside mapped memory, as before) | 39 to 49 % (78 % in the menus) |
+| by device address | all the others; 0 without an address |
+| checks | 0.5 to 1.1 million, **0 wrong**, 100 % with the guest range checked |
+| shaders that gave up | 0 |
+| picture | as before (the user) |

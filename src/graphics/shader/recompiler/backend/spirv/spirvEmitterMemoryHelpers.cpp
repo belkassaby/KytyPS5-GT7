@@ -115,16 +115,20 @@ void EmitMemoryOffsets(EmitterState& state) {
 		state.memory_dword_lengths[i] =
 		    EmitShaderDataDwordLoad(state, state.program.bindings.BufferLengthDword() + i);
 	}
+	const auto load64 = [&](uint32_t dword) {
+		const auto u64 = TypeScalarU64(state);
+		const auto lo  = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, dword));
+		const auto hi  = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, dword + 1u));
+		return Binary(state, spv::OpBitwiseOr, u64, lo,
+		              Binary(state, spv::OpShiftLeftLogical, u64, hi, ConstantDeviceAddress(state, 32)));
+	};
+	if (state.program.bindings.draw_table) {
+		for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
+			state.memory_base_addresses[i] =
+			    load64(state.program.bindings.BufferAddressDword() + 2u * i);
+		}
+	}
 	if (state.program.bindings.write_tracking) {
-		const auto load64 = [&](uint32_t dword) {
-			const auto u64 = TypeScalarU64(state);
-			const auto lo  = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, dword));
-			const auto hi = Unary(state, spv::OpUConvert, u64,
-			                      EmitShaderDataDwordLoad(state, dword + 1u));
-			return Binary(state, spv::OpBitwiseOr, u64, lo,
-			              Binary(state, spv::OpShiftLeftLogical, u64, hi,
-			                     ConstantDeviceAddress(state, 32)));
-		};
 		const auto start           = state.program.bindings.WriteTrackDword();
 		state.write_bitmap_address = load64(start);
 		for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
@@ -248,7 +252,8 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
                                                          uint32_t variable,
                                                          uint32_t pointer_type,
                                                          uint32_t element_bits) {
-	if (variable == 0) {
+	const bool table = state.program.bindings.draw_table;
+	if (variable == 0 && !table) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");
 	}
@@ -258,9 +263,14 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	    .kind          = mem.kind,
 	    .element_bits  = element_bits,
 	    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone};
-	access.object_pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
-	                          ConstantU32(state, array_index));
+	if (table) {
+		access.physical_base = state.memory_base_addresses[array_index];
+		EXIT_IF(access.physical_base == 0);
+	} else {
+		access.object_pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer,
+		                          variable, ConstantU32(state, array_index));
+	}
 	access.byte_offset = state.memory_byte_offsets[array_index];
 	if (state.emitting_write && mem.kind == IR::ResourceKind::Buffer &&
 	    state.program.bindings.write_tracking && mem.resource < state.program.info.buffers.size() &&
@@ -377,10 +387,32 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state,
 	if (access.write_base != 0) {
 		EmitWriteBitmapMark(state, access, index);
 	}
+	if (access.physical_base != 0) {
+		// The draw table mode: base + index * element bytes, as a PhysicalStorageBuffer pointer.
+		const auto u64     = TypeScalarU64(state);
+		const auto shift   = std::countr_zero(std::max(access.element_bits / 8u, 1u));
+		const auto element = Unary(state, spv::OpUConvert, u64, index);
+		const auto offset  = shift == 0 ? element
+		                                : Binary(state, spv::OpShiftLeftLogical, u64, element,
+		                                         ConstantDeviceAddress(state, shift));
+		const auto address = Binary(state, spv::OpIAdd, u64, access.physical_base, offset);
+		return Unary(state, spv::OpConvertUToPtr,
+		             TypePointer(state, spv::StorageClassPhysicalStorageBuffer,
+		                         TypeStorageBufferElement(state, access.element_bits)),
+		             address);
+	}
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, access.object_pointer,
 	                          ConstantU32(state, 0), index);
 	return pointer;
+}
+
+std::vector<uint32_t> MemoryOperands(const MemoryResourceAccess& access) {
+	if (access.physical_base == 0) {
+		return {static_cast<uint32_t>(access.memory_access)};
+	}
+	return {static_cast<uint32_t>(access.memory_access | spv::MemoryAccessAlignedMask),
+	        std::max(access.element_bits / 8u, 1u)};
 }
 
 uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value) {

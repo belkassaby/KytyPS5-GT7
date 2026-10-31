@@ -24,7 +24,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 4;           // Round 118: BindingLayout::partition_target_dword.
+constexpr uint32_t FormatVersion = 5;           // GT7 G1: BindingLayout::draw_table, table_buffers.
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -201,6 +201,8 @@ void Visit(Io& io, T& v) {
 	io(v.memory_offset_dword);
 	io(v.memory_offset_count);
 	io(v.write_tracking);
+	io(v.draw_table);
+	io(v.table_buffers);
 	io(v.user_data_registers);
 	io(v.descriptors);
 }
@@ -345,6 +347,7 @@ void Visit(Io& io, T& v) {
 	io(v.buffers);
 	io(v.images);
 	io(v.samplers);
+	io(v.draw_table);
 }
 
 // The plan's own fields besides its instructions (which EncodePlan/DecodePlan handle first).
@@ -386,8 +389,8 @@ static_assert(sizeof(IR::StageInput) == 56);
 static_assert(sizeof(IR::StageOutput) == 48);
 static_assert(sizeof(IR::ShaderInfo) == 192);
 static_assert(sizeof(IR::DescriptorBinding) == 32);
-static_assert(sizeof(IR::BindingLayout) == 72);
-static_assert(sizeof(IR::CompiledShaderInfo) == 304);
+static_assert(sizeof(IR::BindingLayout) == 96);
+static_assert(sizeof(IR::CompiledShaderInfo) == 328);
 static_assert(sizeof(IR::DescriptorSource::IndirectDescriptor) == 120);
 static_assert(sizeof(IR::DescriptorSource::BindlessSampler) == 4);
 static_assert(sizeof(IR::DescriptorSource) == 272);
@@ -399,7 +402,7 @@ static_assert(sizeof(IR::UniformFillPlan) == 96);
 static_assert(sizeof(IR::ResourceSpecialization::Buffer) == 28);
 static_assert(sizeof(IR::ResourceSpecialization::Image) == 40);
 static_assert(sizeof(IR::ResourceSpecialization::Sampler) == 8);
-static_assert(sizeof(IR::ResourceSpecialization) == 72);
+static_assert(sizeof(IR::ResourceSpecialization) == 80);
 static_assert(sizeof(IR::ResourcePlan) == 856);
 #endif
 

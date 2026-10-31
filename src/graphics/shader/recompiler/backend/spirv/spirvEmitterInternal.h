@@ -151,6 +151,9 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_dword_lengths {};
+	// The draw table mode (BindingLayout::draw_table): each memory binding's device address (u64
+	// ids), the base its elements are addressed from.
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_base_addresses {};
 	// Write bitmap (BindingLayout::write_tracking): the bitmap's device address, each memory
 	// binding's guest base (u64 ids; a base of 0 is not tracked in that draw), and whether the
 	// instruction being emitted writes memory.
@@ -515,7 +518,15 @@ struct MemoryResourceAccess {
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 	// Write-tracked binding, while a writing instruction is emitted: its guest base (u64 id).
 	uint32_t              write_base       = 0;
+	// The draw table mode: the binding's device address (u64 id). Its element pointers are then
+	// PhysicalStorageBuffer pointers, whose loads and stores take the Aligned operand
+	// (MemoryOperands).
+	uint32_t              physical_base    = 0;
 };
+
+// The memory operands of a load or store through an element pointer of `access`: its access mask,
+// with Aligned (the element's size) for a PhysicalStorageBuffer pointer.
+[[nodiscard]] std::vector<uint32_t> MemoryOperands(const MemoryResourceAccess& access);
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);

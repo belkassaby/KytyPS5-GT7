@@ -135,10 +135,14 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		           return resource < program.info.buffers.size() &&
 		                  program.info.buffers[resource].write_tracked;
 	           });
+	next.draw_table = program.draw_table;
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
-	if (!buffers.empty()) {
+	if (next.draw_table) {
+		// Read by device address from the shader data: no descriptor (BufferResourceList).
+		next.table_buffers = std::move(buffers);
+	} else if (!buffers.empty()) {
 		// Draw binding accesses this first group directly when memory_offset_count is nonzero.
 		AddBinding(next, DescriptorBindingKind::Buffers, std::move(buffers));
 	}

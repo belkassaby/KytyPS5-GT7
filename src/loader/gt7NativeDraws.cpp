@@ -381,6 +381,26 @@ void ClassifyBuffers(uint32_t stage, uint32_t count, const uint8_t* states,
 	}
 }
 
+// GPU-driven G1 counters: table-mode buffer bindings, null ones, addressed ones; checks, wrong
+// ones, mirrored ones.
+std::array<std::atomic<uint64_t>, 6> g_g1 {};
+
+void ReportG1() {
+	static std::array<uint64_t, 6> last {};
+	std::array<double, 6>          d {};
+	for (size_t i = 0; i < d.size(); i++) {
+		const auto now = g_g1[i].load(std::memory_order_relaxed);
+		d[i]           = static_cast<double>(now - last[i]);
+		last[i]        = now;
+	}
+	const double bindings = std::max(1.0, d[0]);
+	Log::WriteUnmuted(fmt::format(
+	    "GT7 G1 (10 s): draw table buffer bindings {:.0f}: null {:.1f}%, by device address {:.1f}%, "
+	    "neither {:.0f} | checks {:.0f}: wrong {:.0f}, guest range checked {:.1f}%\n",
+	    d[0], 100.0 * d[1] / bindings, 100.0 * d[2] / bindings, d[0] - d[1] - d[2], d[3], d[4],
+	    d[3] == 0 ? 0.0 : 100.0 * d[5] / d[3]));
+}
+
 void ReportDcbBuffers() {
 	static std::array<std::array<uint64_t, 6>, 2> last {};
 	std::string                                   text;
@@ -1037,6 +1057,9 @@ void Report() {
 			ReportBuffers();
 			ReportDcbBuffers();
 		}
+		if (G1Mode() != 0) {
+			ReportG1();
+		}
 		ReportCommit();
 		ReportResolve();
 		ReportMutations();
@@ -1173,6 +1196,39 @@ void OnDrawDone(uint64_t renderer_ns) {
 
 bool RecordsWalk() {
 	return RecordsWalkEnabled();
+}
+
+int G1Mode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_GT7_G1");
+		if (value == nullptr) {
+			return 0;
+		}
+		if (std::strcmp(value, "verify") == 0) {
+			return 2;
+		}
+		return std::strcmp(value, "buffers") == 0 || std::strcmp(value, "1") == 0 ? 1 : 0;
+	}();
+	return mode;
+}
+
+void AddG1Buffer(bool null, bool addressed) {
+	g_g1[0].fetch_add(1, std::memory_order_relaxed);
+	if (null) {
+		g_g1[1].fetch_add(1, std::memory_order_relaxed);
+	} else if (addressed) {
+		g_g1[2].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void AddG1Verify(bool ok, bool mirrored) {
+	g_g1[3].fetch_add(1, std::memory_order_relaxed);
+	if (!ok) {
+		g_g1[4].fetch_add(1, std::memory_order_relaxed);
+	}
+	if (mirrored) {
+		g_g1[5].fetch_add(1, std::memory_order_relaxed);
+	}
 }
 
 bool RecordsCheck() {

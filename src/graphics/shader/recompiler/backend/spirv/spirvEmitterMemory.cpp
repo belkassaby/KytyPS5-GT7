@@ -340,7 +340,8 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 }
 
 // A coherent (GLC) load of a 32-bit word as GetCoherentLoadMode asks.
-static uint32_t EmitCoherentWordLoad(EmitterState& state, uint32_t pointer) {
+// A PhysicalStorageBuffer pointer (the draw table mode) takes the Aligned operand: `physical`.
+static uint32_t EmitCoherentWordLoad(EmitterState& state, uint32_t pointer, bool physical = false) {
 	const auto mode  = GetCoherentLoadMode();
 	const auto value = state.builder.AllocateId();
 	if (mode == CoherentLoadMode::Acquire || mode == CoherentLoadMode::Relaxed) {
@@ -354,8 +355,14 @@ static uint32_t EmitCoherentWordLoad(EmitterState& state, uint32_t pointer) {
 		                          ConstantU32(state, semantics));
 		return value;
 	}
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
-	                          spv::MemoryAccessVolatileMask);
+	if (physical) {
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+		                          spv::MemoryAccessVolatileMask | spv::MemoryAccessAlignedMask,
+		                          static_cast<uint32_t>(sizeof(uint32_t)));
+	} else {
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+		                          spv::MemoryAccessVolatileMask);
+	}
 	if (mode == CoherentLoadMode::Barrier) {
 		EmitAtomicMemoryBarrier(state, IR::ResourceKind::Buffer);
 	}
@@ -366,11 +373,11 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
                           uint32_t index) {
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	if (resource.memory_access != spv::MemoryAccessMaskNone) {
-		return EmitCoherentWordLoad(ctx.state, pointer);
+		return EmitCoherentWordLoad(ctx.state, pointer, resource.physical_base != 0);
 	}
 	const auto value = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
-	                              resource.memory_access);
+	                              MemoryOperands(resource));
 	return value;
 }
 
@@ -381,7 +388,7 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 		const auto loaded = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(spv::OpLoad, TypeStorageBufferElement(ctx.state, bits), loaded,
 		                              EmitMemoryElementPointer(ctx.state, resource, index),
-		                              resource.memory_access);
+		                              MemoryOperands(resource));
 		value = Unary(ctx.state, spv::OpUConvert, TypeU32(ctx.state), loaded);
 	} else {
 		const auto word = LoadWordInBounds(ctx, resource, index);
@@ -485,7 +492,7 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 		ctx.state.builder.AddFunction(
 		    spv::OpStore, pointer,
 		    Unary(ctx.state, spv::OpUConvert, TypeStorageBufferElement(ctx.state, bits), data),
-		    resource.memory_access);
+		    MemoryOperands(resource));
 		return;
 	}
 	const auto shift   = Binary(ctx.state, spv::OpShiftLeftLogical, TypeU32(ctx.state),
@@ -536,7 +543,7 @@ void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resour
                        uint32_t data) {
 	ctx.state.builder.AddFunction(spv::OpStore,
 	                              EmitMemoryElementPointer(ctx.state, resource, index), data,
-	                              resource.memory_access);
+	                              MemoryOperands(resource));
 }
 
 template <typename Fn>
@@ -2264,10 +2271,17 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
 		           const auto pointer = EmitMemoryElementPointer(state, access, element);
+		           if (access.physical_base != 0 &&
+		               access.memory_access == spv::MemoryAccessMaskNone) {
+			           const auto value = state.builder.AllocateId();
+			           state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+			                                     MemoryOperands(access));
+			           return value;
+		           }
 		           if (access.memory_access == spv::MemoryAccessMaskNone) {
 			           return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
 		           }
-		           return EmitCoherentWordLoad(state, pointer);
+		           return EmitCoherentWordLoad(state, pointer, access.physical_base != 0);
 	           }));
 }
 
