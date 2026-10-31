@@ -4154,11 +4154,36 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	auto&       cache    = m_context.GetBufferCache();
 
 	prepared.buffer_sources.clear();
+	prepared.g3_buffers = false;
 	const auto& layout = program.bindings;
 	if (layout.memory_offset_count == 0) {
 		return;
 	}
 	const auto& resources = ShaderRecompiler::IR::BufferResourceList(layout);
+	// GT7 G3.1: a marked stage in record mode takes the ranges of the render thread's record
+	// (the same as below in 100 % of G3.0's comparisons), when none of its buffers is written.
+	if (layout.record && ::Loader::Gt7NativeDraws::G3Use() &&
+	    ::Loader::Gt7NativeDraws::CurrentMarked() &&
+	    (program.stage == ShaderType::Pixel || program.stage == ShaderType::Vertex)) {
+		const auto* shadow = ::Loader::Gt7NativeDraws::CurrentShadow(
+		    program.stage == ShaderType::Pixel ? 1u : 0u);
+		const bool taken =
+		    shadow != nullptr && shadow->layout && shadow->shader_hash == program.shader_hash &&
+		    shadow->buffer_address.size() == resources.size() &&
+		    std::ranges::none_of(resources, [&](uint32_t resource) {
+			    return resource >= program.info.buffers.size() || program.info.buffers[resource].written;
+		    });
+		if (taken) {
+			prepared.buffer_sources.reserve(resources.size());
+			for (size_t i = 0; i < resources.size(); i++) {
+				prepared.buffer_sources.push_back(
+				    {shadow->buffer_address[i], shadow->buffer_size[i], BufferId {}});
+			}
+			prepared.g3_buffers = true;
+			return;
+		}
+		::Loader::Gt7NativeDraws::AddG3Buffers(false, 0, 0);
+	}
 	prepared.buffer_sources.reserve(resources.size());
 	for (const auto resource: resources) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
@@ -4291,6 +4316,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.shader_data[dword] |= offset << shift;
 	};
 	const auto& resources = ShaderRecompiler::IR::BufferResourceList(layout);
+	uint32_t    g3_direct = 0;
+	uint32_t    g3_usual  = 0;
 	// GT7 GPU-driven G1: the draw table mode reads each binding by device address.
 	const bool table      = layout.draw_table;
 	const bool g1_verify  = table && ::Loader::Gt7NativeDraws::G1Verify();
@@ -4300,12 +4327,30 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		uint64_t tracked_base  = 0;
 		const Buffer* bound    = nullptr;
 		bool          no_address = false; // the draw table mode without an address: no access
-		prepared.buffers.push_back(NativeStorageBuffer(
-		    m_context, prepared.buffer_sources[i], program.info.buffers[resource],
-		    resource < snapshot.buffer_write_extents.size() ? &snapshot.buffer_write_extents[resource]
-		                                                    : nullptr,
-		    buffer_offset, write_tracking && program.info.buffers[resource].write_tracked,
-		    tracked_base, table ? &bound : nullptr));
+		// GT7 G3.1: the record's range, in the buffer that holds it, unsynchronized.
+		const auto& source = prepared.buffer_sources[i];
+		Buffer*     direct = nullptr;
+		if (prepared.g3_buffers && source.size != 0) {
+			direct = m_context.GetBufferCache().TakeOwnerUnsynced(source.address, source.size);
+		}
+		const auto alignment = m_context.GetGraphics().StorageMinAlignment();
+		const auto direct_offset =
+		    direct != nullptr ? source.address - direct->CpuAddress() : uint64_t {0};
+		if (direct != nullptr && direct_offset - Common::AlignDown(direct_offset, alignment) < 256) {
+			const auto aligned = Common::AlignDown(direct_offset, alignment);
+			buffer_offset      = static_cast<uint32_t>(direct_offset - aligned);
+			bound              = direct;
+			prepared.buffers.push_back({direct->Handle(), aligned, source.size + buffer_offset});
+			g3_direct++;
+		} else {
+			g3_usual += prepared.g3_buffers && source.size != 0 ? 1u : 0u;
+			prepared.buffers.push_back(NativeStorageBuffer(
+			    m_context, source, program.info.buffers[resource],
+			    resource < snapshot.buffer_write_extents.size() ? &snapshot.buffer_write_extents[resource]
+			                                                    : nullptr,
+			    buffer_offset, write_tracking && program.info.buffers[resource].write_tracked,
+			    tracked_base, table ? &bound : nullptr));
+		}
 		if (table) {
 			// The bound range's 256-aligned start; null bindings (no buffer) keep 0, their length 0.
 			const auto& info    = prepared.buffers.back();
@@ -4358,6 +4403,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		        ? 0u
 		        : BindingLengthDwords(prepared.buffers.back().range,
 		                              program.info.buffers[resource].written);
+	}
+	if (prepared.g3_buffers) {
+		::Loader::Gt7NativeDraws::AddG3Buffers(true, g3_direct, g3_usual);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
@@ -4698,7 +4746,8 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		const GpuPhases::Scope phase(GpuPhases::Phase::DrawFind);
 		for (auto* stage: stages) {
 			FindBuffers(*stage);
-			uses_dma |= stage->runtime->program->info.uses_dma;
+			// GT7 G3.1: the record's buffers are synchronized by the BDA walk.
+			uses_dma |= stage->runtime->program->info.uses_dma || stage->g3_buffers;
 		}
 	}
 	if (uses_dma) {

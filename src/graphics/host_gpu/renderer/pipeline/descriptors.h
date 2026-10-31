@@ -48,6 +48,9 @@ struct PreparedBindings {
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
+	// GT7 G3.1 (KYTY_GT7_G3=use): buffer_sources came from the render thread's record; the
+	// buffers are taken unsynchronized (the BDA walk synchronizes them) where one holds a range.
+	bool g3_buffers = false;
 	// The stage runs its copy that turns unnormalized coordinates into normalized ones
 	// (ShaderProgram::normalized_samplers): its samplers are made normalized.
 	bool normalize_unnormalized = false;

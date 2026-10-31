@@ -443,3 +443,31 @@ The render threads can build the whole record of 99.4 to 99.8 % of the marked st
 thread patching in the light grid's slot: G3.1's ground is there. A handful of differing words
 in the whole run (images and samplers of three pixel shaders, SRT words of three) were logged:
 G3.1 checks them per draw (stamps, the `ReadSet`) and falls back.
+
+## G3.1a, verified: buffers from the records, synchronized by the BDA walk (2026-10-31)
+
+G3.1 goes piece by piece: each step the GPU thread skips has side effects to keep (buffers' lives,
+texture uploads, layout transitions). First the buffers. `KYTY_GT7_G3=use` (it builds the shadows
+too): a marked stage in record mode whose shadow has its program's layout and none of whose
+buffers is written takes its buffer ranges from the render thread's record (`FindBuffers`), and
+`RebindBuffers` addresses each in the buffer that holds it whole (`BufferCache::
+TakeOwnerUnsynced`: the page table's owner, touched and marked used in the tick, **not
+synchronized**); the draw calls the BDA walk (`PrepareBda`, as memory-reading shaders do), which
+synchronizes the CPU's writes once a guest submission and after a wait that passed. A range no
+single buffer holds goes the usual way.
+
+Race with `KYTY_GT7_G1_VERIFY=1` (`_g3-use-buffers-verify.txt`), 10 s windows:
+
+| | |
+|---|---|
+| marked stages with the record's buffers | 396,000 to 455,000 (**99.3 to 99.8 %**; without: 860 to 3,100) |
+| bindings addressed without a sync | 814,000 to 1,012,000; **the usual way: 0 to 48** |
+| G1 checks (the bound buffer holds the guest range at the shader's offset) | **0 wrong** |
+| buffer syncs on the GPU thread | 2.2 million per 10 s (3.6 million before) |
+| find / buffers phases, us a draw | 0.21 to 0.23 / 0.41 to 0.44 (0.29 to 0.32 / 0.55 before) |
+| picture | as before (the user) |
+
+The BDA walk's rule (the game's writes visible from its next submission) is the console's, and
+the picture shows no stale geometry. The gain is small on its own (~0.2 us a draw): the buffers
+were the cheap part. Next, the expensive ones: the images (textures phase ~1.9 us) and the
+programs (~3.0 us).

@@ -99,6 +99,11 @@ public:
 		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 		return owner != nullptr ? *owner : BufferId {};
 	}
+	// GT7 GPU-driven G3.1 (GPU thread): the buffer that holds [vaddr, vaddr + size) whole and has
+	// a device address, touched and marked used in the current tick, but not synchronized: the
+	// caller's draw relies on the BDA walk for that (RenderContext::PrepareBda, once a guest
+	// submission and after a wait that passed). Null when no single buffer holds the range.
+	[[nodiscard]] Buffer* TakeOwnerUnsynced(uint64_t vaddr, uint64_t size);
 	// needs_device_address: the caller reads the data through a buffer device address, which
 	// the stream buffer used for small CPU-written reads does not have.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,

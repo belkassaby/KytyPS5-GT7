@@ -131,6 +131,12 @@ void               AddG1SlotVerify(bool sampler, bool ok);
 // it writes. Fields: 0 user data, 1 buffer address, 2 buffer size, 3 image slot, 4 sampler slot,
 // 5 flattened SRT; results: 0 equal, 1 missing (not learned or not published), 2 different.
 [[nodiscard]] bool G3Shadow();
+// G3.1 (KYTY_GT7_G3=use, which builds the shadows too): the GPU thread uses the render threads'
+// records; for now their buffers (FindBuffers, RebindBuffers): stages that took them, stages that
+// could not (no shadow, another program, a written buffer), bindings addressed without a sync,
+// and bindings that went the usual way (no single buffer held the range).
+[[nodiscard]] bool G3Use();
+void               AddG3Buffers(bool stage_taken, uint32_t direct, uint32_t usual);
 [[nodiscard]] const Libs::Graphics::Gt7NativeWalk::ShadowRecord* CurrentShadow(uint32_t stage);
 void AddG3Field(uint32_t field, uint32_t result, uint32_t count);
 // A stage compared: whether it had a shadow with a layout, whether every word was equal, and

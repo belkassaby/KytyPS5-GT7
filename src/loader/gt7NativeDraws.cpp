@@ -239,13 +239,24 @@ std::atomic<uint64_t> g_g3_built {0}, g_g3_build_ns {0}, g_g3_stages {0}, g_g3_w
     g_g3_complete {0}, g_g3_but_images {0};
 std::array<std::array<std::atomic<uint64_t>, 3>, 6> g_g3_fields {};
 
-bool G3ShadowEnabled() {
+bool G3UseEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_GT7_G3");
-		return value != nullptr && std::strcmp(value, "shadow") == 0;
+		return value != nullptr && std::strcmp(value, "use") == 0;
 	}();
 	return enabled;
 }
+
+bool G3ShadowEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_G3");
+		return G3UseEnabled() || (value != nullptr && std::strcmp(value, "shadow") == 0);
+	}();
+	return enabled;
+}
+
+// G3.1: stages that took the record's buffers, that could not; bindings direct, the usual way.
+std::array<std::atomic<uint64_t>, 4> g_g3_use {};
 
 void ReportG3() {
 	static std::array<uint64_t, 6> last {};
@@ -272,6 +283,19 @@ void ReportG3() {
 		fields += fmt::format(" | {} {:.0f}: equal {:.2f}%, missing {:.2f}%, different {:.2f}%",
 		                      names[f], v[0] + v[1] + v[2], 100.0 * v[0] / all, 100.0 * v[1] / all,
 		                      100.0 * v[2] / all);
+	}
+	static std::array<uint64_t, 4> last_use {};
+	std::array<double, 4>          u {};
+	for (size_t i = 0; i < u.size(); i++) {
+		const auto n = g_g3_use[i].load(std::memory_order_relaxed);
+		u[i]         = static_cast<double>(n - last_use[i]);
+		last_use[i]  = n;
+	}
+	if (G3UseEnabled()) {
+		Log::WriteUnmuted(fmt::format(
+		    "GT7 G3 use (10 s): stages with the record's buffers {:.0f}, without {:.0f} | bindings "
+		    "addressed without a sync {:.0f}, the usual way {:.0f}\n",
+		    u[0], u[1], u[2], u[3]));
 	}
 	Log::WriteUnmuted(fmt::format(
 	    "GT7 G3 shadow records (10 s): built {:.0f} on the render threads, {:.2f} us each | stages "
@@ -1451,6 +1475,16 @@ void FreeRecordStages() {
 
 bool G3Shadow() {
 	return G3ShadowEnabled();
+}
+
+bool G3Use() {
+	return G3UseEnabled();
+}
+
+void AddG3Buffers(bool stage_taken, uint32_t direct, uint32_t usual) {
+	g_g3_use[stage_taken ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+	g_g3_use[2].fetch_add(direct, std::memory_order_relaxed);
+	g_g3_use[3].fetch_add(usual, std::memory_order_relaxed);
 }
 
 const Libs::Graphics::Gt7NativeWalk::ShadowRecord* CurrentShadow(uint32_t stage) {

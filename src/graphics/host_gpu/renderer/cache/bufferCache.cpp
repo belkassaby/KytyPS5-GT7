@@ -2565,6 +2565,20 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
+Buffer* BufferCache::TakeOwnerUnsynced(uint64_t vaddr, uint64_t size) {
+	const auto id = PeekOwner(vaddr);
+	if (IsBufferInvalid(id)) {
+		return nullptr;
+	}
+	auto& buffer = m_slot_buffers[id];
+	if (!buffer.IsInBounds(vaddr, size) || !buffer.HasDeviceAddress()) {
+		return nullptr;
+	}
+	TouchBuffer(buffer);
+	buffer.last_use_tick = m_scheduler.CurrentTick();
+	return &buffer;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, uint64_t size,
                                                               uint64_t written_vaddr,
                                                               uint64_t written_size, BufferId id) {
