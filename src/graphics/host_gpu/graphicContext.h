@@ -163,6 +163,9 @@ struct GraphicContext {
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// GT7 GPU-driven rendering (docs/GT7-GPU-DRIVEN.md; KYTY_GT7_GPU_DRIVEN=1):
+	// VK_EXT_device_generated_commands is enabled (the GPU writes draw sequences it then executes).
+	bool device_generated_commands_enabled = false;
 	// Descriptor indexing for bindless images: runtime arrays indexed non-uniformly, partially
 	// bound and updated after bind.
 	bool                               bindless_enabled                      = false;

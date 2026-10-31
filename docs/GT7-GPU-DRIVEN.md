@@ -64,3 +64,17 @@ each draw's resources and issues its own draws.
 - **G2, bindless everything** for covered draws.
 - **G3, the GPU thread stops preparing covered draws**: decode writes records; one execute per run.
 - **G4, coverage**: dispatches (GT7's ~1,900 a frame) the same way, through compute sequences.
+
+## G0, first: the device takes device-generated commands (2026-10-30)
+
+`KYTY_GT7_GPU_DRIVEN=1`: `VK_EXT_device_generated_commands` is enabled with its features
+(`deviceGeneratedCommands`, `dynamicGeneratedPipelineLayout`; `GraphicContext::
+device_generated_commands_enabled`), and a probe at GPU start makes an indirect commands layout
+of one indexed draw a sequence: the driver made it (`VK_SUCCESS`).
+
+What G0 found about the order of the work: a generated-commands execute can switch pipelines
+(execution sets), push constants, index and vertex buffers, and draw, per sequence; it cannot bind
+descriptor sets. Today every Kyty draw has its own descriptor set (`CommitBindings`), so draws
+cannot be batched into one execute until their resources no longer come from per-draw sets:
+**G1 (shaders resolving their resources from user data on the GPU) comes before any batching**,
+and is the core of the work.

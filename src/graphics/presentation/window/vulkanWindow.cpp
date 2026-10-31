@@ -789,6 +789,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	create_info.pNext = graphics.attachment_feedback_loop_enabled
 	                        ? static_cast<void*>(&feedback_layout)
 	                        : feedback_dynamic.pNext;
+	vk::PhysicalDeviceDeviceGeneratedCommandsFeaturesEXT generated_commands {};
+	if (graphics.device_generated_commands_enabled) {
+		generated_commands.deviceGeneratedCommands        = VK_TRUE;
+		generated_commands.dynamicGeneratedPipelineLayout = VK_TRUE;
+		generated_commands.pNext                          = const_cast<void*>(create_info.pNext);
+		create_info.pNext                                 = &generated_commands;
+	}
 	if (graphics.provoking_vertex_last_enabled) {
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
@@ -1338,6 +1345,13 @@ void WindowContext::CreateVulkan() {
 		}
 		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
+		// GT7 GPU-driven rendering (docs/GT7-GPU-DRIVEN.md), opt-in for now.
+		if (const char* gpu_driven = std::getenv("KYTY_GT7_GPU_DRIVEN");
+		    gpu_driven != nullptr && gpu_driven[0] == '1' &&
+		    HasExtension(available_extensions, VK_EXT_DEVICE_GENERATED_COMMANDS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_GENERATED_COMMANDS_EXTENSION_NAME);
+			graphic_ctx.device_generated_commands_enabled = true;
 		}
 		if (graphic_ctx.address_binding_messenger != nullptr &&
 		    HasExtension(available_extensions,

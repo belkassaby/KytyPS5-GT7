@@ -277,8 +277,34 @@ RenderContext::~RenderContext() {
 
 void WarmUpLocalMemory(GraphicContext& graphics, CommandScheduler& scheduler);
 
+// GT7 GPU-driven rendering, G0 (docs/GT7-GPU-DRIVEN.md): the device takes device-generated
+// commands. An indirect commands layout of one indexed draw a sequence is made and dropped.
+static void ProbeDeviceGeneratedCommands(GraphicContext& graphics) {
+	if (!graphics.device_generated_commands_enabled) {
+		return;
+	}
+	vk::IndirectCommandsLayoutTokenEXT draw {};
+	draw.type   = vk::IndirectCommandsTokenTypeEXT::eDrawIndexed;
+	draw.offset = 0;
+	vk::IndirectCommandsLayoutCreateInfoEXT info {};
+	info.shaderStages   = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+	info.indirectStride = sizeof(vk::DrawIndexedIndirectCommand);
+	info.pipelineLayout = nullptr; // dynamicGeneratedPipelineLayout
+	info.tokenCount     = 1;
+	info.pTokens        = &draw;
+	vk::IndirectCommandsLayoutEXT layout {};
+	const auto result = graphics.device.createIndirectCommandsLayoutEXT(&info, nullptr, &layout);
+	LOGF("GT7 GPU-driven: device-generated commands enabled; an indirect commands layout (one "
+	     "indexed draw) %s (%d)\n",
+	     result == vk::Result::eSuccess ? "was made" : "could not be made", static_cast<int>(result));
+	if (result == vk::Result::eSuccess) {
+		graphics.device.destroyIndirectCommandsLayoutEXT(layout);
+	}
+}
+
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
+	ProbeDeviceGeneratedCommands(m_graphics);
 	WarmUpLocalMemory(m_graphics, m_command_scheduler);
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);
