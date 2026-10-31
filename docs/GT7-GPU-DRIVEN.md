@@ -330,3 +330,73 @@ because it now holds the slots and the record (~0.95 us a draw for both stages) 
 set work. This is not the frame rate the plan is after: the CPU still prepares every covered draw
 (programs 3.0, textures 1.9 us a draw). G1's result is the format: a covered draw is a pipeline,
 an index buffer and two record offsets, which is what G3 batches.
+
+## G3, design: the GPU thread stops preparing covered draws (2026-10-31)
+
+After G1 a covered draw's GPU-side needs are a pipeline, an index buffer, the draw's arguments and
+one record a stage. What still costs the GPU thread its ~11.8 us is the preparation of that record,
+from the guest's registers, draw by draw. In the last race (medians, us a draw): programs 3.0
+(taking and checking the prepared stages), textures 1.9, images 0.7, buffers 0.5, commit 1.5
+(transitions, slots, record), find and BDA ~0.6; then targets 0.4, vertex 0.4, pipeline 0.2,
+rendering 0.5, emit 0.5, other 1.3. G3 moves the first group, ~8 us, off the GPU thread: GT7's
+render threads build the record, the GPU thread checks and uses it.
+
+### What the render thread has, and what it lacks (from N3 and N4)
+
+| record word | today, on the GPU thread | on the render thread |
+|---|---|---|
+| user data | the SGPRs | **has it**: the engine's shadow, 100 % equal (N3 step 1) |
+| program, specialization, flattened SRT | the walk (or the scanner's) | **has it**: `Gt7Prepare`, 97 to 99 % of stages, 0 wrong, with the `ReadSet` of every byte read (N3 step 3) |
+| pipeline | lookup by registers | learned by state key and material: determined by them (N1, N2: 0.00 % other) |
+| buffer addresses, lengths | `FindBuffers`, `ObtainBuffer` (sync), `NativeStorageBuffer` | the V#s (guest base and size) from its prepared snapshot; the owner buffer by `PeekOwner`, 99 to 100 % right (N4) |
+| image slots | `ResolveTexture`, views, transitions, `TableImageSlot` | the GPU thread's bindings published by descriptor, with their stamps: 98 % of pixel stages but the light grid (N4) |
+| sampler slots | `SamplerCache`, `TableSamplerSlot` | the S# dwords; the slot only through a map the GPU thread publishes |
+
+Three things only the GPU thread can settle, each with a cheap form:
+
+1. **Buffers' contents.** Today each binding is synchronized at the draw (`ObtainBuffer`: ~7
+   syncs a draw at 0.24 us). Memory-reading shaders (`uses_dma`) instead rely on the **BDA walk**
+   (`RenderContext::PrepareBda`): every CPU-dirty buffer synchronized once a guest submission and
+   again after a wait that passed, which is the console's rule (what the game wrote before
+   submitting is visible to its commands). Record buffers take that rule: a record holds each
+   binding's **guest** address and length, and the shader turns the base into a device address
+   through the BDA page table at its start (one lookup a binding; the page table is the buffer
+   cache's own map). The GPU thread only has to make sure a cache buffer covers each range: a
+   memo of the ranges seen (the engine's buffers are long-lived, at fixed addresses), with
+   `ObtainBuffer` for a new one. Stages that write a buffer stay with the GPU thread (write
+   tracking and invalidation are its own).
+2. **Images' layouts.** A slot holds a view in one layout. At the marker the GPU thread checks each
+   record image's current layout is the slot's and its last write is behind a barrier (a read of
+   the image's state, as `Transit` does first); otherwise the draw goes the full way. Material
+   textures never move after load; render targets sampled later get their transition from the
+   draw that falls back, after which the others pass.
+3. **The light grid** (the 2 % image the render thread cannot name): the GPU thread resolves it at
+   the marker as now and patches its slot word in the record (the record is host-visible).
+
+### Records in memory
+
+Each render thread writes its records into its own ring of host-visible device memory (persistently
+mapped; one per thread, so no locks), retired by frame: the GPU thread publishes the last frame
+the GPU finished, and a render thread whose ring is full waits for it (none at ~2 MB a frame).
+The marker carries the record's ring and offset; the GPU thread pushes them.
+
+### Steps, each measured as before
+
+- **G3.0, shadow records.** The render thread builds the full G1 record for each marked draw (no
+  use yet); the GPU thread, which builds its own in `=records`, compares them word by word. Lines:
+  coverage (complete records), mismatches by field, the render thread's cost per record. No
+  speed change expected; the answer is how many draws G3 can carry and what is missing.
+- **G3.1, records used.** For a covered draw whose record is complete, checked (the `ReadSet` and
+  the stamps, the image layouts) and whose buffers are covered, the GPU thread skips
+  `PrepareBindings` to `CommitBindings`: it binds the learned pipeline and the cached set, pushes
+  the record offsets, binds the index buffer and draws. Fallback per draw to the full path.
+  Verify mode keeps building its own record and compares.
+- **G3.2, runs.** Consecutive covered draws of one render target run go into a buffer of
+  generated-commands sequences (execution-set pipeline index, the two offsets as push constants,
+  index buffer, draw) and one `vkCmdExecuteGeneratedCommandsEXT` at the run's end (G0's
+  mechanism). The pipelines of covered draws join the execution set as they are made.
+- **G4**: the compute passes the same way.
+
+Order of risk: G3.0 tells whether the render threads can name enough of each draw (N4 says yes for
+images and buffers; samplers and programs' specializations are new); G3.1 is where the frame rate
+should move (the GPU thread's ~8 us a covered draw); G3.2 removes most of the remaining recording.
