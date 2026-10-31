@@ -228,3 +228,19 @@ Race (first run, every shader recompiled), 10 s windows:
 | shaders that gave up | 0 |
 | slot arrays full | never |
 | picture | textures as before (the user) |
+
+Frame-rate race, `=images` without checks (`_g1-images-race.txt`; some pipelines still compiling,
+`PipelineCompiler` threads at ~55 %), against this morning's two (medians of the 10 s windows of
+400,000 draws or more):
+
+| | G1 off | `=buffers` | `=images` |
+|---|---|---|---|
+| frame rate, median (p25 to p75) | 14.2 (12.5 to 16.3) | 14.4 (11.4 to 15.8) | 14.2 (12.0 to 15.8) |
+| us a draw | 12.0 | 11.5 | 11.8 |
+| programs / textures / images | 3.35 / 1.97 / 0.65 | 2.87 / 1.96 / 0.64 | 2.94 / 1.97 / 0.66 |
+| buffers / commit / other | 0.74 / 1.02 / 1.34 | 0.76 / 0.85 / 1.33 | 0.75 / 1.08 / 1.31 |
+
+Neutral again: the slot lookups in `CommitBindings` cost about what the set 0 image and sampler
+writes they replace did. The work per draw is still all there (the walk, the texture resolution,
+the transitions, a descriptor set for the flattened SRT and the images that do not qualify);
+G1.3 is the step that removes the set.
