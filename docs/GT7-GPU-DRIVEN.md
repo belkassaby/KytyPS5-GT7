@@ -306,3 +306,27 @@ the record). The record's writing (assembling ~150 dwords a stage, then `NativeU
 ring, inside the commit's image step) costs more than the set it replaces. Next: time it on its
 own and make it cheap (written straight into the mapped ring, one upload for a draw's stages),
 before G3.
+
+## G1.3, the record's cost cut (2026-10-31)
+
+Timed on its own ("GT7 G1 records" line), a record cost **0.21 us** to write once written straight
+into the mapped ring (no scratch vector, `StreamBuffer::Map`/`Commit` directly), but a stage's
+**slots 0.47 us**: two or three atomic counter updates per slot and a hash map lookup per image
+and sampler (~16 a stage). The counters are now added once a stage, and a 4,096-entry
+direct-mapped cache sits in front of each map (`BindlessTable::m_table_image_hits`, cleared for a
+view when it is released; samplers are never released). Slots now **0.24 to 0.28 us** a stage.
+
+Races, `=records`, warm cache, medians of the 10 s windows of 400,000 draws or more:
+
+| | G1 off | first `=records` | record written in place | + slot cache |
+|---|---|---|---|---|
+| frame rate, median (p25 to p75) | 14.2 (12.5 to 16.3) | 14.3 (12.0 to 16.3) | 14.4 (12.9 to 16.3) | **14.9 (13.8 to 16.4)** |
+| us a draw | 12.0 | 12.85 | 12.1 | **11.8** |
+| buffers / commit | 0.74 / 1.02 | 0.56 / 1.67 | 0.55 / 1.63 | 0.54 / 1.48 |
+
+G1.3 is now slightly ahead of G1 off: ~0.2 us a draw and ~0.5 fps (within the spread of single
+races; the lower quartile moved most, 12.5 to 13.8). The commit phase is still above G1 off's
+because it now holds the slots and the record (~0.95 us a draw for both stages) in place of the
+set work. This is not the frame rate the plan is after: the CPU still prepares every covered draw
+(programs 3.0, textures 1.9 us a draw). G1's result is the format: a covered draw is a pipeline,
+an index buffer and two record offsets, which is what G3 batches.

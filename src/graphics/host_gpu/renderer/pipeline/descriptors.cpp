@@ -5044,8 +5044,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		// would have had).
 		const auto& layout = program.bindings;
 		if (!layout.table_images.empty() || layout.table_sampler_count != 0) {
+			const auto slots_start = std::chrono::steady_clock::now();
 			auto&      table  = m_context.GetBindlessTable();
 			const bool verify = ::Loader::Gt7NativeDraws::G1Verify();
+			std::array<uint32_t, 2> fresh_count {};
+			std::array<uint32_t, 2> none_count {};
 			for (uint32_t k = 0; k < layout.table_images.size(); k++) {
 				const auto  resource = layout.table_images[k];
 				const auto& binding  = descriptors.images.at(resource);
@@ -5053,8 +5056,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                     program.info.images.at(resource));
 				bool        fresh    = false;
 				const auto  slot = table.TableImageSlot(array, binding.image_view, binding.layout, fresh);
-				prepared->shader_data.at(layout.ImageSlotDword() + k) = slot;
-				::Loader::Gt7NativeDraws::AddG1Slot(false, fresh, slot == 0);
+				prepared->shader_data[layout.ImageSlotDword() + k] = slot;
+				fresh_count[0] += fresh ? 1u : 0u;
+				none_count[0] += slot == 0 ? 1u : 0u;
 				if (verify) {
 					::Loader::Gt7NativeDraws::AddG1SlotVerify(
 					    false, slot != 0 && binding.mip_views.empty() &&
@@ -5065,49 +5069,66 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				const auto sampler = descriptors.samplers.at(j);
 				bool       fresh   = false;
 				const auto slot    = table.TableSamplerSlot(sampler, fresh);
-				prepared->shader_data.at(layout.SamplerSlotDword() + j) = slot;
-				::Loader::Gt7NativeDraws::AddG1Slot(true, fresh, slot == 0);
+				prepared->shader_data[layout.SamplerSlotDword() + j] = slot;
+				fresh_count[1] += fresh ? 1u : 0u;
+				none_count[1] += slot == 0 ? 1u : 0u;
 				if (verify) {
 					::Loader::Gt7NativeDraws::AddG1SlotVerify(
 					    true, slot != 0 && table.TableSampler(slot) == sampler);
 				}
 			}
+			::Loader::Gt7NativeDraws::AddG1Slots(
+			    false, static_cast<uint32_t>(layout.table_images.size()), fresh_count[0], none_count[0]);
+			::Loader::Gt7NativeDraws::AddG1Slots(true, layout.table_sampler_count, fresh_count[1],
+			                                     none_count[1]);
 			if (ShaderRecompiler::IR::FindBinding(
 			        layout, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr &&
 			    !layout.record) {
 				descriptors.shader_data_buffer = NativeUpload(m_context, prepared->shader_data);
 			}
+			::Loader::Gt7NativeDraws::AddG1SlotTime(static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(
+			        std::chrono::steady_clock::now() - slots_start)
+			        .count()));
 		}
 		// GT7 GPU-driven G1.3, level 3: the stage's record, its shader data and then its flattened
 		// SRT (with the bindless patches RebindBuffers applies otherwise), in the stream ring; the
 		// ShaderData binding is the whole ring and the push data the record's offset.
 		uint32_t record_offset = 0;
 		if (layout.record) {
-			const auto&                         snapshot = *prepared->runtime->resources;
-			thread_local std::vector<uint32_t> record;
-			record.assign(prepared->shader_data.begin(), prepared->shader_data.end());
-			const auto srt_begin = record.size();
-			record.insert(record.end(), snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
+			// Written straight into the mapped ring (write-only: the ring may be write-combined).
+			const auto  record_start = std::chrono::steady_clock::now();
+			const auto& snapshot     = *prepared->runtime->resources;
+			const auto& data         = prepared->shader_data;
+			const auto& srt          = snapshot.flattened_srt;
+			const auto  dwords       = std::max<size_t>(data.size() + srt.size(), 1u);
+			EXIT_IF(m_context.GetCommandScheduler().Current().IsInvalid());
+			auto& ring              = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+			const auto [mapped, at] = ring.Map(dwords * sizeof(uint32_t), 256);
+			EXIT_IF(mapped == nullptr);
+			auto* words = reinterpret_cast<uint32_t*>(mapped);
+			std::memcpy(words, data.data(), data.size() * sizeof(uint32_t));
+			std::memcpy(words + data.size(), srt.data(), srt.size() * sizeof(uint32_t));
 			for (const auto& [offset, region, entries]: prepared->bindless_patches) {
-				if (srt_begin + offset + 1u < record.size()) {
-					record[srt_begin + offset]      = region;
-					record[srt_begin + offset + 1u] = entries;
+				if (static_cast<size_t>(offset) + 1u < srt.size()) {
+					words[data.size() + offset]      = region;
+					words[data.size() + offset + 1u] = entries;
 				}
 			}
-			if (record.empty()) {
-				record.push_back(0);
-			}
-			const auto info = NativeUpload(m_context, record);
-			if (record.size() > srt_begin) {
+			ring.Commit();
+			if (!srt.empty()) {
 				FillFlatSlotsOnGpu(m_context,
-				                   {info.buffer, info.offset + srt_begin * sizeof(uint32_t),
-				                    (record.size() - srt_begin) * sizeof(uint32_t)},
+				                   {ring.Handle(), at + data.size() * sizeof(uint32_t),
+				                    srt.size() * sizeof(uint32_t)},
 				                   snapshot.gpu_fills);
 			}
-			EXIT_IF(info.offset % sizeof(uint32_t) != 0);
-			descriptors.shader_data_buffer = {info.buffer, 0, VK_WHOLE_SIZE};
-			record_offset = static_cast<uint32_t>(info.offset / sizeof(uint32_t));
-			::Loader::Gt7NativeDraws::AddG1Record(static_cast<uint32_t>(record.size()));
+			descriptors.shader_data_buffer = {ring.Handle(), 0, VK_WHOLE_SIZE};
+			record_offset = static_cast<uint32_t>(at / sizeof(uint32_t));
+			::Loader::Gt7NativeDraws::AddG1Record(
+			    static_cast<uint32_t>(dwords),
+			    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                              std::chrono::steady_clock::now() - record_start)
+			                              .count()));
 		}
 
 		gt7_lap(3);

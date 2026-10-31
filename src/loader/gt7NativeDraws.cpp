@@ -387,7 +387,7 @@ std::array<std::atomic<uint64_t>, 6> g_g1 {};
 // Slots: images, new, none; samplers, new, none; image checks, wrong; sampler checks, wrong.
 std::array<std::atomic<uint64_t>, 10> g_g1_slots {};
 // Records, their dwords; commits, with the cached set, writing it.
-std::array<std::atomic<uint64_t>, 5> g_g1_records {};
+std::array<std::atomic<uint64_t>, 8> g_g1_records {}; // + record ns, slot stages, slot ns
 
 void ReportG1() {
 	static std::array<uint64_t, 6> last {};
@@ -416,8 +416,8 @@ void ReportG1() {
 		    "{:.0f}, none {:.0f}) | checks: images {:.0f} wrong {:.0f}, samplers {:.0f} wrong {:.0f}\n",
 		    s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9]));
 	}
-	static std::array<uint64_t, 5> last_records {};
-	std::array<double, 5>          r {};
+	static std::array<uint64_t, 8> last_records {};
+	std::array<double, 8>          r {};
 	for (size_t i = 0; i < r.size(); i++) {
 		const auto now  = g_g1_records[i].load(std::memory_order_relaxed);
 		r[i]            = static_cast<double>(now - last_records[i]);
@@ -425,9 +425,10 @@ void ReportG1() {
 	}
 	if (r[0] != 0) {
 		Log::WriteUnmuted(fmt::format(
-		    "GT7 G1 records (10 s): {:.0f} records, {:.1f} dwords each | graphics commits {:.0f}: "
-		    "cached set {:.1f}% (written {:.0f})\n",
-		    r[0], r[1] / r[0], r[2], r[2] == 0 ? 0.0 : 100.0 * r[3] / r[2], r[4]));
+		    "GT7 G1 records (10 s): {:.0f} records, {:.1f} dwords each, {:.3f} us each to write | "
+		    "slots {:.3f} us a stage | graphics commits {:.0f}: cached set {:.1f}% (written {:.0f})\n",
+		    r[0], r[1] / r[0], r[5] / 1000.0 / r[0], r[6] == 0 ? 0.0 : r[7] / 1000.0 / r[6], r[2],
+		    r[2] == 0 ? 0.0 : 100.0 * r[3] / r[2], r[4]));
 	}
 }
 
@@ -1258,20 +1259,26 @@ bool G1Verify() {
 	return G1Level() != 0 && verify;
 }
 
-void AddG1Slot(bool sampler, bool fresh, bool none) {
+void AddG1Slots(bool sampler, uint32_t count, uint32_t fresh, uint32_t none) {
 	const size_t base = sampler ? 3 : 0;
-	g_g1_slots[base].fetch_add(1, std::memory_order_relaxed);
-	if (fresh) {
-		g_g1_slots[base + 1].fetch_add(1, std::memory_order_relaxed);
+	g_g1_slots[base].fetch_add(count, std::memory_order_relaxed);
+	if (fresh != 0) {
+		g_g1_slots[base + 1].fetch_add(fresh, std::memory_order_relaxed);
 	}
-	if (none) {
-		g_g1_slots[base + 2].fetch_add(1, std::memory_order_relaxed);
+	if (none != 0) {
+		g_g1_slots[base + 2].fetch_add(none, std::memory_order_relaxed);
 	}
 }
 
-void AddG1Record(uint32_t dwords) {
+void AddG1Record(uint32_t dwords, uint64_t nanoseconds) {
 	g_g1_records[0].fetch_add(1, std::memory_order_relaxed);
 	g_g1_records[1].fetch_add(dwords, std::memory_order_relaxed);
+	g_g1_records[5].fetch_add(nanoseconds, std::memory_order_relaxed);
+}
+
+void AddG1SlotTime(uint64_t nanoseconds) {
+	g_g1_records[6].fetch_add(1, std::memory_order_relaxed);
+	g_g1_records[7].fetch_add(nanoseconds, std::memory_order_relaxed);
 }
 
 void AddG1Commit(bool static_set, bool written) {

@@ -739,9 +739,14 @@ uint32_t BindlessTable::TableImageSlot(uint32_t binding, vk::ImageView view, vk:
 	if (m_set == nullptr || binding >= ImageArrays || view == nullptr) {
 		return 0;
 	}
+	auto& hit = m_table_image_hits[TableImageIndex(view, layout, binding)];
+	if (hit.view == static_cast<VkImageView>(view) && hit.layout == layout && hit.binding == binding) {
+		return hit.slot;
+	}
 	auto& slots = m_table_image_slots[static_cast<VkImageView>(view)];
 	for (const auto& entry: slots) {
 		if (entry.binding == binding && entry.layout == layout) {
+			hit = {static_cast<VkImageView>(view), layout, binding, entry.slot};
 			return entry.slot;
 		}
 	}
@@ -755,6 +760,7 @@ uint32_t BindlessTable::TableImageSlot(uint32_t binding, vk::ImageView view, vk:
 	}
 	WriteSlot(binding, slot, view, layout);
 	slots.push_back({binding, layout, slot});
+	hit   = {static_cast<VkImageView>(view), layout, binding, slot};
 	fresh = true;
 	return slot;
 }
@@ -764,8 +770,15 @@ uint32_t BindlessTable::TableSamplerSlot(vk::Sampler sampler, bool& fresh) {
 	if (m_set == nullptr || sampler == nullptr) {
 		return 0;
 	}
+	auto& hit = m_table_sampler_hits[TableImageIndex(reinterpret_cast<VkImageView>(
+	                                                     static_cast<VkSampler>(sampler)),
+	                                                 vk::ImageLayout::eUndefined, 0)];
+	if (hit.sampler == static_cast<VkSampler>(sampler)) {
+		return hit.slot;
+	}
 	if (const auto found = m_table_sampler_slots.find(static_cast<VkSampler>(sampler));
 	    found != m_table_sampler_slots.end()) {
+		hit = {static_cast<VkSampler>(sampler), found->second};
 		return found->second;
 	}
 	if (m_next_sampler_slot >= m_samplers_per_array) {
@@ -790,6 +803,7 @@ uint32_t BindlessTable::TableSamplerSlot(vk::Sampler sampler, bool& fresh) {
 		m_table_samplers.resize(slot + 1u);
 	}
 	m_table_samplers[slot] = sampler;
+	hit                    = {static_cast<VkSampler>(sampler), slot};
 	fresh                  = true;
 	return slot;
 }
@@ -802,6 +816,11 @@ bool BindlessTable::ReleaseViews(std::span<const vk::ImageView> views) {
 		if (const auto table = m_table_image_slots.find(static_cast<VkImageView>(view));
 		    table != m_table_image_slots.end()) {
 			for (const auto& entry: table->second) {
+				if (auto& hit = m_table_image_hits[TableImageIndex(table->first, entry.layout,
+				                                                   entry.binding)];
+				    hit.view == table->first) {
+					hit = {};
+				}
 				WriteSlot(entry.binding, entry.slot,
 				          m_placeholder_views[entry.binding * PlaceholderColors],
 				          vk::ImageLayout::eShaderReadOnlyOptimal);

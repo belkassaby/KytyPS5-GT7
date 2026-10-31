@@ -340,6 +340,29 @@ private:
 	};
 	std::unordered_map<VkImageView, std::vector<TableSlot>> m_table_image_slots;
 	std::unordered_map<VkSampler, uint32_t>                 m_table_sampler_slots;
+	// Direct-mapped caches in front of the two maps (a draw looks up ~16 slots a stage; the maps
+	// cost ~0.5 us a stage). An image entry is cleared when its view is released.
+	struct TableImageHit {
+		VkImageView     view    = nullptr;
+		vk::ImageLayout layout  = vk::ImageLayout::eUndefined;
+		uint32_t        binding = 0;
+		uint32_t        slot    = 0;
+	};
+	struct TableSamplerHit {
+		VkSampler sampler = nullptr;
+		uint32_t  slot    = 0;
+	};
+	static constexpr uint32_t                  TableCacheSize = 4096;
+	[[nodiscard]] static uint32_t TableImageIndex(VkImageView view, vk::ImageLayout layout,
+	                                              uint32_t binding) noexcept {
+		auto key = reinterpret_cast<uintptr_t>(view) ^
+		           (static_cast<uintptr_t>(layout) << 3u) ^ (static_cast<uintptr_t>(binding) << 7u);
+		key ^= key >> 17u;
+		key *= 0x9e3779b97f4a7c15ull;
+		return static_cast<uint32_t>(key >> 52u) & (TableCacheSize - 1u);
+	}
+	std::array<TableImageHit, TableCacheSize>   m_table_image_hits {};
+	std::array<TableSamplerHit, TableCacheSize> m_table_sampler_hits {};
 	std::vector<vk::Sampler>                                m_table_samplers;
 };
 
