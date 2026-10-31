@@ -178,3 +178,11 @@ recompiled), 10 s windows:
 | checks | 0.5 to 1.1 million, **0 wrong**, 100 % with the guest range checked |
 | shaders that gave up | 0 |
 | picture | as before (the user) |
+
+Second race, `=buffers` (no checks), shader cache warm but some pipelines still compiling
+(`PipelineCompiler` threads at ~40 %): race frames 8 to 21 fps, **~14 to 15 median**; GPU phases,
+10 s windows of 490,000 to 780,000 draws: **9.4 to 11.9 us a draw** (commit 0.64 to 0.85, buffers
+0.74 to 0.79). Within the spread of earlier races (16 fps median, 10.9 to 11.0 us a draw, run B):
+G1.1 neither gains nor costs measurably, as expected while the draw still writes a descriptor set
+for its images, samplers and flattened SRT. A same-day baseline (markers on, G1 off) to compare
+exactly is still to run.
