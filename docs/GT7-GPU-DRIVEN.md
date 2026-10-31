@@ -400,3 +400,29 @@ The marker carries the record's ring and offset; the GPU thread pushes them.
 Order of risk: G3.0 tells whether the render threads can name enough of each draw (N4 says yes for
 images and buffers; samplers and programs' specializations are new); G3.1 is where the frame rate
 should move (the GPU thread's ~8 us a covered draw); G3.2 removes most of the remaining recording.
+
+## G3.0, first race: the render threads' records (2026-10-31)
+
+`KYTY_GT7_G3=shadow` (with `KYTY_GT7_G1=records`, `KYTY_GT7_NATIVE_RECORDS=use`): the GPU thread
+publishes each learned stage's record layout (`G3Layout`: user data registers, buffers, table
+images and samplers) and the slots it gives image descriptors (with the stamp of the image's
+memory) and samplers (by S# and flags); the render thread builds the stage's record from its
+prepared stage right after `Prepare` (`Gt7NativeWalk::BuildShadow`); the GPU thread compares it
+field by field with the record it writes (`G3Compare`). Race, 10 s windows
+(`_g3-shadow-race.txt`):
+
+| | |
+|---|---|
+| shadows built on the render threads | 490,000 to 590,000, 1.35 to 1.44 us each |
+| stages with a learned layout | 99.4 to 99.6 % |
+| user data | **100.00 %** equal |
+| buffer size | **100.00 %** equal |
+| buffer address | 65 to 77 % equal: the rest are null bindings (base in page 0 or size 0), which the GPU thread records as address 0 and the shadow left as the descriptor's base (fixed since) |
+| image slots | 91.5 to 91.9 % equal, **8.1 to 8.5 % not published** (the light grids), **0.00 % different** |
+| sampler slots | **100.00 %** equal |
+| flattened SRT | 99.97 to 100 % equal |
+| stages with every word equal | 58 to 63 % (the null bindings' artifact included) |
+| frame rate, median | 13.5 (the render threads' preparation and shadows; not used yet) |
+
+So far: no field where the render thread's record is wrong, beyond the null bindings' encoding;
+images the GPU thread never bound (light grids) are the one real gap, as N4 found.

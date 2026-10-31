@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 struct ResourceSnapshot;
@@ -66,6 +67,25 @@ uint32_t ResolveImages(uint64_t key, const ShaderRecompiler::IR::ResourceSnapsho
 uint32_t ResolveBuffers(uint64_t key, const ShaderRecompiler::IR::ResourceSnapshot& resources,
                         uint32_t* ids, uint8_t* states, uint32_t max, uint64_t* addresses = nullptr,
                         uint64_t* sizes = nullptr);
+
+// GPU-driven G3.0 (docs/GT7-GPU-DRIVEN.md; KYTY_GT7_G3=shadow, with KYTY_GT7_G1=records and
+// KYTY_GT7_NATIVE_RECORDS=use): a stage's G1 record as the render thread can build it, from its
+// prepared stage and what the GPU thread published for the learned key (the record's layout) and
+// by descriptor (image and sampler slots). Buffers by guest address and size (G3's format) rather
+// than device address. A slot of 0: not published (or no longer valid).
+struct ShadowRecord {
+	bool                  layout = false; // the layout was learned; the rest is empty otherwise
+	uint64_t              shader_hash = 0;
+	std::vector<uint32_t> user;
+	std::vector<uint64_t> buffer_address;
+	std::vector<uint64_t> buffer_size;
+	std::vector<uint32_t> image_slots;
+	std::vector<uint32_t> sampler_slots;
+	std::vector<uint32_t> srt;
+};
+
+// Render thread, right after Prepare (the GPU thread may take the prepared stage's resources).
+void BuildShadow(uint64_t key, const DrawPrep::StageResult& prepared, ShadowRecord* shadow);
 
 // Both sides: a hash of a snapshot's buffers, images, samplers and flattened SRT.
 [[nodiscard]] uint64_t Hash(const ShaderRecompiler::IR::ResourceSnapshot& snapshot);

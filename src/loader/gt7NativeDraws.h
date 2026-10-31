@@ -125,6 +125,17 @@ void               AddG1Verify(bool ok, bool mirrored);
 // placeholder or default sampler); and its check.
 void               AddG1Slots(bool sampler, uint32_t count, uint32_t fresh, uint32_t none);
 void               AddG1SlotVerify(bool sampler, bool ok);
+
+// GPU-driven G3.0 (KYTY_GT7_G3=shadow): the render threads build each marked stage's record as a
+// shadow (Gt7NativeWalk::BuildShadow); the GPU thread compares it, field by field, with the record
+// it writes. Fields: 0 user data, 1 buffer address, 2 buffer size, 3 image slot, 4 sampler slot,
+// 5 flattened SRT; results: 0 equal, 1 missing (not learned or not published), 2 different.
+[[nodiscard]] bool G3Shadow();
+[[nodiscard]] const Libs::Graphics::Gt7NativeWalk::ShadowRecord* CurrentShadow(uint32_t stage);
+void AddG3Field(uint32_t field, uint32_t result, uint32_t count);
+// A stage compared: whether it had a shadow with a layout, whether every word was equal, and
+// whether every word was equal but for image slots not published (the light grid: G3 patches it).
+void AddG3Stage(bool shadow, bool complete, bool all_but_images);
 // G1.3 (KYTY_GT7_G1=records, level 3): a stage's record written (its dwords), and per pipeline
 // commit whether the cached set was bound (static: the pipeline's stages are all records with
 // fixed buffers; written: the cached set had to be written first).

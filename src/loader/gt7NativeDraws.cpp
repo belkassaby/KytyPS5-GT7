@@ -230,7 +230,56 @@ struct Record {
 	uint32_t buffer_ids[2][32] {};
 	uint8_t  buffer_states[2][32] {};
 	uint8_t  buffer_count[2] {};
+	// G3.0: the stages' records as this thread builds them (heap, freed with the stages).
+	Libs::Graphics::Gt7NativeWalk::ShadowRecord* shadow[2] {};
 };
+
+// G3.0: shadows built and their time on the render threads; per field and result, words.
+std::atomic<uint64_t> g_g3_built {0}, g_g3_build_ns {0}, g_g3_stages {0}, g_g3_with {0},
+    g_g3_complete {0}, g_g3_but_images {0};
+std::array<std::array<std::atomic<uint64_t>, 3>, 6> g_g3_fields {};
+
+bool G3ShadowEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_G3");
+		return value != nullptr && std::strcmp(value, "shadow") == 0;
+	}();
+	return enabled;
+}
+
+void ReportG3() {
+	static std::array<uint64_t, 6> last {};
+	static std::array<std::array<uint64_t, 3>, 6> last_fields {};
+	const std::array<uint64_t, 6> now = {g_g3_built.load(),   g_g3_build_ns.load(),
+	                                     g_g3_stages.load(),  g_g3_with.load(),
+	                                     g_g3_complete.load(), g_g3_but_images.load()};
+	std::array<double, 6> d {};
+	for (size_t i = 0; i < d.size(); i++) {
+		d[i]    = static_cast<double>(now[i] - last[i]);
+		last[i] = now[i];
+	}
+	static constexpr const char* names[6] = {"user data", "buffer address", "buffer size",
+	                                         "image slots", "sampler slots", "SRT words"};
+	std::string fields;
+	for (size_t f = 0; f < 6; f++) {
+		std::array<double, 3> v {};
+		for (size_t r = 0; r < 3; r++) {
+			const auto n         = g_g3_fields[f][r].load(std::memory_order_relaxed);
+			v[r]                 = static_cast<double>(n - last_fields[f][r]);
+			last_fields[f][r]    = n;
+		}
+		const double all = std::max(1.0, v[0] + v[1] + v[2]);
+		fields += fmt::format(" | {} {:.0f}: equal {:.2f}%, missing {:.2f}%, different {:.2f}%",
+		                      names[f], v[0] + v[1] + v[2], 100.0 * v[0] / all, 100.0 * v[1] / all,
+		                      100.0 * v[2] / all);
+	}
+	Log::WriteUnmuted(fmt::format(
+	    "GT7 G3 shadow records (10 s): built {:.0f} on the render threads, {:.2f} us each | stages "
+	    "compared {:.0f}: with a learned layout {:.1f}%, every word equal {:.1f}%, all but unpublished "
+	    "image slots {:.1f}%{}\n",
+	    d[0], d[0] == 0 ? 0.0 : d[1] / 1000.0 / d[0], d[2], d[2] == 0 ? 0.0 : 100.0 * d[3] / d[2],
+	    d[2] == 0 ? 0.0 : 100.0 * d[4] / d[2], d[2] == 0 ? 0.0 : 100.0 * d[5] / d[2], fields));
+}
 struct RecordRing {
 	std::unique_ptr<uint8_t[]> bytes {new uint8_t[RingBytes]};
 	size_t                     head   = 0;
@@ -278,6 +327,19 @@ void WalkRecord(Record& record) {
 			        prepared)) {
 				record.prepared[s]   = prepared;
 				record.walk_state[s] = 1;
+				if (G3ShadowEnabled()) {
+					const auto shadow_start = std::chrono::steady_clock::now();
+					record.shadow[s]        = new Libs::Graphics::Gt7NativeWalk::ShadowRecord;
+					Libs::Graphics::Gt7NativeWalk::BuildShadow(
+					    LearnedKey(t_identity.state, t_identity.material, s), *prepared,
+					    record.shadow[s]);
+					g_g3_built.fetch_add(1, std::memory_order_relaxed);
+					g_g3_build_ns.fetch_add(
+					    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					                              std::chrono::steady_clock::now() - shadow_start)
+					                              .count()),
+					    std::memory_order_relaxed);
+				}
 				if (RecordsCheck()) {
 					std::array<uint64_t, 32> addresses {};
 					std::array<uint64_t, 32> sizes {};
@@ -1088,6 +1150,9 @@ void Report() {
 			ReportBuffers();
 			ReportDcbBuffers();
 		}
+		if (G3ShadowEnabled()) {
+			ReportG3();
+		}
 		if (G1Level() != 0) {
 			ReportG1();
 		}
@@ -1367,6 +1432,10 @@ void FreeRecordStages() {
 	}
 	delete record->image_bindings;
 	record->image_bindings = nullptr;
+	for (auto*& shadow: record->shadow) {
+		delete shadow;
+		shadow = nullptr;
+	}
 	for (auto*& prepared: record->prepared) {
 		if (prepared == nullptr) {
 			continue;
@@ -1377,6 +1446,34 @@ void FreeRecordStages() {
 		}
 		delete prepared;
 		prepared = nullptr;
+	}
+}
+
+bool G3Shadow() {
+	return G3ShadowEnabled();
+}
+
+const Libs::Graphics::Gt7NativeWalk::ShadowRecord* CurrentShadow(uint32_t stage) {
+	const auto* record = CurrentRecord();
+	return record != nullptr && stage < 2 ? record->shadow[stage] : nullptr;
+}
+
+void AddG3Field(uint32_t field, uint32_t result, uint32_t count) {
+	if (field < 6 && result < 3 && count != 0) {
+		g_g3_fields[field][result].fetch_add(count, std::memory_order_relaxed);
+	}
+}
+
+void AddG3Stage(bool shadow, bool complete, bool all_but_images) {
+	if (all_but_images) {
+		g_g3_but_images.fetch_add(1, std::memory_order_relaxed);
+	}
+	g_g3_stages.fetch_add(1, std::memory_order_relaxed);
+	if (shadow) {
+		g_g3_with.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (complete) {
+		g_g3_complete.fetch_add(1, std::memory_order_relaxed);
 	}
 }
 

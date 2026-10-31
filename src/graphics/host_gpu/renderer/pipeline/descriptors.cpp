@@ -1048,6 +1048,42 @@ struct Gt7Bound {
 	uint64_t stamp   = 0;
 };
 std::unordered_map<TextureDescKey, Gt7Bound, TextureDescKeyHash> g_gt7_n4_bound;
+// GPU-driven G3.0 (Gt7NativeWalk::BuildShadow): what the GPU thread publishes for the render
+// threads' shadow records: each learned stage's record layout, and the slots it gave image
+// descriptors (while no image over their memory is made or dropped: the stamp) and samplers.
+struct G3Layout {
+	uint32_t                                         user_data_base = 0;
+	uint64_t                                         shader_hash    = 0;
+	std::vector<uint32_t>                            user_regs;
+	std::vector<uint32_t>                            buffers;
+	std::vector<uint32_t>                            images;
+	std::vector<ShaderRecompiler::IR::ImageResource> image_resources;
+	std::vector<ShaderRecompiler::IR::SamplerResource> samplers;
+};
+struct G3ImageSlot {
+	uint32_t slot    = 0;
+	uint64_t address = 0;
+	uint64_t size    = 0;
+	uint64_t stamp   = 0;
+};
+using G3SamplerKey = std::array<uint32_t, 5>; // the S# dwords and the resource's flags
+struct G3SamplerKeyHash {
+	size_t operator()(const G3SamplerKey& key) const {
+		return static_cast<size_t>(XXH3_64bits(key.data(), sizeof(key)));
+	}
+};
+std::shared_mutex                                                      g_g3_mutex;
+std::unordered_map<uint64_t, std::shared_ptr<const G3Layout>>          g_g3_layouts;
+std::unordered_map<TextureDescKey, G3ImageSlot, TextureDescKeyHash>    g_g3_image_slots;
+std::unordered_map<G3SamplerKey, uint32_t, G3SamplerKeyHash>           g_g3_sampler_slots;
+
+G3SamplerKey MakeG3SamplerKey(const ShaderRecompiler::IR::SamplerResource& sampler,
+                              const ShaderRecompiler::IR::DescriptorValue&  value) {
+	return {value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
+	        (sampler.force_point_filtering ? 1u : 0u) | (sampler.depth_compare ? 2u : 0u) |
+	            (sampler.integer_border ? 4u : 0u) | (sampler.gather_lod ? 8u : 0u)};
+}
+
 // Buffers: each program's buffer resources (by learned key and stage), and the buffer cache.
 std::unordered_map<uint64_t, std::shared_ptr<const std::vector<uint32_t>>> g_gt7_n4_buffer_programs;
 std::atomic<BufferCache*> g_gt7_n4_buffer_cache {nullptr};
@@ -4700,6 +4736,90 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
+// GPU-driven G3.0, GPU thread (CommitBindings, a marked vertex or pixel stage in record mode):
+// publishes the stage's record layout for its learned key, and compares the shadow the render
+// thread built (Gt7NativeWalk::BuildShadow) with the record written here, field by field.
+static void G3Compare(TextureCache& textures, const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                      const PreparedBindings& prepared) {
+	g_gt7_n4_texture_cache.store(&textures, std::memory_order_release);
+	const uint32_t stage  = program.stage == ShaderType::Pixel ? 1u : 0u;
+	const auto&    layout = program.bindings;
+	const auto&    snap   = *prepared.runtime->resources;
+	if (const auto key = ::Loader::Gt7NativeDraws::CurrentLearnedKey(stage); key != 0) {
+		const auto identity = program.shader_hash ^ (uint64_t {layout.ShaderDataDwords()} << 48u);
+		thread_local std::unordered_map<uint64_t, uint64_t> sent;
+		if (auto& last = sent[key]; last != identity) {
+			last         = identity;
+			auto g3      = std::make_shared<G3Layout>();
+			g3->user_data_base = program.user_data_base;
+			g3->shader_hash    = program.shader_hash;
+			g3->user_regs      = layout.user_data_registers;
+			g3->buffers        = ShaderRecompiler::IR::BufferResourceList(layout);
+			g3->images         = layout.table_images;
+			for (const auto resource: layout.table_images) {
+				g3->image_resources.push_back(program.info.images.at(resource));
+			}
+			if (layout.table_sampler_count != 0) {
+				g3->samplers = program.info.samplers;
+			}
+			std::unique_lock lock(g_g3_mutex);
+			g_g3_layouts[key] = std::move(g3);
+		}
+	}
+	const auto* shadow = ::Loader::Gt7NativeDraws::CurrentShadow(stage);
+	if (shadow == nullptr || !shadow->layout || shadow->shader_hash != program.shader_hash) {
+		::Loader::Gt7NativeDraws::AddG3Stage(false, false, false);
+		return;
+	}
+	bool       complete = true;
+	bool       differ   = false; // a word different, or missing other than an image slot
+	const auto field    = [&](uint32_t which, uint32_t result) {
+		::Loader::Gt7NativeDraws::AddG3Field(which, result, 1);
+		if (result != 0) {
+			complete = false;
+			differ |= result == 2 || which != 3;
+			static std::array<std::atomic<uint32_t>, 6> logged {};
+			if (result == 2 && logged[which].fetch_add(1, std::memory_order_relaxed) < 6) {
+				LOGF("GT7 G3 shadow: stage %s shader 0x%016" PRIx64 " field %u differs\n",
+				     stage == 1 ? "pixel" : "vertex", program.shader_hash, which);
+			}
+		}
+	};
+	const auto users = layout.user_data_registers.size();
+	for (size_t i = 0; i < users; i++) {
+		field(0, i >= shadow->user.size() ? 1u : shadow->user[i] == prepared.shader_data[i] ? 0u : 2u);
+	}
+	const auto buffers = prepared.buffer_sources.size();
+	for (size_t i = 0; i < buffers; i++) {
+		if (i >= shadow->buffer_address.size()) {
+			field(1, 1);
+			continue;
+		}
+		const auto& source = prepared.buffer_sources[i];
+		field(1, shadow->buffer_address[i] == source.address ? 0u : 2u);
+		field(2, shadow->buffer_size[i] == source.size ? 0u : 2u);
+	}
+	for (size_t k = 0; k < layout.table_images.size(); k++) {
+		const auto slot = prepared.shader_data[layout.ImageSlotDword() + k];
+		field(3, k >= shadow->image_slots.size() || shadow->image_slots[k] == 0 ? 1u
+		         : shadow->image_slots[k] == slot                               ? 0u
+		                                                                        : 2u);
+	}
+	for (size_t j = 0; j < layout.table_sampler_count; j++) {
+		const auto slot = prepared.shader_data[layout.SamplerSlotDword() + j];
+		field(4, j >= shadow->sampler_slots.size() || shadow->sampler_slots[j] == 0 ? 1u
+		         : shadow->sampler_slots[j] == slot                                 ? 0u
+		                                                                            : 2u);
+	}
+	if (!snap.flattened_srt.empty()) {
+		field(5, shadow->srt.size() == snap.flattened_srt.size() &&
+		                 std::equal(shadow->srt.begin(), shadow->srt.end(), snap.flattened_srt.begin())
+		             ? 0u
+		             : 2u);
+	}
+	::Loader::Gt7NativeDraws::AddG3Stage(true, complete, !differ);
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -5047,6 +5167,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const auto slots_start = std::chrono::steady_clock::now();
 			auto&      table  = m_context.GetBindlessTable();
 			const bool verify = ::Loader::Gt7NativeDraws::G1Verify();
+			const bool g3     = ::Loader::Gt7NativeDraws::G3Shadow() &&
+			                ::Loader::Gt7NativeDraws::CurrentMarked() &&
+			                (program.stage == ShaderType::Pixel || program.stage == ShaderType::Vertex);
 			std::array<uint32_t, 2> fresh_count {};
 			std::array<uint32_t, 2> none_count {};
 			for (uint32_t k = 0; k < layout.table_images.size(); k++) {
@@ -5057,6 +5180,25 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				bool        fresh    = false;
 				const auto  slot = table.TableImageSlot(array, binding.image_view, binding.layout, fresh);
 				prepared->shader_data[layout.ImageSlotDword() + k] = slot;
+				if (g3 && slot != 0) {
+					const auto  key   = MakeTextureDescKey(program.info.images.at(resource),
+					                                       prepared->runtime->resources->images.at(resource));
+					const auto& data  = binding.desc.info.data;
+					const auto  stamp = m_context.GetTextureCache().RangeStamp(data.address, data.size);
+					thread_local std::unordered_map<TextureDescKey, G3ImageSlot, TextureDescKeyHash> sent;
+					if (sent.size() > (1u << 18u)) {
+						sent.clear();
+					}
+					auto& last = sent[key];
+					if (last.slot != slot || last.stamp != stamp) {
+						last = {slot, data.address, data.size, stamp};
+						std::unique_lock lock(g_g3_mutex);
+						if (g_g3_image_slots.size() > (1u << 18u)) {
+							g_g3_image_slots.clear();
+						}
+						g_g3_image_slots[key] = last;
+					}
+				}
 				fresh_count[0] += fresh ? 1u : 0u;
 				none_count[0] += slot == 0 ? 1u : 0u;
 				if (verify) {
@@ -5070,6 +5212,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				bool       fresh   = false;
 				const auto slot    = table.TableSamplerSlot(sampler, fresh);
 				prepared->shader_data[layout.SamplerSlotDword() + j] = slot;
+				if (g3 && slot != 0) {
+					const auto& resource = program.info.samplers.at(j);
+					const auto  key      = MakeG3SamplerKey(
+                        resource, prepared->runtime->resources->samplers.at(resource.snapshot_index));
+					thread_local std::unordered_map<G3SamplerKey, uint32_t, G3SamplerKeyHash> sent;
+					if (const auto it = sent.find(key); it == sent.end() || it->second != slot) {
+						sent[key] = slot;
+						std::unique_lock lock(g_g3_mutex);
+						g_g3_sampler_slots[key] = slot;
+					}
+				}
 				fresh_count[1] += fresh ? 1u : 0u;
 				none_count[1] += slot == 0 ? 1u : 0u;
 				if (verify) {
@@ -5124,6 +5277,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			descriptors.shader_data_buffer = {ring.Handle(), 0, VK_WHOLE_SIZE};
 			record_offset = static_cast<uint32_t>(at / sizeof(uint32_t));
+			if (::Loader::Gt7NativeDraws::G3Shadow() && ::Loader::Gt7NativeDraws::CurrentMarked() &&
+			    (program.stage == ShaderType::Pixel || program.stage == ShaderType::Vertex)) {
+				G3Compare(m_context.GetTextureCache(), program, *prepared);
+			}
 			::Loader::Gt7NativeDraws::AddG1Record(
 			    static_cast<uint32_t>(dwords),
 			    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -5402,6 +5559,70 @@ uint32_t ResolveBuffers(uint64_t key, const ShaderRecompiler::IR::ResourceSnapsh
 		ids[i]           = owner.index;
 	}
 	return count;
+}
+
+void BuildShadow(uint64_t key, const DrawPrep::StageResult& prepared, ShadowRecord* shadow) {
+	std::shared_ptr<const G3Layout> layout;
+	{
+		std::shared_lock lock(g_g3_mutex);
+		const auto       it = g_g3_layouts.find(key);
+		if (it == g_g3_layouts.end()) {
+			return;
+		}
+		layout = it->second;
+	}
+	const auto& res = prepared.resources;
+	shadow->layout      = true;
+	shadow->shader_hash = layout->shader_hash;
+	for (const auto reg: layout->user_regs) {
+		const auto index = reg - layout->user_data_base;
+		shadow->user.push_back(index < res.user_data.size() ? res.user_data[index] : 0u);
+	}
+	for (const auto resource: layout->buffers) {
+		if (resource >= res.buffers.size()) {
+			shadow->buffer_address.push_back(0);
+			shadow->buffer_size.push_back(0);
+			continue;
+		}
+		// As FindBuffers: a base in guest page 0, or no size, binds nothing.
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(res.buffers[resource]);
+		const bool none = descriptor.Base48() < BufferCache::CACHING_PAGESIZE || descriptor.GetSize() == 0;
+		shadow->buffer_address.push_back(none ? 0 : descriptor.Base48());
+		shadow->buffer_size.push_back(none ? 0 : descriptor.GetSize());
+	}
+	std::vector<G3ImageSlot> images(layout->images.size());
+	{
+		std::shared_lock lock(g_g3_mutex);
+		for (size_t k = 0; k < layout->images.size(); k++) {
+			const auto resource = layout->images[k];
+			if (resource >= res.images.size()) {
+				continue;
+			}
+			const auto it =
+			    g_g3_image_slots.find(MakeTextureDescKey(layout->image_resources[k], res.images[resource]));
+			if (it != g_g3_image_slots.end()) {
+				images[k] = it->second;
+			}
+		}
+		for (const auto& sampler: layout->samplers) {
+			uint32_t slot = 0;
+			if (sampler.snapshot_index < res.samplers.size()) {
+				const auto it =
+				    g_g3_sampler_slots.find(MakeG3SamplerKey(sampler, res.samplers[sampler.snapshot_index]));
+				slot = it != g_g3_sampler_slots.end() ? it->second : 0u;
+			}
+			shadow->sampler_slots.push_back(slot);
+		}
+	}
+	auto* cache = g_gt7_n4_texture_cache.load(std::memory_order_acquire);
+	for (const auto& image: images) {
+		shadow->image_slots.push_back(
+		    image.slot != 0 && cache != nullptr &&
+		            cache->RangeStamp(image.address, image.size) == image.stamp
+		        ? image.slot
+		        : 0u);
+	}
+	shadow->srt.assign(res.flattened_srt.begin(), res.flattened_srt.end());
 }
 
 } // namespace Gt7NativeWalk
