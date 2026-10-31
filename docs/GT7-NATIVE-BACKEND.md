@@ -357,3 +357,27 @@ draw, as N3 and N4 did):
 4. **Command lists**: pipeline, set, vertex and index buffers, dynamic state, draw, recorded on the
    render thread; at the marker the GPU thread validates, patches the light grid, opens the render
    pass, stitches, splices, and skips the draw packet. Verified by picture, then the A/B.
+
+## N4 step 3, sub-step 1, measured: where a draw's buffers live (2026-10-30)
+
+A record's buffers (checks on, `ClassifyBuffers`) against the render context's command buffer
+(`ctx+0x788`, `[bottom, top)`) and each stage's (`GT7StageBinding +0xa8`, where
+`gt7_RenewStageConstants` moves the stage's constants: a separate segment). Race, 10 s windows:
+
+| | vertex stages | pixel stages |
+|---|---|---|
+| buffers in a command buffer segment | 3,600 to 8,900 (150 to 170 bytes each) | 3,100 to 7,200 (330 to 340 bytes each) |
+| buffers elsewhere | 480,000 to 720,000 (27 to 36 KB each) | 170,000 to 290,000 (6.7 to 6.8 KB each) |
+| stages with every buffer in a segment | 4.5 to 6.6 % | 16.6 to 23.5 % |
+
+Samples: the commonest pixel buffer is one 56-byte block at a fixed address (`0x1296cc0000`), in
+neither segment. The stage constant blocks are in the stages' segments, as the decompile says, but
+they are few: most of a draw's buffers are the engine's shared ones (mesh data for the vertex
+stage, scene and frame data for the pixel stage), long-lived and at fixed addresses.
+
+So sub-step 1 changes: the command buffer copies cover a small part; a record's buffers come
+mostly from the buffer cache's bindings, as its images do from the texture cache's. Those buffers
+are written by the CPU once a frame (scene data) or not at all (meshes): the GPU thread syncs them
+the first time a frame uses them, and a record can take the buffer cache's binding (buffer, offset)
+published by descriptor while the buffer's sync state holds, the way the image bindings do with
+their stamps.

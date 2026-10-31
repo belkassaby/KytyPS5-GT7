@@ -64,7 +64,8 @@ uint32_t ResolveImages(uint64_t key, const ShaderRecompiler::IR::ResourceSnapsho
 // `states`: 0 none bound (address in page 0, or no size), 1 found (`ids` holds its index),
 // 3 no buffer owns the page. The count, or 0 when the program's buffers are not learned.
 uint32_t ResolveBuffers(uint64_t key, const ShaderRecompiler::IR::ResourceSnapshot& resources,
-                        uint32_t* ids, uint8_t* states, uint32_t max);
+                        uint32_t* ids, uint8_t* states, uint32_t max, uint64_t* addresses = nullptr,
+                        uint64_t* sizes = nullptr);
 
 // Both sides: a hash of a snapshot's buffers, images, samplers and flattened SRT.
 [[nodiscard]] uint64_t Hash(const ShaderRecompiler::IR::ResourceSnapshot& snapshot);

@@ -34,6 +34,7 @@ namespace Loader::Gt7NativeDraws {
 void ReportUse();
 void ReportImages();
 void ReportBuffers();
+void ReportDcbBuffers();
 void FreeRecordStages();
 
 namespace Pm4 = Libs::Graphics::Pm4;
@@ -249,6 +250,9 @@ uint64_t LearnedKey(uint64_t state, uint64_t material, uint32_t stage) {
 	return ((state ^ (material * 0x9E3779B97F4A7C15ull)) << 1u) | stage;
 }
 
+void ClassifyBuffers(uint32_t stage, uint32_t count, const uint8_t* states,
+                     const uint64_t* addresses, const uint64_t* sizes);
+
 void WalkRecord(Record& record) {
 	for (uint32_t s = 0; s < 2; s++) {
 		if (!record.has_user[s]) {
@@ -275,10 +279,15 @@ void WalkRecord(Record& record) {
 				record.prepared[s]   = prepared;
 				record.walk_state[s] = 1;
 				if (RecordsCheck()) {
+					std::array<uint64_t, 32> addresses {};
+					std::array<uint64_t, 32> sizes {};
 					record.walk_hash[s]    = Libs::Graphics::Gt7NativeWalk::Hash(prepared->resources);
 					record.buffer_count[s] = static_cast<uint8_t>(Libs::Graphics::Gt7NativeWalk::ResolveBuffers(
 					    LearnedKey(t_identity.state, t_identity.material, s), prepared->resources,
-					    record.buffer_ids[s], record.buffer_states[s], 32));
+					    record.buffer_ids[s], record.buffer_states[s], 32, addresses.data(),
+					    sizes.data()));
+					ClassifyBuffers(s, record.buffer_count[s], record.buffer_states[s],
+					                addresses.data(), sizes.data());
 				}
 				if (s == 1) {
 					record.image_bindings = new std::array<std::shared_ptr<const void>, 32>;
@@ -317,6 +326,81 @@ void WalkRecord(Record& record) {
 		                            .count()),
 		                    std::memory_order_relaxed);
 	}
+}
+
+// N4 step 3, sub-step 1, measured first: a record's buffers in the render thread's own command
+// buffer segment (GT7CommandBuffer at ctx+0x788: [bottom, top); data is allocated down from top):
+// memory it wrote and the GPU never writes, which a record can copy into a ring of its own.
+constexpr uint64_t CtxDcb       = 0x788;
+std::array<std::atomic<uint64_t>, 2> g_dcb_buffers {}, g_dcb_bytes {}, g_other_buffers {},
+    g_other_bytes {}, g_dcb_stages_all {}, g_dcb_stages {};
+
+void ClassifyBuffers(uint32_t stage, uint32_t count, const uint8_t* states,
+                     const uint64_t* addresses, const uint64_t* sizes) {
+	if (t_ctx == nullptr || count == 0) {
+		return;
+	}
+	// The render context's command buffer, and each stage's (GT7StageBinding +0xa8: where
+	// gt7_RenewStageConstants moves the stage's constants), as [bottom, top).
+	std::array<std::pair<uint64_t, uint64_t>, 7> segments {};
+	std::memcpy(&segments[0].first, t_ctx + CtxDcb, sizeof(uint64_t));
+	std::memcpy(&segments[0].second, t_ctx + CtxDcb + 8, sizeof(uint64_t));
+	for (uint64_t st = 0; st < 6; st++) {
+		uint64_t dcb = 0;
+		std::memcpy(&dcb, t_ctx + CtxStages + st * CtxStageSize + 0xa8, sizeof(dcb));
+		if (dcb != 0) {
+			std::memcpy(&segments[1 + st].first, reinterpret_cast<const void*>(dcb), sizeof(uint64_t));
+			std::memcpy(&segments[1 + st].second, reinterpret_cast<const void*>(dcb + 8), sizeof(uint64_t));
+		}
+	}
+	static std::atomic<uint32_t> logged {0};
+	bool all = true;
+	for (uint32_t i = 0; i < count; i++) {
+		if (states[i] == 0) {
+			continue; // none bound
+		}
+		bool in = false;
+		for (const auto& [bottom, top]: segments) {
+			in |= bottom != 0 && addresses[i] >= bottom && addresses[i] + sizes[i] <= top;
+		}
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+			Log::WriteUnmuted(fmt::format(
+			    "Native records N4 command buffer data: {} buffer at 0x{:x} ({} bytes): {} | ctx "
+			    "[0x{:x}, 0x{:x}) stage 0 [0x{:x}, 0x{:x}) stage 1 [0x{:x}, 0x{:x})\n",
+			    stage == 0 ? "vertex" : "pixel", addresses[i], sizes[i], in ? "in" : "outside",
+			    segments[0].first, segments[0].second, segments[1].first, segments[1].second,
+			    segments[2].first, segments[2].second));
+		}
+		(in ? g_dcb_buffers : g_other_buffers)[stage].fetch_add(1, std::memory_order_relaxed);
+		(in ? g_dcb_bytes : g_other_bytes)[stage].fetch_add(sizes[i], std::memory_order_relaxed);
+		all &= in;
+	}
+	g_dcb_stages[stage].fetch_add(1, std::memory_order_relaxed);
+	if (all) {
+		g_dcb_stages_all[stage].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void ReportDcbBuffers() {
+	static std::array<std::array<uint64_t, 6>, 2> last {};
+	std::string                                   text;
+	for (uint32_t s = 0; s < 2; s++) {
+		const std::array<uint64_t, 6> now = {g_dcb_stages[s].load(),  g_dcb_stages_all[s].load(),
+		                                     g_dcb_buffers[s].load(), g_dcb_bytes[s].load(),
+		                                     g_other_buffers[s].load(), g_other_bytes[s].load()};
+		std::array<double, 6>          d {};
+		for (size_t i = 0; i < d.size(); i++) {
+			d[i]       = static_cast<double>(now[i] - last[s][i]);
+			last[s][i] = now[i];
+		}
+		const double stages = std::max(1.0, d[0]);
+		text += fmt::format(
+		    " | {} stages {:.0f}: every buffer in the command buffer {:.1f}%; buffers in it {:.0f} "
+		    "({:.0f} bytes each), elsewhere {:.0f} ({:.0f} bytes each)",
+		    s == 0 ? "vertex" : "pixel", d[0], 100.0 * d[1] / stages, d[2],
+		    d[2] == 0 ? 0.0 : d[3] / d[2], d[4], d[4] == 0 ? 0.0 : d[5] / d[4]);
+	}
+	Log::WriteUnmuted(fmt::format("Native records N4 command buffer data (10 s){}\n", text));
 }
 
 uint64_t MakeRecord() {
@@ -951,6 +1035,7 @@ void Report() {
 			ReportUse();
 			ReportImages();
 			ReportBuffers();
+			ReportDcbBuffers();
 		}
 		ReportCommit();
 		ReportResolve();

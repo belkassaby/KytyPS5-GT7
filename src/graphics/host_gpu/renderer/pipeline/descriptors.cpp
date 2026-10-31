@@ -5172,7 +5172,8 @@ uint32_t ResolveImages(uint64_t key, const ShaderRecompiler::IR::ResourceSnapsho
 }
 
 uint32_t ResolveBuffers(uint64_t key, const ShaderRecompiler::IR::ResourceSnapshot& resources,
-                        uint32_t* ids, uint8_t* states, uint32_t max) {
+                        uint32_t* ids, uint8_t* states, uint32_t max, uint64_t* addresses,
+                        uint64_t* sizes) {
 	auto*                                       cache = g_gt7_n4_buffer_cache.load(std::memory_order_acquire);
 	std::shared_ptr<const std::vector<uint32_t>> list;
 	{
@@ -5193,6 +5194,10 @@ uint32_t ResolveBuffers(uint64_t key, const ShaderRecompiler::IR::ResourceSnapsh
 		}
 		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[resource]);
 		const auto address    = descriptor.Base48();
+		if (addresses != nullptr) {
+			addresses[i] = address;
+			sizes[i]     = descriptor.GetSize();
+		}
 		if (address < BufferCache::CACHING_PAGESIZE || descriptor.GetSize() == 0) {
 			states[i] = 0;
 			ids[i]    = UINT32_MAX;
