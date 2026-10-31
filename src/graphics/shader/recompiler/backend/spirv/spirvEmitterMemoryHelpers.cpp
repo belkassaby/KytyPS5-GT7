@@ -5,7 +5,47 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
+// The record's offset in the stream ring (level 3), from the push data.
+static uint32_t RecordBase(EmitterState& state) {
+	const auto pointer = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
+	                          state.push_constant_variable, ConstantU32(state, 0),
+	                          ConstantU32(state, state.program.bindings.push_data_start_dword));
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
+static uint32_t LoadShaderDataStorage(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.shader_data_storage_variable, ConstantU32(state, 0), index);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
+uint32_t FlatSrtVariable(const EmitterState& state) {
+	return state.program.bindings.record ? state.shader_data_storage_variable
+	                                     : state.flattened_srt_variable;
+}
+
+uint32_t FlatSrtIndex(EmitterState& state, uint32_t index) {
+	if (!state.program.bindings.record) {
+		return index;
+	}
+	return EmitBinaryU32(state, spv::OpIAdd,
+	                     EmitBinaryU32(state, spv::OpIAdd, RecordBase(state),
+	                                   ConstantU32(state, state.program.bindings.FlatSrtDword())),
+	                     index);
+}
+
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
+	if (state.program.bindings.record) {
+		EXIT_IF(state.shader_data_storage_variable == 0 || state.push_constant_variable == 0);
+		return LoadShaderDataStorage(
+		    state, EmitBinaryU32(state, spv::OpIAdd, RecordBase(state), ConstantU32(state, dword_index)));
+	}
 	if (state.program.bindings.UsesPushData()) {
 		dword_index += state.program.bindings.push_data_start_dword;
 		const auto pointer = state.builder.AllocateId();
@@ -39,8 +79,8 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 	const auto LoadMapping = [&](uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
-		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
-		                          index);
+		                          pointer, FlatSrtVariable(state), ConstantU32(state, 0),
+		                          FlatSrtIndex(state, index));
 		const auto value = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 		return value;

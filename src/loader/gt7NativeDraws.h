@@ -125,6 +125,11 @@ void               AddG1Verify(bool ok, bool mirrored);
 // placeholder or default sampler); and its check.
 void               AddG1Slot(bool sampler, bool fresh, bool none);
 void               AddG1SlotVerify(bool sampler, bool ok);
+// G1.3 (KYTY_GT7_G1=records, level 3): a stage's record written (its dwords), and per pipeline
+// commit whether the cached set was bound (static: the pipeline's stages are all records with
+// fixed buffers; written: the cached set had to be written first).
+void               AddG1Record(uint32_t dwords);
+void               AddG1Commit(bool static_set, bool written);
 
 } // namespace Loader::Gt7NativeDraws
 

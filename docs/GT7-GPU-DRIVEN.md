@@ -272,3 +272,18 @@ G1.1 and G1.2 showed:
 The "GT7 G1 records" line counts records, their size, and the draws that bound the cached set
 (and why the others did not). Verified by picture: the record holds the words the shader data
 and flattened SRT bindings held before, from the same code.
+
+## G1.3, verified: records in the stream ring (2026-10-31)
+
+`KYTY_GT7_G1=records` with `KYTY_GT7_G1_VERIFY=1`, first run (every shader recompiled; shader
+disk cache format 7), music rally, 10 s windows (`_g1-records-verify.txt`):
+
+| | |
+|---|---|
+| records written | 500,000 to 590,000, **145 to 155 dwords each** (~600 bytes: ~2 MB a frame of the 64 MB ring) |
+| graphics commits of marked draws | 270,000 to 330,000, **98.5 to 99.4 % binding the cached set**; 1 to 13 sets written (new pipeline layouts) |
+| buffer, image and sampler checks | 0 wrong (as G1.1 and G1.2) |
+| shaders that gave up | 0 |
+| picture | as before (the user); 9 to 16 fps while every shader compiled |
+
+A covered draw now allocates and writes no descriptor set and pushes one dword a stage.

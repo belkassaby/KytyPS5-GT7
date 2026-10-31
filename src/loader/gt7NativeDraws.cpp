@@ -386,6 +386,8 @@ void ClassifyBuffers(uint32_t stage, uint32_t count, const uint8_t* states,
 std::array<std::atomic<uint64_t>, 6> g_g1 {};
 // Slots: images, new, none; samplers, new, none; image checks, wrong; sampler checks, wrong.
 std::array<std::atomic<uint64_t>, 10> g_g1_slots {};
+// Records, their dwords; commits, with the cached set, writing it.
+std::array<std::atomic<uint64_t>, 5> g_g1_records {};
 
 void ReportG1() {
 	static std::array<uint64_t, 6> last {};
@@ -413,6 +415,19 @@ void ReportG1() {
 		    "GT7 G1 slots (10 s): images {:.0f} (new {:.0f}, none {:.0f}), samplers {:.0f} (new "
 		    "{:.0f}, none {:.0f}) | checks: images {:.0f} wrong {:.0f}, samplers {:.0f} wrong {:.0f}\n",
 		    s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9]));
+	}
+	static std::array<uint64_t, 5> last_records {};
+	std::array<double, 5>          r {};
+	for (size_t i = 0; i < r.size(); i++) {
+		const auto now  = g_g1_records[i].load(std::memory_order_relaxed);
+		r[i]            = static_cast<double>(now - last_records[i]);
+		last_records[i] = now;
+	}
+	if (r[0] != 0) {
+		Log::WriteUnmuted(fmt::format(
+		    "GT7 G1 records (10 s): {:.0f} records, {:.1f} dwords each | graphics commits {:.0f}: "
+		    "cached set {:.1f}% (written {:.0f})\n",
+		    r[0], r[1] / r[0], r[2], r[2] == 0 ? 0.0 : 100.0 * r[3] / r[2], r[4]));
 	}
 }
 
@@ -1219,6 +1234,9 @@ int G1Level() {
 		if (value == nullptr) {
 			return 0;
 		}
+		if (std::strcmp(value, "records") == 0) {
+			return 3;
+		}
 		if (std::strcmp(value, "images") == 0) {
 			return 2;
 		}
@@ -1248,6 +1266,21 @@ void AddG1Slot(bool sampler, bool fresh, bool none) {
 	}
 	if (none) {
 		g_g1_slots[base + 2].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void AddG1Record(uint32_t dwords) {
+	g_g1_records[0].fetch_add(1, std::memory_order_relaxed);
+	g_g1_records[1].fetch_add(dwords, std::memory_order_relaxed);
+}
+
+void AddG1Commit(bool static_set, bool written) {
+	g_g1_records[2].fetch_add(1, std::memory_order_relaxed);
+	if (static_set) {
+		g_g1_records[3].fetch_add(1, std::memory_order_relaxed);
+	}
+	if (written) {
+		g_g1_records[4].fetch_add(1, std::memory_order_relaxed);
 	}
 }
 

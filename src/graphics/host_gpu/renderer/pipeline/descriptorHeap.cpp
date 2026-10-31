@@ -24,6 +24,9 @@ DescriptorHeap::DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master
 }
 
 DescriptorHeap::~DescriptorHeap() {
+	for (const auto pool: m_persistent_pools) {
+		m_graphics.device.destroyDescriptorPool(pool, nullptr);
+	}
 	m_graphics.device.destroyDescriptorPool(m_current_pool, nullptr);
 	for (const auto& [pool, tick]: m_pending_pools) {
 		m_master_semaphore.Wait(tick);
@@ -56,6 +59,34 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	auto& fresh_batch = m_sets[layout];
 	EXIT_IF(!Allocate(layout, fresh_batch));
 	return fresh_batch.sets[--fresh_batch.size];
+}
+
+vk::DescriptorSet DescriptorHeap::Persistent(vk::DescriptorSetLayout layout) {
+	EXIT_IF(layout == nullptr);
+	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+		if (m_persistent_pools.empty() || attempt == 1) {
+			vk::DescriptorPoolCreateInfo create {};
+			create.maxSets       = DescriptorHeapCount;
+			create.poolSizeCount = static_cast<uint32_t>(DescriptorPoolSizes.size());
+			create.pPoolSizes    = DescriptorPoolSizes.data();
+			vk::DescriptorPool pool = nullptr;
+			EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &pool) !=
+			        vk::Result::eSuccess);
+			m_persistent_pools.push_back(pool);
+		}
+		vk::DescriptorSetAllocateInfo allocate {};
+		allocate.descriptorPool     = m_persistent_pools.back();
+		allocate.descriptorSetCount = 1;
+		allocate.pSetLayouts        = &layout;
+		vk::DescriptorSet set       = nullptr;
+		const auto        result    = m_graphics.device.allocateDescriptorSets(&allocate, &set);
+		if (result == vk::Result::eSuccess) {
+			return set;
+		}
+		EXIT_IF(result != vk::Result::eErrorOutOfPoolMemory &&
+		        result != vk::Result::eErrorFragmentedPool);
+	}
+	EXIT("DescriptorHeap: a persistent set could not be allocated\n");
 }
 
 bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {

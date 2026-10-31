@@ -84,10 +84,13 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		Expect(Kind::BdaPagetable);
 		Expect(Kind::FaultBuffer);
 	}
-	if (IR::UsesFlattenedSrt(program)) {
+	if (IR::UsesFlattenedSrt(program) && !program.bindings.record) {
 		Expect(Kind::FlattenedSrt);
 	}
-	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {
+	const bool shader_data_storage =
+	    program.bindings.record ||
+	    (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData());
+	if (shader_data_storage) {
 		Expect(Kind::ShaderData);
 	}
 
@@ -113,7 +116,9 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	    program.bindings.partition_target_dword != IR::PushData::NoStart;
 	const auto extra_dwords = (has_dispatch_threads ? 3u : 0u) + (has_partition_target ? 2u : 0u);
 	if ((program.bindings.UsesPushData() &&
-	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
+	     !IR::PushData::CanFit(program.bindings.push_data_start_dword,
+	                           program.bindings.PushDwords())) ||
+	    (program.bindings.record && !program.bindings.UsesPushData()) ||
 	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
 	                              program.bindings.dispatch_thread_dword != user_data_dwords)) ||
 	    (has_partition_target && (program.stage != ShaderType::Compute ||
@@ -121,7 +126,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	                                  user_data_dwords + (has_dispatch_threads ? 3u : 0u))) ||
 	    program.bindings.memory_offset_dword != user_data_dwords + extra_dwords ||
 	    program.bindings.memory_offset_count != IR::BufferResourceList(program.bindings).size() ||
-	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
+	    has_shader_data_storage != shader_data_storage ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||
 	    std::adjacent_find(program.bindings.user_data_registers.begin(),

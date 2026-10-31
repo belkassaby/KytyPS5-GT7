@@ -2680,7 +2680,9 @@ struct PipelineCache::ProgramCache {
 			               ShaderRecompiler::IR::BufferResource::NoIndirectBuffer ||
 			           buffer.indirect_search_iterations != 0;
 		    });
-		const uint8_t want = !table ? 0u : level >= 2 && bindless_images ? 2u : 1u;
+		const uint8_t want = !table                          ? 0u
+		                     : !bindless_images || level < 2 ? 1u
+		                                                     : static_cast<uint8_t>(level);
 		if (specialization.draw_table == want) {
 			return;
 		}
@@ -3009,7 +3011,7 @@ struct PipelineCache::ProgramCache {
 				const auto& layout = candidate.program.bindings;
 				return layout.push_data_start_dword ==
 				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
-				                                                    layout.ShaderDataDwords()) &&
+				                                                    layout.PushDwords()) &&
 				       (by_hash ? candidate.specialization_hash == snapshot.specialization_hash
 				                : candidate.specialization == snapshot.specialization);
 			};

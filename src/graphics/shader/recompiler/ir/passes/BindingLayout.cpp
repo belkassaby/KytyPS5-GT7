@@ -145,8 +145,14 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		}
 		next.table_sampler_count = static_cast<uint32_t>(program.info.samplers.size());
 	}
-	next.push_data_start_dword =
-	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
+	next.record = program.draw_table >= 3u;
+	next.push_data_start_dword = PushData::StartFor(push_data_start_dword, next.PushDwords());
+	if (next.record && !next.UsesPushData()) {
+		// No room for the record's offset: the shader data goes as in level 2.
+		next.record                = false;
+		next.push_data_start_dword =
+		    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
+	}
 
 	if (next.draw_table) {
 		// Read by device address from the shader data: no descriptor (BufferResourceList).
@@ -202,11 +208,11 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		AddBinding(next, DescriptorBindingKind::BdaPagetable);
 		AddBinding(next, DescriptorBindingKind::FaultBuffer);
 	}
-	if (UsesFlattenedSrt(program)) {
+	if (UsesFlattenedSrt(program) && !next.record) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 
-	if (next.ShaderDataDwords() != 0 && !next.UsesPushData()) {
+	if (next.record || (next.ShaderDataDwords() != 0 && !next.UsesPushData())) {
 		AddBinding(next, DescriptorBindingKind::ShaderData);
 	}
 

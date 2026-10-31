@@ -487,6 +487,10 @@ struct BindingLayout {
 	// offset and length words keep their meaning). table_buffers lists the buffer resources, as
 	// the Buffers binding's resources do in the other mode (BufferResourceList).
 	bool                           draw_table          = false;
+	// Level 3 (G1.3): the shader data and then the flattened SRT are the stage's record in the
+	// ShaderData binding (the stream ring), at the dword offset the push data holds (one dword,
+	// PushDwords); no FlattenedSrt binding.
+	bool                           record              = false;
 	// Level 2 (G1.2): the samplers (all of them) and table_images (the images TableImage
 	// takes) are read from set 1's bindless arrays, at the slots the shader data holds from
 	// ImageSlotDword() and SamplerSlotDword(), one dword each; no set 0 binding for them.
@@ -514,12 +518,16 @@ struct BindingLayout {
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return SamplerSlotDword() + table_sampler_count;
 	}
+	// The record's flattened SRT, after its shader data.
+	[[nodiscard]] uint32_t FlatSrtDword() const { return ShaderDataDwords(); }
+	// What the push data holds: the shader data, or a record's offset.
+	[[nodiscard]] uint32_t PushDwords() const { return record ? 1u : ShaderDataDwords(); }
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
 	}
 	void AdvancePushData(uint32_t& cursor) const {
 		if (UsesPushData()) {
-			cursor = push_data_start_dword + ShaderDataDwords();
+			cursor = push_data_start_dword + PushDwords();
 		}
 	}
 

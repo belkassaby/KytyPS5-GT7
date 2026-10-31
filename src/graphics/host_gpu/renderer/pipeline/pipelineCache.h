@@ -265,6 +265,10 @@ public:
 		bool                    uses_push_descriptors = false;
 		// Samples bindless images: descriptor set 1 is the bindless table.
 		bool                    uses_bindless         = false;
+		// GT7 G1.3: every stage is in record mode and set 0 holds only buffers fixed for the
+		// session (the stream ring, the BDA page table, the fault buffer): no push descriptors,
+		// one persistent set (RenderExecutor::CommitBindings).
+		bool                    static_bindings       = false;
 		// Set while a worker compiles `pipeline`; draws skip it until the compile finishes.
 		std::shared_ptr<PendingGraphicsPipeline> pending;
 		// Round 105: the driver could not build this compute pipeline (`pipeline` is null); its

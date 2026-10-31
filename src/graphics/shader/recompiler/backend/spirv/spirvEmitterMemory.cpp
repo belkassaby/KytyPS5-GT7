@@ -621,7 +621,7 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 		const auto& buffer = state.program.info.buffers[mem.resource];
 		const auto* handle = inst.Arg(0).ResolveInstruction();
 		if (handle == nullptr || buffer.indirect_resources.empty() ||
-		    state.flattened_srt_variable == 0 || buffer.indirect_search_iterations == 0u) {
+		    FlatSrtVariable(state) == 0 || buffer.indirect_search_iterations == 0u) {
 			ctx.Fail(inst, "has no indirect buffer runtime mapping");
 			return;
 		}
@@ -2219,13 +2219,13 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
-	if (state.flattened_srt_variable == 0) {
+	if (FlatSrtVariable(state) == 0) {
 		ctx.Fail(inst, "requires the flattened SRT descriptor");
 	}
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
-	                          state.flattened_srt_variable, ConstantU32(state, 0),
-	                          ctx.Arg(inst, 1));
+	                          FlatSrtVariable(state), ConstantU32(state, 0),
+	                          FlatSrtIndex(state, ctx.Arg(inst, 1)));
 	return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
 }
 

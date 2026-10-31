@@ -24,7 +24,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 6;           // GT7 G1.2: BindingLayout::table_images, samplers.
+constexpr uint32_t FormatVersion = 7;           // GT7 G1.3: BindingLayout::record.
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -202,6 +202,7 @@ void Visit(Io& io, T& v) {
 	io(v.memory_offset_count);
 	io(v.write_tracking);
 	io(v.draw_table);
+	io(v.record);
 	io(v.table_sampler_count);
 	io(v.table_buffers);
 	io(v.table_images);

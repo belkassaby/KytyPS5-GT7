@@ -315,7 +315,8 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
 	}
-	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	pipeline.uses_push_descriptors =
+	    !pipeline.static_bindings && descriptor_count <= graphics.max_push_descriptors;
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors
@@ -644,6 +645,19 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		                  vk::ShaderStageFlagBits::eFragment);
 		pipeline.uses_bindless |= UsesBindless(*ps_input_info->stage.program);
 	}
+	// GT7 G1.3: a pipeline whose every stage is a record with only fixed buffers in set 0.
+	const auto static_stage = [](const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+		using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+		return program.bindings.record &&
+		       std::ranges::all_of(program.bindings.descriptors, [](const auto& binding) {
+			       return binding.kind == Kind::ShaderData || binding.kind == Kind::BdaPagetable ||
+			              binding.kind == Kind::FaultBuffer;
+		       });
+	};
+	pipeline.static_bindings =
+	    std::ranges::all_of(vertex_info,
+	                        [&](const auto& stage) { return static_stage(*stage.stage.program); }) &&
+	    (!ps_active || static_stage(*ps_input_info->stage.program));
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
 	const vk::PushConstantRange push_constants {graphics_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};

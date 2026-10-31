@@ -4360,7 +4360,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	// images' layouts), which uploads the shader data then.
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr &&
-	    program.bindings.table_images.empty() && program.bindings.table_sampler_count == 0) {
+	    program.bindings.table_images.empty() && program.bindings.table_sampler_count == 0 &&
+	    !program.bindings.record) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
 	}
 }
@@ -5072,9 +5073,41 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				}
 			}
 			if (ShaderRecompiler::IR::FindBinding(
-			        layout, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
+			        layout, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr &&
+			    !layout.record) {
 				descriptors.shader_data_buffer = NativeUpload(m_context, prepared->shader_data);
 			}
+		}
+		// GT7 GPU-driven G1.3, level 3: the stage's record, its shader data and then its flattened
+		// SRT (with the bindless patches RebindBuffers applies otherwise), in the stream ring; the
+		// ShaderData binding is the whole ring and the push data the record's offset.
+		uint32_t record_offset = 0;
+		if (layout.record) {
+			const auto&                         snapshot = *prepared->runtime->resources;
+			thread_local std::vector<uint32_t> record;
+			record.assign(prepared->shader_data.begin(), prepared->shader_data.end());
+			const auto srt_begin = record.size();
+			record.insert(record.end(), snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
+			for (const auto& [offset, region, entries]: prepared->bindless_patches) {
+				if (srt_begin + offset + 1u < record.size()) {
+					record[srt_begin + offset]      = region;
+					record[srt_begin + offset + 1u] = entries;
+				}
+			}
+			if (record.empty()) {
+				record.push_back(0);
+			}
+			const auto info = NativeUpload(m_context, record);
+			if (record.size() > srt_begin) {
+				FillFlatSlotsOnGpu(m_context,
+				                   {info.buffer, info.offset + srt_begin * sizeof(uint32_t),
+				                    (record.size() - srt_begin) * sizeof(uint32_t)},
+				                   snapshot.gpu_fills);
+			}
+			EXIT_IF(info.offset % sizeof(uint32_t) != 0);
+			descriptors.shader_data_buffer = {info.buffer, 0, VK_WHOLE_SIZE};
+			record_offset = static_cast<uint32_t>(info.offset / sizeof(uint32_t));
+			::Loader::Gt7NativeDraws::AddG1Record(static_cast<uint32_t>(record.size()));
 		}
 
 		gt7_lap(3);
@@ -5162,8 +5195,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		const auto shader_data_dwords = program.bindings.ShaderDataDwords();
 		EXIT_IF(prepared->shader_data.size() != shader_data_dwords);
 		if (program.bindings.UsesPushData()) {
-			std::ranges::copy(prepared->shader_data,
-			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
+			if (program.bindings.record) {
+				push_data.dwords[program.bindings.push_data_start_dword] = record_offset;
+			} else {
+				std::ranges::copy(prepared->shader_data,
+				                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
+			}
 			has_push_data = true;
 		}
 	}
@@ -5174,7 +5211,44 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		                        push_data.dwords.data());
 	}
 
-	if (!m_descriptor_writes.empty()) {
+	const bool g1_records = ::Loader::Gt7NativeDraws::G1Level() >= 3 &&
+	                        pipeline_bind_point == vk::PipelineBindPoint::eGraphics;
+	if (pipeline.static_bindings && !pipeline.uses_push_descriptors &&
+	    !m_descriptor_writes.empty()) {
+		// GT7 G1.3: set 0 holds only buffers fixed for the session; the set written with them
+		// once is bound (a new one if they ever change: one in use is never rewritten).
+		struct StaticSet {
+			vk::DescriptorSet                     set = nullptr;
+			std::vector<vk::DescriptorBufferInfo> infos;
+		};
+		static std::unordered_map<VkDescriptorSetLayout, StaticSet> static_sets;
+		thread_local std::vector<vk::DescriptorBufferInfo>          infos;
+		infos.clear();
+		for (const auto& write: m_descriptor_writes) {
+			EXIT_IF(write.pBufferInfo == nullptr);
+			infos.insert(infos.end(), write.pBufferInfo, write.pBufferInfo + write.descriptorCount);
+		}
+		auto&      cached  = static_sets[static_cast<VkDescriptorSetLayout>(pipeline.descriptor_set_layout)];
+		const bool written = cached.set == nullptr || cached.infos != infos;
+		if (written) {
+			cached.set   = m_context.GetDescriptorHeap().Persistent(pipeline.descriptor_set_layout);
+			cached.infos = infos;
+			for (auto& write: m_descriptor_writes) {
+				write.dstSet = cached.set;
+			}
+			m_context.GetGraphics().device.updateDescriptorSets(
+			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
+			    nullptr);
+		}
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1,
+		                             &cached.set, 0, nullptr);
+		if (g1_records) {
+			::Loader::Gt7NativeDraws::AddG1Commit(true, written);
+		}
+	} else if (!m_descriptor_writes.empty()) {
+		if (g1_records && ::Loader::Gt7NativeDraws::CurrentMarked()) {
+			::Loader::Gt7NativeDraws::AddG1Commit(false, false);
+		}
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		ScrubDeadDescriptorViews(m_descriptor_writes.data(),
 		                         static_cast<uint32_t>(m_descriptor_writes.size()),
