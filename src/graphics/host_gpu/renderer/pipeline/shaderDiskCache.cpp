@@ -24,7 +24,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 7;           // GT7 G1.3: BindingLayout::record.
+constexpr uint32_t FormatVersion = 8;           // GT7 G3: light grids (Image::grid, table_grids).
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -124,6 +124,7 @@ void Visit(Io& io, T& v) {
 	io(v.bindless);
 	io(v.runtime);
 	io(v.clamp_half_float);
+	io(v.grid);
 	io(v.indirect_resources);
 }
 
@@ -206,6 +207,7 @@ void Visit(Io& io, T& v) {
 	io(v.table_sampler_count);
 	io(v.table_buffers);
 	io(v.table_images);
+	io(v.table_grids);
 	io(v.user_data_registers);
 	io(v.descriptors);
 }
@@ -335,6 +337,7 @@ void Visit(Io& io, T& v) {
 	io(v.bindless);
 	io(v.runtime);
 	io(v.clamp_half_float);
+	io(v.grid);
 }
 
 template <typename Io, typename T>
@@ -392,8 +395,8 @@ static_assert(sizeof(IR::StageInput) == 56);
 static_assert(sizeof(IR::StageOutput) == 48);
 static_assert(sizeof(IR::ShaderInfo) == 192);
 static_assert(sizeof(IR::DescriptorBinding) == 32);
-static_assert(sizeof(IR::BindingLayout) == 128);
-static_assert(sizeof(IR::CompiledShaderInfo) == 360);
+static_assert(sizeof(IR::BindingLayout) == 152);
+static_assert(sizeof(IR::CompiledShaderInfo) == 384);
 static_assert(sizeof(IR::DescriptorSource::IndirectDescriptor) == 120);
 static_assert(sizeof(IR::DescriptorSource::BindlessSampler) == 4);
 static_assert(sizeof(IR::DescriptorSource) == 272);

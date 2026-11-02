@@ -40,6 +40,10 @@ struct ResourceSpecialization {
 		bool                          bindless                   = false;
 		bool                          runtime                        = false;
 		bool                          clamp_half_float               = false;
+		// GT7 G3 (the draw table mode, level 3): a light grid (a linear R32G32_UINT array GT7
+		// writes per draw in its per-frame memory), read by device address at the base and shape
+		// the stage's record gives (BindingLayout::table_grids).
+		bool                          grid                           = false;
 		bool                          operator==(const Image&) const = default;
 	};
 

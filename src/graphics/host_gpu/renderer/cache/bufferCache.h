@@ -104,6 +104,9 @@ public:
 	// caller's draw relies on the BDA walk for that (RenderContext::PrepareBda, once a guest
 	// submission and after a wait that passed). Null when no single buffer holds the range.
 	[[nodiscard]] Buffer* TakeOwnerUnsynced(uint64_t vaddr, uint64_t size);
+	// The same, synchronized as ObtainBuffer synchronizes a read binding (the CPU's writes
+	// uploaded now): what a G3 bypassed draw reads, as its full path would.
+	[[nodiscard]] Buffer* TakeOwnerSynced(uint64_t vaddr, uint64_t size);
 	// needs_device_address: the caller reads the data through a buffer device address, which
 	// the stream buffer used for small CPU-written reads does not have.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,

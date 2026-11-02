@@ -2894,6 +2894,22 @@ static bool G3SameRendering(const RenderState& a, const RenderState& b) {
 	return true;
 }
 
+// Why a draw found no whole record, in detail, every 10 s ("GT7 G3 records missing").
+static void G3NoteMissing(const char* why) {
+	static std::map<std::string, uint64_t> counts;
+	static auto                            last = std::chrono::steady_clock::now();
+	counts[why]++;
+	if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(10)) {
+		std::string text;
+		for (const auto& [reason, count]: counts) {
+			text += fmt::format(", {} {}", reason, count);
+		}
+		LOGF("GT7 G3 records missing (10 s)%s\n", text.c_str());
+		counts.clear();
+		last = now;
+	}
+}
+
 bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& args,
                                  const DrawIndexBufferSource& index_source) {
 	using namespace ::Loader::Gt7NativeDraws;
@@ -2922,6 +2938,9 @@ bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& arg
 	for (uint32_t s = 0; s < stage_count; s++) {
 		const auto* shadow = shadows[s];
 		if (shadow == nullptr || !shadow->layout || shadow->shader_hash != learned.shader_hashes[s]) {
+			G3NoteMissing(shadow == nullptr  ? (s == 0 ? "vertex: none" : "pixel: none")
+			              : !shadow->layout  ? (s == 0 ? "vertex: no layout" : "pixel: no layout")
+			                                 : (s == 0 ? "vertex: another shader" : "pixel: another shader"));
 			return result(G3NoShadow);
 		}
 		if (std::ranges::find(shadow->image_slots, 0u) != shadow->image_slots.end() ||
@@ -2929,10 +2948,19 @@ bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& arg
 			return result(G3ImageUnpublished);
 		}
 	}
-	const auto* rendering = m_context.GetCommandScheduler().Current().RenderingState();
-	if (rendering == nullptr || !G3SameRendering(*rendering, learned.rendering)) {
+	const auto* open = m_context.GetCommandScheduler().Current().RenderingState();
+	if (open == nullptr || !G3SameRendering(*open, learned.rendering)) {
 		return result(G3RenderingDiffers);
 	}
+	// The synchronizations below may record uploads, which end the rendering: it is begun again,
+	// loading what is there, before the draw.
+	auto rendering_state = *open;
+	for (auto& color: rendering_state.color_attachments) {
+		color.is_clear = false;
+	}
+	rendering_state.depth_stencil_attachment.depth_clear   = false;
+	rendering_state.depth_stencil_attachment.stencil_clear = false;
+	const RenderState* rendering = &rendering_state;
 	auto&      textures = m_context.GetTextureCache();
 	const auto tick     = m_context.GetCommandScheduler().CurrentTick();
 	for (uint32_t s = 0; s < stage_count; s++) {
@@ -2947,15 +2975,27 @@ bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& arg
 			}
 		}
 	}
-	auto* index = m_context.GetBufferCache().TakeOwnerUnsynced(index_source.address, index_source.size);
-	if (index == nullptr) {
-		return result(G3IndexBuffer);
+	// The index buffer: its buffer as is (the BDA walk synchronizes it), or, for one no buffer
+	// holds (small CPU-written index data goes to the stream ring), the buffer cache's usual way.
+	vk::Buffer     index_handle = nullptr;
+	vk::DeviceSize index_offset = 0;
+	if (auto* index = m_context.GetBufferCache().TakeOwnerSynced(index_source.address,
+	                                                              index_source.size);
+	    index != nullptr) {
+		index_handle = index->Handle();
+		index_offset = index->Offset(index_source.address);
 	}
 	// The vertex buffers, from the record's vertex table ranges.
 	PreparedVertexBuffers vertex_buffers;
 	if (learned.vertex_slots != 0) {
 		const auto& vertex = *shadows[0];
 		if (!vertex.vertex || vertex.vertex_address.size() != learned.vertex_slots) {
+			static constexpr const char* whys[6] = {"vertex table: slots differ", "vertex table: not learned",
+			                                        "vertex table: not in the user data",
+			                                        "vertex table: unreadable",
+			                                        "vertex table: attributes disagree",
+			                                        "vertex table: constant attribute"};
+			G3NoteMissing(whys[std::min<uint32_t>(vertex.vertex_why, 5)]);
 			return result(G3NoShadow);
 		}
 		auto& cache          = m_context.GetBufferCache();
@@ -2965,7 +3005,7 @@ bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& arg
 				vertex_buffers.buffers[i] = cache.GetBuffer(NULL_BUFFER_ID).Handle();
 				continue;
 			}
-			auto* owner = cache.TakeOwnerUnsynced(vertex.vertex_address[i], vertex.vertex_size[i]);
+			auto* owner = cache.TakeOwnerSynced(vertex.vertex_address[i], vertex.vertex_size[i]);
 			if (owner == nullptr) {
 				return result(G3BufferRange);
 			}
@@ -2981,12 +3021,20 @@ bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& arg
 			return result(G3BufferRange);
 		}
 	}
-	// The CPU's writes the records' buffers and the indices read: synchronized once a submission.
-	m_context.PrepareBda();
+	// Every buffer the draw reads was synchronized as its full path would (TakeOwnerSynced).
+	if (index_handle == nullptr) {
+		auto [buffer_ptr, offset] = m_context.GetBufferCache().ObtainBuffer(index_source.address,
+		                                                                    index_source.size, false);
+		index_handle = buffer_ptr->Handle();
+		index_offset = offset;
+	}
+	if (!m_context.GetCommandScheduler().Current().IsRendering()) {
+		m_context.GetCommandScheduler().BeginRendering(rendering_state);
+	}
 
 	const auto vk_buffer = buffer.Recorder();
 	CommitVertexBuffers(vk_buffer, vertex_buffers);
-	vk_buffer.bindIndexBuffer(index->Handle(), index->Offset(index_source.address), index_source.type);
+	vk_buffer.bindIndexBuffer(index_handle, index_offset, index_source.type);
 	ShaderVertexInputInfo vertex_info;
 	vertex_info.stage.program = &learned.vertex_program;
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_info, learned.depth, *rendering);

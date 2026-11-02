@@ -2579,6 +2579,14 @@ Buffer* BufferCache::TakeOwnerUnsynced(uint64_t vaddr, uint64_t size) {
 	return &buffer;
 }
 
+Buffer* BufferCache::TakeOwnerSynced(uint64_t vaddr, uint64_t size) {
+	auto* buffer = TakeOwnerUnsynced(vaddr, size);
+	if (buffer != nullptr) {
+		(void)SynchronizeBuffer(*buffer, vaddr, size, false, false);
+	}
+	return buffer;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, uint64_t size,
                                                               uint64_t written_vaddr,
                                                               uint64_t written_size, BufferId id) {

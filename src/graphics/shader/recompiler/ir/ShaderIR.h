@@ -174,6 +174,8 @@ struct ImageResource {
 	// A storage image of a 16-bit float format: its stores clamp finite values beyond the format's
 	// range to the largest half (65504), as the guest GPU's conversion does (FloatStoreClamp).
 	bool                          clamp_half_float = false;
+	// ResourceSpecialization::Image::grid: loads read guest memory (no descriptor binding).
+	bool                          grid = false;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -497,6 +499,10 @@ struct BindingLayout {
 	uint32_t                       table_sampler_count = 0;
 	std::vector<uint32_t>          table_buffers;
 	std::vector<uint32_t>          table_images;
+	// The light grids (ImageResource::grid): GridDwords words each from GridDword(): the device
+	// address of its first byte (2: in the buffer cache's buffer that holds it, synchronized by the
+	// host for the draw), width, height, layers, row pitch and layer stride in bytes.
+	std::vector<uint32_t>          table_grids;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
@@ -515,8 +521,10 @@ struct BindingLayout {
 	[[nodiscard]] uint32_t SamplerSlotDword() const {
 		return ImageSlotDword() + static_cast<uint32_t>(table_images.size());
 	}
+	static constexpr uint32_t GridDwords = 7;
+	[[nodiscard]] uint32_t GridDword() const { return SamplerSlotDword() + table_sampler_count; }
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
-		return SamplerSlotDword() + table_sampler_count;
+		return GridDword() + GridDwords * static_cast<uint32_t>(table_grids.size());
 	}
 	// The record's flattened SRT, after its shader data.
 	[[nodiscard]] uint32_t FlatSrtDword() const { return ShaderDataDwords(); }
@@ -537,7 +545,7 @@ struct BindingLayout {
 // An image the draw table mode (level 2) reads by bindless slot: a plain sampled image of a
 // dimension the bindless arrays have (2D, 2D array, cube, 3D), one view, not chosen by a key.
 [[nodiscard]] inline bool TableImage(const ImageResource& image) {
-	return image.resource_class == ImageResourceClass::Sampled && !image.atomic &&
+	return image.resource_class == ImageResourceClass::Sampled && !image.atomic && !image.grid &&
 	       !image.bindless && !image.runtime && image.mip_mode != ImageMipMode::Dynamic &&
 	       image.mip_count == 1u && image.indirect_root == ImageResource::NoIndirectImage &&
 	       image.indirect_resources.empty() &&

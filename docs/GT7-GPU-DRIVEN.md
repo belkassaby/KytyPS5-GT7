@@ -539,3 +539,37 @@ What GPU-driven rendering needs instead, in order:
   at the run's end, executes the run with one `vkCmdExecuteGeneratedCommandsEXT` and skips the
   run's draw packets. The pipelines of covered draws join an indirect execution set (one shared
   layout: G1.3's static set).
+
+## G3.2, the bypass working; light grids from guest memory (2026-11-02)
+
+- **Light grids** (a linear R32G32_UINT array GT7 writes per draw, ~70 % of covered draws had
+  one): a full-path draw learns each (shader, image) light grid's shape from Kyty's texture
+  (width, height, layers, row pitch, layer stride); at level 3 the program is specialized with
+  `Image::grid` and its loads read the grid by device address (`ImageRead` lowered to two dword
+  loads at base + layer * stride + y * pitch + x * 8; out of range reads zero). The record holds
+  the grid's base and shape (`BindingLayout::table_grids`, 7 words), the render thread's shadow
+  too (`Gt7NativeWalk::GridWords`). Shader disk cache format 8.
+- **Vertex tables**: matched by stride, records and a base at most 4 KB below (Kyty's V# is the
+  table's with the attribute offset added and its format rewritten); read by the render thread
+  through `FindBacking` (`TryReadGpuCleanBacking` serves the GPU thread only: it refused every
+  read on the render threads).
+- **Index buffers** no single buffer holds (small CPU-written ones go to the stream ring): the
+  usual `ObtainBuffer`.
+
+Races (`_g3-bypass5.txt`, `_g3-bypass6.txt`), 10 s windows:
+
+| | unsynchronized (BDA walk) | synchronized per draw |
+|---|---|---|
+| covered draws bypassed | 58 to 70 %, 1.7 to 2.1 us each | 51 to 66 %, 2.7 to 3.3 us each |
+| full path: buffer range / rendering differs / not learned | 19 to 31 % / 4 to 5 % / 3 to 5 % | 18 to 27 % / 4 to 5 % / 5 to 8 % |
+| write faults | **49,000 to 61,000/s, 920 to 950 ms/s in handlers** (18,000/s before) | 20,000 to 49,000/s while shaders compiled |
+| picture | **flickering**: world map icons, rally menu, pre-race textures, flashes in the race | flicker gone (the user) |
+| frame rate | ~15 (the faults cost GT7's threads what the bypass saved) | not measured (shaders compiling) |
+
+Leaving the bypassed draws' buffers to the BDA walk made them read data one sync older than the
+full path's draws of the same objects (the flicker), and the walk's protection of whole regions
+made GT7's threads fault on most of their writes. Synchronizing each range as the full path does
+(`BufferCache::TakeOwnerSynced`; the light grid's base a device address of the cache's
+synchronized copy; images with CPU writes pending go the full path) fixes the picture. It is a
+CPU stopgap: the GPU-side answer is the GPU reading guest memory in place (imported host memory,
+`VK_EXT_external_memory_host`; `KYTY_HOST_IMPORT_PROBE`), with no copies to synchronize at all.

@@ -1304,6 +1304,72 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    BindlessSamplerSlot(ctx, state.program.info.samplers[mem.sampler], inst.Arg(1));
 	}
 	const auto* address = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
+	if (image.grid) {
+		// GT7 G3: a light grid, linear R32G32_UINT: texel (x, y, layer) at base + layer * layer
+		// stride + y * row pitch + x * 8 (a device address), all from the stage's record; out of
+		// range reads zero.
+		if (op != IR::ValueOpcode::ImageRead) {
+			ctx.Fail(inst, "reads a light grid other than by a load");
+			return;
+		}
+		const auto& grids = state.program.bindings.table_grids;
+		const auto  found = std::ranges::find(grids, mem.resource);
+		EXIT_IF(found == grids.end());
+		const auto first = state.program.bindings.GridDword() +
+		                   IR::BindingLayout::GridDwords * static_cast<uint32_t>(found - grids.begin());
+		const auto word = [&](uint32_t i) { return EmitShaderDataDwordLoad(state, first + i); };
+		const auto u64  = TypeScalarU64(state);
+		const auto wide = [&](uint32_t value) { return Unary(state, spv::OpUConvert, u64, value); };
+		const auto components = ImageDimensionInfoFor(image.dimension).coordinate_components;
+		const auto x          = AddressU32(ctx, mem, *address, 0);
+		const auto y = components > 1u && mem.image_address_components > 1u
+		                   ? AddressU32(ctx, mem, *address, 1)
+		                   : ConstantU32(state, 0);
+		const auto layer = components > 2u && mem.image_address_components > 2u
+		                       ? AddressU32(ctx, mem, *address, 2)
+		                       : ConstantU32(state, 0);
+		const auto base = Binary(state, spv::OpBitwiseOr, u64, wide(word(0)),
+		                         Binary(state, spv::OpShiftLeftLogical, u64, wide(word(1)),
+		                                ConstantDeviceAddress(state, 32)));
+		const auto less = [&](uint32_t a, uint32_t b) {
+			return Binary(state, spv::OpULessThan, TypeBool(state), a, b);
+		};
+		const auto both = [&](uint32_t a, uint32_t b) {
+			return Binary(state, spv::OpLogicalAnd, TypeBool(state), a, b);
+		};
+		const auto inside = both(ctx.Arg(inst, 2),
+		                         both(less(x, word(2)), both(less(y, word(3)), less(layer, word(4)))));
+		const auto texel_address = Binary(
+		    state, spv::OpIAdd, u64, base,
+		    Binary(state, spv::OpIAdd, u64,
+		           Binary(state, spv::OpIMul, u64, wide(layer), wide(word(6))),
+		           Binary(state, spv::OpIAdd, u64, Binary(state, spv::OpIMul, u64, wide(y), wide(word(5))),
+		                  Binary(state, spv::OpShiftLeftLogical, u64, wide(x),
+		                         ConstantDeviceAddress(state, 3)))));
+		ctx.Define(inst, EmitValueOrDefaultIfCondition(
+		                     state, inside, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4),
+		                     [&]() {
+			                     const auto load = [&](uint32_t at) {
+				                     const auto pointer =
+				                         Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), at);
+				                     const auto value = state.builder.AllocateId();
+				                     state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+				                                               spv::MemoryAccessAlignedMask,
+				                                               static_cast<uint32_t>(sizeof(uint32_t)));
+				                     return value;
+			                     };
+			                     const auto low  = load(texel_address);
+			                     const auto high = load(Binary(state, spv::OpIAdd, u64, texel_address,
+			                                                   ConstantDeviceAddress(state, 4)));
+			                     const auto color = state.builder.AllocateId();
+			                     state.builder.AddFunction(spv::OpCompositeConstruct,
+			                                               TypeU32Vector(state, 4), color, low, high,
+			                                               ConstantU32(state, 0), ConstantU32(state, 1));
+			                     return ResultVector(ctx, UnpackImageTexel(ctx, mem, color),
+			                                         image.numeric_class, false, mem);
+		                     }));
+		return;
+	}
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
 		ctx.Define(inst, QueryDimensions(ctx, mem, *address));

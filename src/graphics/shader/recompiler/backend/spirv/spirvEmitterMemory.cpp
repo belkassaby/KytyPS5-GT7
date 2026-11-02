@@ -1444,6 +1444,10 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 
 } // namespace
 
+uint32_t LoadGuestDword(ValueEmitContext& ctx, uint32_t address) {
+	return LoadBdaDword(ctx, address);
+}
+
 uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value) {
 	return state.builder.Constant(spv::OpConstant, TypeScalarU64(state),
 	                              static_cast<uint32_t>(value),

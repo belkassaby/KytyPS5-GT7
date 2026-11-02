@@ -86,11 +86,25 @@ struct ShadowRecord {
 	// vertex buffer slot's guest range (0 bytes: not fetched), and the draw's vertex and instance
 	// offsets from its user data; `vertex` false when the table was not learned or not readable.
 	bool                  vertex          = false;
+	// Why `vertex` is false: 1 no table learned, 2 its address not in the user data, 3 the table
+	// unreadable (GPU-written or unmapped), 4 a slot's attributes disagree, 5 a constant attribute.
+	uint8_t               vertex_why      = 0;
 	std::vector<uint64_t> vertex_address;
 	std::vector<uint64_t> vertex_size;
 	int32_t               vertex_offset   = 0;
 	uint32_t              instance_offset = 0;
+	// The light grids' words (BindingLayout::GridDwords each: base, shape), empty when one's shape
+	// is not known or its descriptor does not match it.
+	std::vector<uint32_t> grid_words;
 };
+
+// G3 light grids (any thread): whether image `image` of the shader `shader_hash` was seen as a
+// light grid by a full-path draw (so its loads may read guest memory: ResourceSpecialization::
+// Image::grid); and a grid's record words from its T# (the learned shape: false when the T# does
+// not match it).
+[[nodiscard]] bool KnownGrid(uint64_t shader_hash, uint32_t image);
+[[nodiscard]] bool GridWords(uint64_t shader_hash, uint32_t image, const uint32_t* tsharp,
+                             uint32_t* words);
 
 // Render thread, right after Prepare (the GPU thread may take the prepared stage's resources).
 void BuildShadow(uint64_t key, const DrawPrep::StageResult& prepared, ShadowRecord* shadow);

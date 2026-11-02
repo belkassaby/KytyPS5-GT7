@@ -1059,7 +1059,18 @@ struct G3Layout {
 	std::vector<uint32_t>                            images;
 	std::vector<ShaderRecompiler::IR::ImageResource> image_resources;
 	std::vector<ShaderRecompiler::IR::SamplerResource> samplers;
+	std::vector<uint32_t>                            grids;
 };
+// G3 light grids: each (shader, image) a full-path draw found a light grid, with the shape
+// Kyty's texture had (linear R32G32_UINT: a row pitch and a layer stride in bytes).
+struct G3Grid {
+	uint32_t width = 0, height = 0, layers = 0, pitch_bytes = 0, layer_bytes = 0;
+};
+std::unordered_map<uint64_t, G3Grid> g_g3_grids;
+uint64_t G3GridKey(uint64_t shader_hash, uint32_t image) {
+	return shader_hash * 0x9e3779b97f4a7c15ull + image;
+}
+
 struct G3ImageSlot {
 	uint32_t slot    = 0;
 	uint64_t address = 0;
@@ -3988,6 +3999,23 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			binding       = {id, nullptr, std::move(desc)};
 		}
 		const bool grid    = pixel && IsLightGridBinding(program.info.images[i], binding);
+		if (grid && ::Loader::Gt7NativeDraws::G3Use() && ::Loader::Gt7NativeDraws::CurrentMarked()) {
+			// G3: this image of this shader is a light grid; its shape, once (the T# must name
+			// the texture's own memory, linear, one level).
+			thread_local std::unordered_set<uint64_t> learned_grids;
+			const auto key  = G3GridKey(program.shader_hash, i);
+			const auto& info = binding.desc.info;
+			const auto  tsharp = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
+			if (!learned_grids.contains(key) && !info.IsTiled() && info.resources.levels == 1 &&
+			    info.resources.layers != 0 && info.data.address == tsharp.Base40() &&
+			    info.bytes_per_block == 8u && info.pitch != 0) {
+				learned_grids.insert(key);
+				std::unique_lock lock(g_g3_mutex);
+				g_g3_grids[key] = {info.extent.width, info.extent.height, info.resources.layers,
+				                   info.pitch * 8u,
+				                   static_cast<uint32_t>(info.data.size / info.resources.layers)};
+			}
+		}
 		if (grid) {
 			// Its later uploads are checked (TextureCache::CheckLightGridUpload), and what this
 			// binding reads (CheckLightGridView).
@@ -4385,7 +4413,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto& source = prepared.buffer_sources[i];
 		Buffer*     direct = nullptr;
 		if (prepared.g3_buffers && source.size != 0) {
-			direct = m_context.GetBufferCache().TakeOwnerUnsynced(source.address, source.size);
+			direct = m_context.GetBufferCache().TakeOwnerSynced(source.address, source.size);
 		}
 		const auto alignment = m_context.GetGraphics().StorageMinAlignment();
 		const auto direct_offset =
@@ -4801,7 +4829,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		for (auto* stage: stages) {
 			FindBuffers(*stage);
 			// GT7 G3.1: the record's buffers are synchronized by the BDA walk.
-			uses_dma |= stage->runtime->program->info.uses_dma || stage->g3_buffers;
+			uses_dma |= stage->runtime->program->info.uses_dma;
 		}
 	}
 	if (uses_dma) {
@@ -4864,12 +4892,30 @@ bool G3SlotReady(TextureCache& textures, uint32_t array, uint32_t slot, uint64_t
 	const auto& kept  = g_g3_slot_bindings[array][slot];
 	auto*       image = textures.TryGetImage(kept.id);
 	if (kept.view == nullptr || image == nullptr || !image->registered || image->depth_id ||
-	    image->binding.needs_rebind || image->binding.is_target ||
+	    image->binding.needs_rebind || image->binding.is_target || image->IsCpuDirty() ||
 	    image->CurrentLayout() != kept.layout ||
 	    textures.RangeStamp(kept.desc.info.data.address, kept.desc.info.data.size) != kept.stamp) {
 		return false;
 	}
 	image->tick_accessed_last = std::max(image->tick_accessed_last, tick);
+	return true;
+}
+
+// A light grid's record words: its guest base (words 0-1) turned into the device address of the
+// buffer cache's synchronized copy (the grid's layers, as ObtainBuffer gives a read binding).
+static bool G3GridDeviceAddress(RenderContext& context, uint32_t* words) {
+	const uint64_t guest = static_cast<uint64_t>(words[0]) | (static_cast<uint64_t>(words[1]) << 32u);
+	const uint64_t size  = static_cast<uint64_t>(words[4]) * words[6];
+	if (guest < BufferCache::CACHING_PAGESIZE || size == 0) {
+		return false;
+	}
+	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(guest, size, false, false, {}, true);
+	if (buffer == nullptr || !buffer->HasDeviceAddress()) {
+		return false;
+	}
+	const auto device = buffer->BufferDeviceAddress() + offset;
+	words[0]          = static_cast<uint32_t>(device);
+	words[1]          = static_cast<uint32_t>(device >> 32u);
 	return true;
 }
 
@@ -4893,7 +4939,7 @@ uint32_t G3WriteRecord(RenderContext& context, const ShaderRecompiler::IR::Bindi
 		if (size == 0) {
 			continue; // a null binding: no address, no length
 		}
-		auto* buffer = cache.TakeOwnerUnsynced(address, size);
+		auto* buffer = cache.TakeOwnerSynced(address, size);
 		if (buffer == nullptr) {
 			return UINT32_MAX;
 		}
@@ -4913,6 +4959,18 @@ uint32_t G3WriteRecord(RenderContext& context, const ShaderRecompiler::IR::Bindi
 	          words.begin() + layout.ImageSlotDword());
 	std::copy(shadow.sampler_slots.begin(), shadow.sampler_slots.end(),
 	          words.begin() + layout.SamplerSlotDword());
+	if (shadow.grid_words.size() !=
+	    ShaderRecompiler::IR::BindingLayout::GridDwords * layout.table_grids.size()) {
+		return UINT32_MAX;
+	}
+	std::copy(shadow.grid_words.begin(), shadow.grid_words.end(), words.begin() + layout.GridDword());
+	for (size_t g = 0; g < layout.table_grids.size(); g++) {
+		if (!G3GridDeviceAddress(context,
+		                         words.data() + layout.GridDword() +
+		                             ShaderRecompiler::IR::BindingLayout::GridDwords * g)) {
+			return UINT32_MAX;
+		}
+	}
 	auto&      ring         = cache.GetUtilityBuffer(MemoryUsage::Stream);
 	const auto total        = std::max<size_t>(words.size() + shadow.srt.size(), 1u);
 	const auto [mapped, at] = ring.Map(total * sizeof(uint32_t), 256);
@@ -4950,6 +5008,7 @@ static void G3Compare(TextureCache& textures, const ShaderRecompiler::IR::Compil
 			if (layout.table_sampler_count != 0) {
 				g3->samplers = program.info.samplers;
 			}
+			g3->grids = layout.table_grids;
 			std::unique_lock lock(g_g3_mutex);
 			g_g3_layouts[key] = std::move(g3);
 		}
@@ -5452,6 +5511,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		// SRT (with the bindless patches RebindBuffers applies otherwise), in the stream ring; the
 		// ShaderData binding is the whole ring and the push data the record's offset.
 		uint32_t record_offset = 0;
+		for (size_t g = 0; g < layout.table_grids.size(); g++) {
+			const auto resource = layout.table_grids[g];
+			auto*      words    = prepared->shader_data.data() + layout.GridDword() +
+			                      ShaderRecompiler::IR::BindingLayout::GridDwords * g;
+			if (!Gt7NativeWalk::GridWords(program.shader_hash, resource,
+			                              prepared->runtime->resources->images.at(resource).dwords.data(),
+			                              words) ||
+			    !G3GridDeviceAddress(m_context, words)) {
+				std::fill_n(words, ShaderRecompiler::IR::BindingLayout::GridDwords, 0u);
+			}
+		}
 		if (layout.record) {
 			// Written straight into the mapped ring (write-only: the ring may be write-combined).
 			const auto  record_start = std::chrono::steady_clock::now();
@@ -5564,7 +5634,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
 			if (std::ranges::find(program.bindings.table_images, i) !=
-			    program.bindings.table_images.end()) {
+			        program.bindings.table_images.end() ||
+			    program.info.images[i].grid) {
 				EXIT_IF(m_image_occurrences[i] != 0);
 				continue;
 			}
@@ -5762,6 +5833,38 @@ uint32_t ResolveBuffers(uint64_t key, const ShaderRecompiler::IR::ResourceSnapsh
 	return count;
 }
 
+bool KnownGrid(uint64_t shader_hash, uint32_t image) {
+	std::shared_lock lock(g_g3_mutex);
+	return g_g3_grids.contains(G3GridKey(shader_hash, image));
+}
+
+bool GridWords(uint64_t shader_hash, uint32_t image, const uint32_t* tsharp, uint32_t* words) {
+	G3Grid grid;
+	{
+		std::shared_lock lock(g_g3_mutex);
+		const auto       it = g_g3_grids.find(G3GridKey(shader_hash, image));
+		if (it == g_g3_grids.end()) {
+			return false;
+		}
+		grid = it->second;
+	}
+	ShaderTextureResource t;
+	std::copy_n(tsharp, 8, t.fields);
+	if (t.IsNull() || static_cast<uint32_t>(t.Width5()) + 1u != grid.width ||
+	    static_cast<uint32_t>(t.Height5()) + 1u != grid.height) {
+		return false;
+	}
+	const auto base = t.Base40();
+	words[0]        = static_cast<uint32_t>(base);
+	words[1]        = static_cast<uint32_t>(base >> 32u);
+	words[2]        = grid.width;
+	words[3]        = grid.height;
+	words[4]        = grid.layers;
+	words[5]        = grid.pitch_bytes;
+	words[6]        = grid.layer_bytes;
+	return true;
+}
+
 void BuildShadow(uint64_t key, const DrawPrep::StageResult& prepared, ShadowRecord* shadow) {
 	std::shared_ptr<const G3Layout> layout;
 	{
@@ -5824,6 +5927,16 @@ void BuildShadow(uint64_t key, const DrawPrep::StageResult& prepared, ShadowReco
 		        : 0u);
 	}
 	shadow->srt.assign(res.flattened_srt.begin(), res.flattened_srt.end());
+	shadow->grid_words.resize(ShaderRecompiler::IR::BindingLayout::GridDwords * layout->grids.size());
+	for (size_t g = 0; g < layout->grids.size(); g++) {
+		const auto resource = layout->grids[g];
+		if (resource >= res.images.size() ||
+		    !GridWords(layout->shader_hash, resource, res.images[resource].dwords.data(),
+		               shadow->grid_words.data() + ShaderRecompiler::IR::BindingLayout::GridDwords * g)) {
+			shadow->grid_words.clear();
+			break;
+		}
+	}
 	// The vertex stage's vertex buffers from its vertex table, as Kyty's draw describes them
 	// (ShaderDetectBuffers: a slot starts at its lowest attribute's base, stride times records).
 	std::shared_ptr<const G3VertexTable> vertex;
@@ -5834,6 +5947,7 @@ void BuildShadow(uint64_t key, const DrawPrep::StageResult& prepared, ShadowReco
 		}
 	}
 	if (vertex == nullptr || vertex->table_index + 1u >= res.user_data.size()) {
+		shadow->vertex_why = vertex == nullptr ? 1 : 2;
 		return;
 	}
 	const uint64_t table = static_cast<uint64_t>(res.user_data[vertex->table_index]) |
@@ -5844,11 +5958,17 @@ void BuildShadow(uint64_t key, const DrawPrep::StageResult& prepared, ShadowReco
 			entries = std::max(entries, entry.index + 1u);
 		}
 	}
+	// The table is in the render thread's own command buffer memory (the CPU writes it, the GPU
+	// never does): its backing, through this thread's mapping cache, as the record's walk reads.
 	std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4> words {};
-	if (table < BufferCache::CACHING_PAGESIZE || entries > ShaderVertexInputInfo::RES_MAX ||
-	    !Libs::LibKernel::Memory::TryReadGpuCleanBacking(table, words.data(), entries * 16u)) {
+	const uint8_t* backing = table < BufferCache::CACHING_PAGESIZE || entries > ShaderVertexInputInfo::RES_MAX
+	                             ? nullptr
+	                             : Libs::LibKernel::Memory::FindBacking(table, entries * 16u);
+	if (backing == nullptr) {
+		shadow->vertex_why = 3;
 		return;
 	}
+	std::memcpy(words.data(), backing, entries * 16u);
 	for (const auto& slot: vertex->slots) {
 		uint64_t base    = UINT64_MAX;
 		uint64_t size    = 0;
@@ -5858,6 +5978,7 @@ void BuildShadow(uint64_t key, const DrawPrep::StageResult& prepared, ShadowReco
 			ShaderBufferResource r;
 			std::copy_n(words.begin() + entry.index * 4u, 4, r.fields);
 			if (base != UINT64_MAX && (r.Stride() != stride || r.NumRecords() != records)) {
+				shadow->vertex_why = 4;
 				return; // as the draw path, which ends the emulator on it
 			}
 			base    = std::min(base, r.Base48() + entry.offset);
@@ -5866,6 +5987,9 @@ void BuildShadow(uint64_t key, const DrawPrep::StageResult& prepared, ShadowReco
 		}
 		if (!slot.empty()) {
 			if (stride == 0) {
+				shadow->vertex_why = 5;
+				shadow->vertex_address.clear();
+				shadow->vertex_size.clear();
 				return; // a constant attribute: its size rule is not done here
 			}
 			size = static_cast<uint64_t>(stride) * records;

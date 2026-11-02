@@ -1370,7 +1370,8 @@ uint64_t SpecializationHash(const ShaderRecompiler::IR::ResourceSpecialization& 
 		     static_cast<uint32_t>(image.cube) | (static_cast<uint32_t>(image.fmask) << 1u) |
 		         (static_cast<uint32_t>(image.bindless) << 2u) |
 		         (static_cast<uint32_t>(image.runtime) << 3u) |
-		         (static_cast<uint32_t>(image.clamp_half_float) << 4u),
+		         (static_cast<uint32_t>(image.clamp_half_float) << 4u) |
+		         (static_cast<uint32_t>(image.grid) << 5u),
 		     static_cast<uint32_t>(image.fmask_fragments)});
 	}
 	for (const auto& sampler: specialization.samplers) {
@@ -2669,7 +2670,7 @@ struct PipelineCache::ProgramCache {
 	// with the bindless table), when their program has no indirect buffer. Every other stage is
 	// not (a stage snapshot is reused by the next draw's walk). The scanner's hash is made without
 	// the mode; the level toggles its salt.
-	void ApplyDrawTableMode(ShaderType stage, StageSnapshot& snapshot) const {
+	void ApplyDrawTableMode(ShaderType stage, StageSnapshot& snapshot, uint64_t shader_hash) const {
 		auto& specialization = snapshot.specialization;
 		const auto level     = ::Loader::Gt7NativeDraws::G1Level();
 		const bool table =
@@ -2692,6 +2693,25 @@ struct PipelineCache::ProgramCache {
 			snapshot.specialization_hash_valid = snapshot.specialization_hash != 0;
 		}
 		specialization.draw_table = want;
+		ApplyGrids(stage, snapshot, shader_hash);
+	}
+
+	// G3: at level 3, the pixel stage's images seen as light grids read guest memory. The flags
+	// change the specialization: its hash is not the scanner's then.
+	static void ApplyGrids(ShaderType stage, StageSnapshot& snapshot, uint64_t shader_hash) {
+		auto&      specialization = snapshot.specialization;
+		const bool records        = specialization.draw_table >= 3u && stage == ShaderType::Pixel;
+		bool       changed        = false;
+		for (uint32_t i = 0; i < specialization.images.size(); i++) {
+			const bool grid = records && Gt7NativeWalk::KnownGrid(shader_hash, i);
+			if (specialization.images[i].grid != grid) {
+				specialization.images[i].grid = grid;
+				changed                       = true;
+			}
+		}
+		if (changed) {
+			snapshot.specialization_hash_valid = false;
+		}
 	}
 
 	// The first materialization of a new source; a failure skips this draw (see Get).
@@ -2709,7 +2729,7 @@ struct PipelineCache::ProgramCache {
 			                                                snapshot.resources, snapshot.specialization);
 		}
 		if (ok) {
-			ApplyDrawTableMode(stage, snapshot);
+			ApplyDrawTableMode(stage, snapshot, hash);
 			return true;
 		}
 		if (!ShaderFailureNonFatal()) {
@@ -3002,7 +3022,7 @@ struct PipelineCache::ProgramCache {
 					                                             : 0);
 				}
 			}
-			ApplyDrawTableMode(stage, snapshot);
+			ApplyDrawTableMode(stage, snapshot, params.hash);
 			// Round 79: by the hash the scanner made, when there is one (comparing the
 			// specializations themselves read the scanner's freshly written vectors: ~2 % of the
 			// GPU thread in a race). KYTY_BISECT's spechash:off compares them again.

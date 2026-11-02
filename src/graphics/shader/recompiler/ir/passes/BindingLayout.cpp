@@ -141,6 +141,8 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			if (TableImage(program.info.images[i])) {
 				next.table_images.push_back(i);
+			} else if (program.info.images[i].grid) {
+				next.table_grids.push_back(i);
 			}
 		}
 		next.table_sampler_count = static_cast<uint32_t>(program.info.samplers.size());
@@ -164,8 +166,9 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 
 	std::array<std::vector<uint32_t>, ImageBindingCount> image_groups;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		if (std::ranges::find(next.table_images, i) != next.table_images.end()) {
-			continue; // by bindless slot (draw table mode)
+		if (std::ranges::find(next.table_images, i) != next.table_images.end() ||
+		    program.info.images[i].grid) {
+			continue; // by bindless slot, or a light grid from guest memory (draw table mode)
 		}
 		const auto kind = DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {

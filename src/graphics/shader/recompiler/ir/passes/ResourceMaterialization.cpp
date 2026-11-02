@@ -1992,6 +1992,27 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||
 	        program.info.images.size() > specialization.images.size());
 	program.draw_table = specialization.draw_table;
+	// The light grids (G3): only images the program loads and nothing else; their loads read
+	// guest memory, through the BDA page table.
+	for (uint32_t index = 0; index < program.info.images.size() && index < specialization.images.size();
+	     ++index) {
+		bool grid = specialization.images[index].grid;
+		for (const auto* block: program.blocks) {
+			for (const auto& inst: *block) {
+				if (!grid) {
+					break;
+				}
+				const auto op = inst.GetOpcode();
+				if (ImageOpcodeInfoOf(op).access == ImageAccess::None || op == ValueOpcode::ImageRead) {
+					continue;
+				}
+				const auto memory = inst.Flags<MemoryFlags>().index;
+				grid = memory >= program.memory_info.size() ||
+				       program.memory_info[memory].resource != index;
+			}
+		}
+		program.info.images[index].grid = grid;
+	}
 
 	auto& buffers = program.info.buffers;
 	const auto original_buffer_count = buffers.size();

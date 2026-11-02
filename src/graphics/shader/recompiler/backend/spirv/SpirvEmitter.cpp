@@ -46,6 +46,9 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	};
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto& table = program.bindings.table_images;
+		if (program.info.images[i].grid) {
+			continue;
+		}
 		if (std::ranges::find(table, i) != table.end()) {
 			if (!IR::TableImage(program.info.images[i])) {
 				Fail(program, "draw table image is not one TableImage takes");
