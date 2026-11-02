@@ -593,3 +593,19 @@ The frame rate is not yet a clean measure of the bypass: shader permutations kee
 during the race. Next: (1) why permutations keep appearing (the grid flags and levels should
 settle after a run); (2) GT7's CPU-written memory imported and read in place by covered draws,
 in place of the per-draw synchronization; (3) the generated-commands runs.
+
+Third race on the same build (`_g3-bypass8.txt`; 606 compiles in the run, against 2,351 and ~5,000):
+
+| | G1 off (2026-10-31) | bypass, synchronized per draw |
+|---|---|---|
+| frame rate, median (p25 to p75) | 14.2 (12.5 to 16.3) | **15.3 (14.1 to 17.1)** |
+| covered draws bypassed | | 61 to 72 %, 2.2 to 2.5 us each |
+| GPU thread | ~90 to 98 % busy | **62 to 78 % busy, 23 % idle** |
+| us a draw (all draws on the full path, GPU phases) | 12.0 | 9.1 |
+| write faults | ~18,000/s | 35,000/s, ~700 ms/s in handlers on GT7's threads |
+
+The bypass takes the GPU thread off the critical path (it waits a quarter of the time), and the
+frame rate rises ~8 %, the lower quartile most (12.5 to 14.1). What limits the frame now is on
+GT7's side: its threads spend ~0.7 s per second in write faults, which the per-draw
+synchronization's protections cause (twice the faults of G1 off). The GPU reading GT7's memory in
+place (the probe: 5.9 GB/s) removes those synchronizations and their protections.
