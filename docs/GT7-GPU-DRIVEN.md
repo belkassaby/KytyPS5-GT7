@@ -573,3 +573,23 @@ made GT7's threads fault on most of their writes. Synchronizing each range as th
 synchronized copy; images with CPU writes pending go the full path) fixes the picture. It is a
 CPU stopgap: the GPU-side answer is the GPU reading guest memory in place (imported host memory,
 `VK_EXT_external_memory_host`; `KYTY_HOST_IMPORT_PROBE`), with no copies to synchronize at all.
+
+Warm-cache race with `KYTY_HOST_IMPORT_PROBE=1` (`_g3-bypass7.txt`):
+
+| | |
+|---|---|
+| covered draws bypassed | **67 to 75 %**, 2.8 to 2.9 us each (full path: buffer range 15 %, not learned 6 to 10 %, rendering differs 3.5 %) |
+| GPU thread | busy 82 to 83 %, **idle 17 to 18 %** (it was 90 to 98 % busy): it is no longer the only limit |
+| write faults | 28,000 to 32,000/s, ~300 to 340 ms/s in handlers |
+| frame rate | 12.8 median (9 to 19; the user: closer to 10) |
+| shader work still on the GPU thread | 20 to 670 translations and compiles per 10 s (up to 4.7 s of the 10), compiler threads at ~97 %: permutations still new (grid flags learned as the race goes, draw table levels) |
+
+**Host import probe** (`VK_EXT_external_memory_host`, RTX 4090 Laptop): a 63 MB range of GT7's
+memory imported in place, read by the GPU at **5.9 GB/s** (its own memory: 18.6 GB/s), bytes
+equal. The GPU can read the game's memory where it lies, at PCIe speed: tens of MB a frame of
+CPU-written data cost a few ms of GPU time, with no copies, syncs, protections or faults.
+
+The frame rate is not yet a clean measure of the bypass: shader permutations keep compiling
+during the race. Next: (1) why permutations keep appearing (the grid flags and levels should
+settle after a run); (2) GT7's CPU-written memory imported and read in place by covered draws,
+in place of the per-draw synchronization; (3) the generated-commands runs.
