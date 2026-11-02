@@ -633,3 +633,22 @@ memory became ~10 times as slow. Reading the game's memory in place therefore ne
 in place left out of write tracking altogether: a renderer-wide change of how CPU-written memory
 reaches the GPU (the full path synchronizes the same pages for its draws), not a covered-draw one.
 Off by default; the bypass reads as before (15.3 fps).
+
+## Next: direct regions (design, 2026-11-02; not implemented yet)
+
+AnyPS5 upstream was measured on GT7 in a separate session (never reached a race; ~47 to 54 us a
+draw): the port stays on Kyty. The frame is now limited by write faults on GT7's threads, both
+ways (protect churn concentrates in 0xec06020000, 0x125b5e0000, 0x125b770000,
+0x143d000000-0x143d250000, 0xf439f80000; mostly "no access" protections of GPU-written pages).
+
+**Direct regions**: a few hot mappings (env `KYTY_DIRECT_REGIONS=<hot addresses>`, at most
+`KYTY_DIRECT_MAX_MB` each, the whole mapping found with `FindBacking`) become one cache buffer
+each, backed by GT7's own memory imported once (`VK_EXT_external_memory_host`), created only at
+the first buffer request in the region (nothing older to merge). Hooks in `BufferCache`:
+`Buffer::direct` (a constructor over an imported buffer and memory; the destructor frees them);
+`CreateBuffer` makes the direct buffer for a request inside a region; `SynchronizeBuffer` returns
+at once for it (so the BDA walk too); `MarkGpuWritten` skips it (GPU writes land in GT7's
+memory, no read-back protections); `ObtainBuffer`/`Written`/`Tracked` return it directly; the
+garbage collector skips it; a request straddling a region's edge stops with a message (to see if
+it happens). Every draw and dispatch, full path and bypass, then reads and writes those pages in
+place, never write-tracked: no faults there. Then the generated-commands runs.
