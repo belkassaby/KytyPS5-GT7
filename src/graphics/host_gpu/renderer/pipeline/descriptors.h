@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
+#include "graphics/host_gpu/renderer/pipeline/gt7NativeWalk.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
@@ -18,6 +19,8 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+class RenderContext;
 
 struct ShaderStageRuntime;
 
@@ -107,6 +110,35 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 // Diagnostics (KYTY_WATCH_SHADER): logs again, a few frames later, the user-data buffers a
 // watched draw read, to tell data written after the draw from data never written.
 void LogWatchedRereads(BufferCache& cache, uint64_t presented_frames);
+
+// GT7 GPU-driven G3 bypass (renderDraw.cpp, GPU thread), from what full-path draws left:
+// the persistent set of a static-bindings pipeline's set 0 layout (null: none made yet);
+[[nodiscard]] vk::DescriptorSet G3StaticSet(vk::DescriptorSetLayout layout);
+// whether bindless image slot `slot` of array `array` still holds a binding whose image is
+// registered, unchanged (its memory's stamp) and in the layout the slot was written with; the
+// image is then marked used in `tick`;
+[[nodiscard]] bool G3SlotReady(TextureCache& textures, uint32_t array, uint32_t slot, uint64_t tick);
+// a stage's record written from the render thread's shadow into the stream ring, its buffers
+// addressed in the buffers that hold them (unsynchronized: the BDA walk); its dword offset, or
+// UINT32_MAX when a range has no single buffer (nothing is written then).
+// the vertex stage's vertex table for a stage key (learned on a full-path draw): the user data
+// index of the table's address, each Kyty vertex buffer slot's table entries, the user data index
+// of the vertex and instance offsets (-1: none); the render threads read the table per draw
+// (BuildShadow);
+struct G3VertexTable {
+	struct Entry {
+		uint32_t index  = 0; // the table entry (a V#, 16 bytes)
+		uint32_t offset = 0; // the attribute's byte offset, added to the V#'s base
+	};
+	uint32_t                        table_index = 0;
+	std::vector<std::vector<Entry>> slots;
+	int32_t                            vertex_offset_index   = -1;
+	int32_t                            instance_offset_index = -1;
+};
+void G3LearnVertexTable(uint64_t stage_key, G3VertexTable table);
+[[nodiscard]] uint32_t G3WriteRecord(RenderContext& context,
+                                     const ShaderRecompiler::IR::BindingLayout& layout,
+                                     const Gt7NativeWalk::ShadowRecord& shadow);
 
 // Diagnostics: KYTY_WATCH_SHADER=<hash> with KYTY_WATCH_SHADER_FRAME=<n>: whether a use of the
 // shader falls in the n-th presented frame after its first use (each caller counts up to 64).

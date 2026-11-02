@@ -82,6 +82,14 @@ struct ShadowRecord {
 	std::vector<uint32_t> image_slots;
 	std::vector<uint32_t> sampler_slots;
 	std::vector<uint32_t> srt;
+	// The vertex stage of a draw whose vertex inputs come from its vertex table (G3.2): each
+	// vertex buffer slot's guest range (0 bytes: not fetched), and the draw's vertex and instance
+	// offsets from its user data; `vertex` false when the table was not learned or not readable.
+	bool                  vertex          = false;
+	std::vector<uint64_t> vertex_address;
+	std::vector<uint64_t> vertex_size;
+	int32_t               vertex_offset   = 0;
+	uint32_t              instance_offset = 0;
 };
 
 // Render thread, right after Prepare (the GPU thread may take the prepared stage's resources).

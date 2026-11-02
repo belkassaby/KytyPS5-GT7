@@ -181,6 +181,10 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
+	// GT7 G3 bypass: the rendering open now, or null.
+	[[nodiscard]] const RenderState* RenderingState() const noexcept {
+		return m_rendering ? &m_render_state : nullptr;
+	}
 
 	// The raw command buffer. With the recording thread (CommandScheduler::EnableRecordingThread)
 	// this first waits until the thread has run everything queued; hot paths use Recorder().
@@ -290,6 +294,9 @@ public:
 
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	// GT7 G3.2 (renderDraw.cpp): the marked draw drawn from its records, or false (nothing done).
+	bool TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& args,
+	                 const DrawIndexBufferSource& index_source);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {

@@ -239,12 +239,49 @@ std::atomic<uint64_t> g_g3_built {0}, g_g3_build_ns {0}, g_g3_stages {0}, g_g3_w
     g_g3_complete {0}, g_g3_but_images {0};
 std::array<std::array<std::atomic<uint64_t>, 3>, 6> g_g3_fields {};
 
+bool G3BypassEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_G3");
+		return value != nullptr && std::strcmp(value, "bypass") == 0;
+	}();
+	return enabled;
+}
+
 bool G3UseEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_GT7_G3");
-		return value != nullptr && std::strcmp(value, "use") == 0;
+		return G3BypassEnabled() || (value != nullptr && std::strcmp(value, "use") == 0);
 	}();
 	return enabled;
+}
+
+// G3.2: draws by result, the bypassed draws' nanoseconds, learned states.
+std::array<std::atomic<uint64_t>, 9> g_g3_bypass {};
+std::atomic<uint64_t>                g_g3_bypass_ns {0}, g_g3_learned {0};
+
+void ReportG3Bypass() {
+	static std::array<uint64_t, 9> last {};
+	static uint64_t                last_ns = 0, last_learned = 0;
+	std::array<double, 9>          d {};
+	double                         all = 0;
+	for (size_t i = 0; i < d.size(); i++) {
+		const auto n = g_g3_bypass[i].load(std::memory_order_relaxed);
+		d[i]         = static_cast<double>(n - last[i]);
+		last[i]      = n;
+		all += d[i];
+	}
+	const auto ns      = g_g3_bypass_ns.load(std::memory_order_relaxed);
+	const auto learned = g_g3_learned.load(std::memory_order_relaxed);
+	const auto pct     = [&](size_t i) { return all == 0 ? 0.0 : 100.0 * d[i] / all; };
+	Log::WriteUnmuted(fmt::format(
+	    "GT7 G3 bypass (10 s): marked draws {:.0f}: bypassed {:.1f}% ({:.2f} us each) | full path: "
+	    "not learned {:.1f}%, no whole record {:.1f}%, light grid {:.1f}%, image not ready {:.1f}%, "
+	    "rendering differs {:.1f}%, index buffer {:.1f}%, buffer range {:.1f}%, other {:.1f}% | "
+	    "states learned {}\n",
+	    all, pct(0), d[0] == 0 ? 0.0 : static_cast<double>(ns - last_ns) / 1000.0 / d[0], pct(1),
+	    pct(2), pct(3), pct(4), pct(5), pct(6), pct(7), pct(8), learned - last_learned));
+	last_ns      = ns;
+	last_learned = learned;
 }
 
 bool G3ShadowEnabled() {
@@ -1178,6 +1215,9 @@ void Report() {
 		if (G3ShadowEnabled()) {
 			ReportG3();
 		}
+		if (G3BypassEnabled()) {
+			ReportG3Bypass();
+		}
 		if (G1Level() != 0) {
 			ReportG1();
 		}
@@ -1480,6 +1520,28 @@ bool G3Shadow() {
 
 bool G3Use() {
 	return G3UseEnabled();
+}
+
+bool G3Bypass() {
+	return G3BypassEnabled();
+}
+
+uint64_t CurrentDrawKey() {
+	const auto& id = g_current_identity;
+	return g_current_marked && id.state != 0 ? LearnedKey(id.state, id.material, 2) : 0;
+}
+
+void AddG3Bypass(uint32_t result, uint64_t nanoseconds) {
+	if (result < g_g3_bypass.size()) {
+		g_g3_bypass[result].fetch_add(1, std::memory_order_relaxed);
+	}
+	if (result == G3Bypassed) {
+		g_g3_bypass_ns.fetch_add(nanoseconds, std::memory_order_relaxed);
+	}
+}
+
+void AddG3Learned() {
+	g_g3_learned.fetch_add(1, std::memory_order_relaxed);
 }
 
 void AddG3Images(uint32_t taken, uint32_t resolved) {

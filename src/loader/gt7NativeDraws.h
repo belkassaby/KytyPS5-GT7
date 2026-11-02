@@ -140,6 +140,28 @@ void               AddG3Buffers(bool stage_taken, uint32_t direct, uint32_t usua
 // G3.1b: a stage's images taken from its record's slots, and those resolved the usual way though
 // their slot was published (the slot's image changed since).
 void               AddG3Images(uint32_t taken, uint32_t resolved);
+
+// G3.2, the bypass (KYTY_GT7_G3=bypass; it includes =use): a marked draw whose records are whole
+// and whose learned state (pipeline, layouts, rendering) holds is drawn from its records without
+// the GPU thread's per-draw pipeline (RenderExecutor::TryG3Bypass). The draw's key (state key and
+// material: what determines its programs and pipeline, N1), 0 when not marked; and per draw, how
+// it went (G3BypassResult).
+[[nodiscard]] bool     G3Bypass();
+[[nodiscard]] uint64_t CurrentDrawKey();
+enum G3BypassResult : uint32_t {
+	G3Bypassed = 0,
+	G3NotLearned,
+	G3NoShadow,
+	G3ImageUnpublished,
+	G3ImageNotReady,
+	G3RenderingDiffers,
+	G3IndexBuffer,
+	G3BufferRange,
+	G3Other,
+	G3ResultCount,
+};
+void AddG3Bypass(uint32_t result, uint64_t nanoseconds);
+void AddG3Learned();
 [[nodiscard]] const Libs::Graphics::Gt7NativeWalk::ShadowRecord* CurrentShadow(uint32_t stage);
 void AddG3Field(uint32_t field, uint32_t result, uint32_t count);
 // A stage compared: whether it had a shadow with a layout, whether every word was equal, and

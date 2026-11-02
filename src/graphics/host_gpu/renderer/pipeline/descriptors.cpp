@@ -1077,6 +1077,9 @@ std::unordered_map<uint64_t, std::shared_ptr<const G3Layout>>          g_g3_layo
 std::unordered_map<TextureDescKey, G3ImageSlot, TextureDescKeyHash>    g_g3_image_slots;
 std::unordered_map<G3SamplerKey, uint32_t, G3SamplerKeyHash>           g_g3_sampler_slots;
 
+// G3.2: learned vertex tables by stage key (G3LearnVertexTable), read by BuildShadow.
+std::unordered_map<uint64_t, std::shared_ptr<const G3VertexTable>> g_g3_vertex_tables;
+
 // G3.1b (GPU thread): the binding each table image slot was given (the image, its view and
 // description, and the stamp of its memory then), by bindless array and slot; a record's slot is
 // turned back into its binding with the texture memo's checks (PrepareBindings).
@@ -1084,7 +1087,8 @@ struct G3SlotBinding {
 	ImageId                 id;
 	vk::ImageView           view = nullptr;
 	TextureCache::ImageDesc desc;
-	uint64_t                stamp = 0;
+	uint64_t                stamp  = 0;
+	vk::ImageLayout         layout = vk::ImageLayout::eUndefined;
 };
 std::array<std::vector<G3SlotBinding>, 4> g_g3_slot_bindings;
 
@@ -4835,6 +4839,91 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
+// G1.3 / G3: the set written once for each static-bindings pipeline's set 0 layout.
+struct G3StaticSetEntry {
+	vk::DescriptorSet                     set = nullptr;
+	std::vector<vk::DescriptorBufferInfo> infos;
+};
+static std::unordered_map<VkDescriptorSetLayout, G3StaticSetEntry> g_g3_static_sets;
+
+vk::DescriptorSet G3StaticSet(vk::DescriptorSetLayout layout) {
+	const auto it = g_g3_static_sets.find(static_cast<VkDescriptorSetLayout>(layout));
+	return it != g_g3_static_sets.end() ? it->second.set : vk::DescriptorSet {};
+}
+
+void G3LearnVertexTable(uint64_t stage_key, G3VertexTable table) {
+	auto shared = std::make_shared<const G3VertexTable>(std::move(table));
+	std::unique_lock lock(g_g3_mutex);
+	g_g3_vertex_tables[stage_key] = std::move(shared);
+}
+
+bool G3SlotReady(TextureCache& textures, uint32_t array, uint32_t slot, uint64_t tick) {
+	if (array >= g_g3_slot_bindings.size() || slot == 0 || slot >= g_g3_slot_bindings[array].size()) {
+		return false;
+	}
+	const auto& kept  = g_g3_slot_bindings[array][slot];
+	auto*       image = textures.TryGetImage(kept.id);
+	if (kept.view == nullptr || image == nullptr || !image->registered || image->depth_id ||
+	    image->binding.needs_rebind || image->binding.is_target ||
+	    image->CurrentLayout() != kept.layout ||
+	    textures.RangeStamp(kept.desc.info.data.address, kept.desc.info.data.size) != kept.stamp) {
+		return false;
+	}
+	image->tick_accessed_last = std::max(image->tick_accessed_last, tick);
+	return true;
+}
+
+uint32_t G3WriteRecord(RenderContext& context, const ShaderRecompiler::IR::BindingLayout& layout,
+                       const Gt7NativeWalk::ShadowRecord& shadow) {
+	const auto dwords = layout.ShaderDataDwords();
+	thread_local std::vector<uint32_t> words;
+	words.assign(dwords, 0u);
+	const auto users = layout.user_data_registers.size();
+	if (shadow.user.size() != users || shadow.buffer_address.size() != layout.memory_offset_count ||
+	    shadow.image_slots.size() != layout.table_images.size() ||
+	    shadow.sampler_slots.size() != layout.table_sampler_count || layout.write_tracking) {
+		return UINT32_MAX;
+	}
+	std::copy(shadow.user.begin(), shadow.user.end(), words.begin());
+	auto&      cache     = context.GetBufferCache();
+	const auto alignment = context.GetGraphics().StorageMinAlignment();
+	for (uint32_t i = 0; i < layout.memory_offset_count; i++) {
+		const auto address = shadow.buffer_address[i];
+		const auto size    = shadow.buffer_size[i];
+		if (size == 0) {
+			continue; // a null binding: no address, no length
+		}
+		auto* buffer = cache.TakeOwnerUnsynced(address, size);
+		if (buffer == nullptr) {
+			return UINT32_MAX;
+		}
+		const auto offset     = address - buffer->CpuAddress();
+		const auto aligned    = Common::AlignDown(offset, alignment);
+		const auto adjustment = static_cast<uint32_t>(offset - aligned);
+		if (adjustment >= 256) {
+			return UINT32_MAX;
+		}
+		words[layout.memory_offset_dword + i / 4u] |= adjustment << ((i % 4u) * 8u);
+		words[layout.BufferLengthDword() + i] = BindingLengthDwords(size + adjustment, false);
+		const auto device = buffer->BufferDeviceAddress() + aligned;
+		words[layout.BufferAddressDword() + 2u * i]      = static_cast<uint32_t>(device);
+		words[layout.BufferAddressDword() + 2u * i + 1u] = static_cast<uint32_t>(device >> 32u);
+	}
+	std::copy(shadow.image_slots.begin(), shadow.image_slots.end(),
+	          words.begin() + layout.ImageSlotDword());
+	std::copy(shadow.sampler_slots.begin(), shadow.sampler_slots.end(),
+	          words.begin() + layout.SamplerSlotDword());
+	auto&      ring         = cache.GetUtilityBuffer(MemoryUsage::Stream);
+	const auto total        = std::max<size_t>(words.size() + shadow.srt.size(), 1u);
+	const auto [mapped, at] = ring.Map(total * sizeof(uint32_t), 256);
+	EXIT_IF(mapped == nullptr);
+	auto* out = reinterpret_cast<uint32_t*>(mapped);
+	std::memcpy(out, words.data(), words.size() * sizeof(uint32_t));
+	std::memcpy(out + words.size(), shadow.srt.data(), shadow.srt.size() * sizeof(uint32_t));
+	ring.Commit();
+	return static_cast<uint32_t>(at / sizeof(uint32_t));
+}
+
 // GPU-driven G3.0, GPU thread (CommitBindings, a marked vertex or pixel stage in record mode):
 // publishes the stage's record layout for its learned key, and compares the shadow the render
 // thread built (Gt7NativeWalk::BuildShadow) with the record written here, field by field.
@@ -5291,8 +5380,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto& data  = binding.desc.info.data;
 					const auto  stamp = m_context.GetTextureCache().RangeStamp(data.address, data.size);
 					if (kept.id != binding.image_id || kept.view != binding.image_view ||
-					    kept.stamp != stamp) {
-						kept = {binding.image_id, binding.image_view, binding.desc, stamp};
+					    kept.stamp != stamp || kept.layout != binding.layout) {
+						kept = {binding.image_id, binding.image_view, binding.desc, stamp, binding.layout};
 					}
 				}
 				if (g3 && slot != 0) {
@@ -5511,12 +5600,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	    !m_descriptor_writes.empty()) {
 		// GT7 G1.3: set 0 holds only buffers fixed for the session; the set written with them
 		// once is bound (a new one if they ever change: one in use is never rewritten).
-		struct StaticSet {
-			vk::DescriptorSet                     set = nullptr;
-			std::vector<vk::DescriptorBufferInfo> infos;
-		};
-		static std::unordered_map<VkDescriptorSetLayout, StaticSet> static_sets;
-		thread_local std::vector<vk::DescriptorBufferInfo>          infos;
+		auto&                                              static_sets = g_g3_static_sets;
+		thread_local std::vector<vk::DescriptorBufferInfo> infos;
 		infos.clear();
 		for (const auto& write: m_descriptor_writes) {
 			EXIT_IF(write.pBufferInfo == nullptr);
@@ -5739,6 +5824,62 @@ void BuildShadow(uint64_t key, const DrawPrep::StageResult& prepared, ShadowReco
 		        : 0u);
 	}
 	shadow->srt.assign(res.flattened_srt.begin(), res.flattened_srt.end());
+	// The vertex stage's vertex buffers from its vertex table, as Kyty's draw describes them
+	// (ShaderDetectBuffers: a slot starts at its lowest attribute's base, stride times records).
+	std::shared_ptr<const G3VertexTable> vertex;
+	{
+		std::shared_lock lock(g_g3_mutex);
+		if (const auto it = g_g3_vertex_tables.find(key); it != g_g3_vertex_tables.end()) {
+			vertex = it->second;
+		}
+	}
+	if (vertex == nullptr || vertex->table_index + 1u >= res.user_data.size()) {
+		return;
+	}
+	const uint64_t table = static_cast<uint64_t>(res.user_data[vertex->table_index]) |
+	                       (static_cast<uint64_t>(res.user_data[vertex->table_index + 1u]) << 32u);
+	uint32_t entries = 0;
+	for (const auto& slot: vertex->slots) {
+		for (const auto& entry: slot) {
+			entries = std::max(entries, entry.index + 1u);
+		}
+	}
+	std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4> words {};
+	if (table < BufferCache::CACHING_PAGESIZE || entries > ShaderVertexInputInfo::RES_MAX ||
+	    !Libs::LibKernel::Memory::TryReadGpuCleanBacking(table, words.data(), entries * 16u)) {
+		return;
+	}
+	for (const auto& slot: vertex->slots) {
+		uint64_t base    = UINT64_MAX;
+		uint64_t size    = 0;
+		uint32_t stride  = 0;
+		uint32_t records = 0;
+		for (const auto& entry: slot) {
+			ShaderBufferResource r;
+			std::copy_n(words.begin() + entry.index * 4u, 4, r.fields);
+			if (base != UINT64_MAX && (r.Stride() != stride || r.NumRecords() != records)) {
+				return; // as the draw path, which ends the emulator on it
+			}
+			base    = std::min(base, r.Base48() + entry.offset);
+			stride  = r.Stride();
+			records = r.NumRecords();
+		}
+		if (!slot.empty()) {
+			if (stride == 0) {
+				return; // a constant attribute: its size rule is not done here
+			}
+			size = static_cast<uint64_t>(stride) * records;
+		}
+		shadow->vertex_address.push_back(slot.empty() ? 0 : base);
+		shadow->vertex_size.push_back(size);
+	}
+	const auto value = [&](int32_t index) {
+		return index >= 0 && static_cast<size_t>(index) < res.user_data.size() ? res.user_data[index]
+		                                                                       : 0u;
+	};
+	shadow->vertex_offset   = static_cast<int32_t>(value(vertex->vertex_offset_index));
+	shadow->instance_offset = value(vertex->instance_offset_index);
+	shadow->vertex          = true;
 }
 
 } // namespace Gt7NativeWalk

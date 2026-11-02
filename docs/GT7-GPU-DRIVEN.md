@@ -496,3 +496,46 @@ take and check (`TakeScanned`, `ReadSet::Validate`), `PrepareBindings`, `RebindI
 `RebindBuffers`, the transitions and the record in `CommitBindings`. Each piece replaced inside it
 saves a fraction of a microsecond: N4's lesson again (GT7-NATIVE-BACKEND.md). The frame rate moves
 only when a covered draw does not enter that pipeline at all.
+
+## G3.2, first attempt: a GPU-thread bypass, and why it does not get there (2026-11-02)
+
+`KYTY_GT7_G3=bypass`: a full-path marked draw leaves, for its key (state key and material),
+its pipeline, the stages' record layouts, its rendering, depth state and vertex program, and its
+vertex table (which entries of the table the vertex shader's user data points at feed each of
+Kyty's vertex buffer slots, with each attribute's offset: Kyty's V# is the table's with the offset
+added and the format rewritten). The next draws of the key with whole records skip the per-draw
+pipeline: the GPU thread writes the two records from the render threads' shadows, binds the
+learned pipeline, the cached set, index and vertex buffers (unsynchronized: the BDA walk), sets
+the dynamic state and draws. Races (`_g3-bypass1..4.txt`), the last one, 10 s windows:
+
+| marked draws (~290,000 to 300,000) | |
+|---|---|
+| learnable on the full path | 276,000 to 288,000 (refused: occlusion queries 12,000, tessellation 7,000 to 24,000) |
+| **bypassed** | **0 %** |
+| light grid (an image slot the render thread cannot name) | **70 to 71 %** |
+| no whole record | 17 % |
+| index buffer not in a single buffer | 5.5 to 6.7 % |
+| not learned / rendering differs | 4 to 5 % / 2 % |
+| frame rate | 13.8 fps median |
+
+Two findings:
+
+1. **The light grid is the blocker.** Nearly every pixel stage samples a light grid that GT7
+   writes at a new address in its per-frame memory for each draw: Kyty makes (uploads) a texture
+   for it per draw, on the GPU thread. No record made ahead can name it, and resolving it at the
+   draw is the per-draw texture work the bypass is meant to remove.
+2. **A bypass on the GPU thread is still the GPU thread.** Even working, it records every covered
+   draw there (records, binds, dynamic state, draw): cheaper than ~12 us, but the same shape.
+
+What GPU-driven rendering needs instead, in order:
+
+- **The light grid read by the shaders from guest memory**, through the BDA page table, as a
+  buffer, not as a texture Kyty makes per draw: the recompiler lowers the light grid's image reads
+  (by its descriptor class) to address-based loads, the T# in the record. Then every image of a
+  covered draw is a material texture or a target with a fixed slot, and a draw's record is whole
+  on the render thread.
+- **Device-generated commands for runs of covered draws**: the render threads write each draw's
+  record and its sequence (pipeline index, record offsets, index buffer, draw); the GPU thread,
+  at the run's end, executes the run with one `vkCmdExecuteGeneratedCommandsEXT` and skips the
+  run's draw packets. The pipelines of covered draws join an indirect execution set (one shared
+  layout: G1.3's static set).

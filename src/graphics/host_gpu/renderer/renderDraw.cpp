@@ -62,6 +62,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <map>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -2788,6 +2789,247 @@ static void LogFrameGraphDraw(RenderContext& context, const CommandBuffer& buffe
 	FrameGraph::SetShowBuffers(draw.index_count <= 6 || !state.depth_info.image_id);
 }
 
+// GT7 GPU-driven G3.2, the bypass (KYTY_GT7_G3=bypass; docs/GT7-GPU-DRIVEN.md): what a full-path
+// marked draw leaves for the next draws of its key (state key and material, which determine its
+// programs and pipeline): the pipeline, each stage's record layout, the rendering it drew in, the
+// depth state and the vertex program its dynamic state is made from. A draw of that key whose
+// records are whole is then drawn from them (TryG3Bypass).
+struct G3Learned {
+	PipelineCache::Pipeline*                  pipeline = nullptr;
+	RenderState                               rendering;
+	RenderDepthInfo                           depth;
+	ShaderRecompiler::IR::CompiledShaderInfo  vertex_program;
+	std::array<ShaderRecompiler::IR::BindingLayout, 2> layouts; // vertex, pixel
+	std::array<uint64_t, 2>                   shader_hashes {};
+	std::array<std::vector<uint32_t>, 2>      image_arrays; // the bindless array of each table image
+	vk::ShaderStageFlags                      push_stages;
+	vk::ImageAspectFlags                      feedback_aspects;
+	uint32_t                                  db_count_control = 0;
+	bool                                      color_attachments = false;
+	bool                                      has_pixel         = true;
+	// The vertex inputs: Kyty's vertex buffer slots (0: none), filled from the record's vertex
+	// table ranges; with an embedded fetch, the vertex and instance offsets from its user data.
+	uint32_t                                  vertex_slots      = 0;
+	bool                                      fetch_embedded    = false;
+	bool                                      vertex_offset     = false;
+	bool                                      instance_offset   = false;
+};
+
+// GT7 G3.2, learning a draw's vertex table: for each of Kyty's vertex buffer slots, the entries of
+// the table the vertex shader's user data points at that hold its attributes' V#s (the slot is
+// empty when none of its attributes is fetched). Kyty's V# of an attribute is the table's with
+// the attribute's offset added to the base and its format in dword 3 (ShaderApplyAttribSemantics):
+// an entry matches by stride and records, its base at most 4 KB below. False when no user data
+// pair points at a table holding every attribute's V#.
+static bool G3MapVertexTable(const ShaderVertexInputInfo& info, G3VertexTable& out) {
+	const auto& user = info.stage.resources->user_data;
+	for (uint32_t k = 0; k + 1u < user.size(); k++) {
+		const uint64_t table =
+		    static_cast<uint64_t>(user[k]) | (static_cast<uint64_t>(user[k + 1u]) << 32u);
+		if (table < BufferCache::CACHING_PAGESIZE) {
+			continue;
+		}
+		std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4> words {};
+		uint32_t                                                  entries = ShaderVertexInputInfo::RES_MAX;
+		while (entries != 0 &&
+		       !Libs::LibKernel::Memory::TryReadGpuCleanBacking(table, words.data(), entries * 16u)) {
+			entries /= 2u;
+		}
+		if (entries == 0) {
+			continue;
+		}
+		std::vector<std::vector<G3VertexTable::Entry>> slots(static_cast<size_t>(info.buffers_num));
+		std::vector<bool> fetched(static_cast<size_t>(info.buffers_num), false);
+		bool              all = true;
+		for (int ri = 0; ri < info.resources_num && all; ri++) {
+			const auto& r    = info.resources[ri];
+			const auto  b    = info.resources_dst[ri].buffer_index;
+			uint32_t    best = entries;
+			uint64_t    best_offset = 4096;
+			for (uint32_t j = 0; j < entries; j++) {
+				ShaderBufferResource e;
+				std::copy_n(words.begin() + j * 4u, 4, e.fields);
+				if (e.Stride() == r.Stride() && e.NumRecords() == r.NumRecords() &&
+				    e.Base48() <= r.Base48() && r.Base48() - e.Base48() < best_offset) {
+					best        = j;
+					best_offset = r.Base48() - e.Base48();
+				}
+			}
+			if (best == entries || b < 0 || b >= info.buffers_num) {
+				all = false;
+				break;
+			}
+			slots[b].push_back({best, static_cast<uint32_t>(best_offset)});
+			fetched[b] = fetched[b] || VertexAttributeFetched(info, ri);
+		}
+		if (!all) {
+			continue;
+		}
+		for (size_t b = 0; b < slots.size(); b++) {
+			if (!fetched[b]) {
+				slots[b].clear();
+			}
+		}
+		out.table_index = k;
+		out.slots       = std::move(slots);
+		return true;
+	}
+	return false;
+}
+static std::unordered_map<uint64_t, G3Learned> g_g3_learned;
+
+// The rendering's attachments: the same views and area (whether it began with a clear does not
+// matter to a draw inside it).
+static bool G3SameRendering(const RenderState& a, const RenderState& b) {
+	if (a.width != b.width || a.height != b.height || a.num_layers != b.num_layers ||
+	    a.num_color_attachments != b.num_color_attachments ||
+	    a.depth_stencil_attachment.image_view != b.depth_stencil_attachment.image_view) {
+		return false;
+	}
+	for (uint32_t i = 0; i < a.num_color_attachments; i++) {
+		if (a.color_attachments[i].image_view != b.color_attachments[i].image_view) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& args,
+                                 const DrawIndexBufferSource& index_source) {
+	using namespace ::Loader::Gt7NativeDraws;
+	const auto start  = std::chrono::steady_clock::now();
+	const auto result = [&](uint32_t value) {
+		AddG3Bypass(value, value != G3Bypassed
+		                       ? 0
+		                       : static_cast<uint64_t>(
+		                             std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                 std::chrono::steady_clock::now() - start)
+		                                 .count()));
+		return value == G3Bypassed;
+	};
+	const auto key = CurrentDrawKey();
+	const auto it  = key != 0 ? g_g3_learned.find(key) : g_g3_learned.end();
+	if (it == g_g3_learned.end()) {
+		return result(G3NotLearned);
+	}
+	const auto& learned = it->second;
+	if (args.gpu_args_address != 0 || index_source.host_data != nullptr || index_source.size == 0 ||
+	    buffer.GetRegisters().GetDbCountControl() != learned.db_count_control) {
+		return result(G3Other);
+	}
+	std::array<const Gt7NativeWalk::ShadowRecord*, 2> shadows {CurrentShadow(0), CurrentShadow(1)};
+	const uint32_t stage_count = learned.has_pixel ? 2u : 1u;
+	for (uint32_t s = 0; s < stage_count; s++) {
+		const auto* shadow = shadows[s];
+		if (shadow == nullptr || !shadow->layout || shadow->shader_hash != learned.shader_hashes[s]) {
+			return result(G3NoShadow);
+		}
+		if (std::ranges::find(shadow->image_slots, 0u) != shadow->image_slots.end() ||
+		    std::ranges::find(shadow->sampler_slots, 0u) != shadow->sampler_slots.end()) {
+			return result(G3ImageUnpublished);
+		}
+	}
+	const auto* rendering = m_context.GetCommandScheduler().Current().RenderingState();
+	if (rendering == nullptr || !G3SameRendering(*rendering, learned.rendering)) {
+		return result(G3RenderingDiffers);
+	}
+	auto&      textures = m_context.GetTextureCache();
+	const auto tick     = m_context.GetCommandScheduler().CurrentTick();
+	for (uint32_t s = 0; s < stage_count; s++) {
+		const auto& arrays = learned.image_arrays[s];
+		const auto& slots  = shadows[s]->image_slots;
+		if (arrays.size() != slots.size()) {
+			return result(G3NoShadow);
+		}
+		for (size_t k = 0; k < slots.size(); k++) {
+			if (!G3SlotReady(textures, arrays[k], slots[k], tick)) {
+				return result(G3ImageNotReady);
+			}
+		}
+	}
+	auto* index = m_context.GetBufferCache().TakeOwnerUnsynced(index_source.address, index_source.size);
+	if (index == nullptr) {
+		return result(G3IndexBuffer);
+	}
+	// The vertex buffers, from the record's vertex table ranges.
+	PreparedVertexBuffers vertex_buffers;
+	if (learned.vertex_slots != 0) {
+		const auto& vertex = *shadows[0];
+		if (!vertex.vertex || vertex.vertex_address.size() != learned.vertex_slots) {
+			return result(G3NoShadow);
+		}
+		auto& cache          = m_context.GetBufferCache();
+		vertex_buffers.count = learned.vertex_slots;
+		for (uint32_t i = 0; i < learned.vertex_slots; i++) {
+			if (vertex.vertex_size[i] == 0) {
+				vertex_buffers.buffers[i] = cache.GetBuffer(NULL_BUFFER_ID).Handle();
+				continue;
+			}
+			auto* owner = cache.TakeOwnerUnsynced(vertex.vertex_address[i], vertex.vertex_size[i]);
+			if (owner == nullptr) {
+				return result(G3BufferRange);
+			}
+			vertex_buffers.buffers[i] = owner->Handle();
+			vertex_buffers.offsets[i] = owner->Offset(vertex.vertex_address[i]);
+			vertex_buffers.sizes[i]   = vertex.vertex_size[i];
+		}
+	}
+	std::array<uint32_t, 2> records {};
+	for (uint32_t s = 0; s < stage_count; s++) {
+		records[s] = G3WriteRecord(m_context, learned.layouts[s], *shadows[s]);
+		if (records[s] == UINT32_MAX) {
+			return result(G3BufferRange);
+		}
+	}
+	// The CPU's writes the records' buffers and the indices read: synchronized once a submission.
+	m_context.PrepareBda();
+
+	const auto vk_buffer = buffer.Recorder();
+	CommitVertexBuffers(vk_buffer, vertex_buffers);
+	vk_buffer.bindIndexBuffer(index->Handle(), index->Offset(index_source.address), index_source.type);
+	ShaderVertexInputInfo vertex_info;
+	vertex_info.stage.program = &learned.vertex_program;
+	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_info, learned.depth, *rendering);
+	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
+		vk_buffer.setAttachmentFeedbackLoopEnableEXT(learned.feedback_aspects);
+	}
+	vk_buffer.bindGuestPipeline(learned.pipeline->pipeline, learned.color_attachments);
+	const auto set = G3StaticSet(learned.pipeline->descriptor_set_layout);
+	EXIT_IF(set == nullptr);
+	vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, learned.pipeline->pipeline_layout,
+	                             0, 1, &set, 0, nullptr);
+	if (learned.pipeline->uses_bindless) {
+		const auto bindless = m_context.GetGraphics().bindless_set;
+		vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+		                             learned.pipeline->pipeline_layout, 1, 1, &bindless, 0, nullptr);
+	}
+	ShaderRecompiler::IR::PushData push_data;
+	for (uint32_t s = 0; s < stage_count; s++) {
+		push_data.dwords[learned.layouts[s].push_data_start_dword] = records[s];
+	}
+	vk_buffer.pushConstants(learned.pipeline->pipeline_layout, learned.push_stages, 0,
+	                        sizeof(push_data), push_data.dwords.data());
+	// As ResolveDrawOffsets: with an embedded fetch, the offsets the vertex shader's user data hold.
+	const auto& ucfg            = buffer.GetUserConfig();
+	auto        vertex_offset   = static_cast<int32_t>(ucfg.GetIndexOffset());
+	uint32_t    instance_offset = 0;
+	if (learned.fetch_embedded) {
+		if (ucfg.GetIndexOffset() == 0 && learned.vertex_offset) {
+			vertex_offset = shadows[0]->vertex_offset;
+		}
+		if (learned.instance_offset) {
+			instance_offset = shadows[0]->instance_offset;
+		}
+	}
+	vk_buffer.drawIndexed(args.index_count, args.instance_count, 0, vertex_offset + args.base_vertex,
+	                      instance_offset);
+	Profiler::Add(Profiler::Counter::Draws);
+	Common::PerfStats::AddDraw();
+	m_context.GetCommandScheduler().NoteDraw(learned.shader_hashes[learned.has_pixel ? 1 : 0], false);
+	m_context.GetBufferCache().WritesRecorded(false, 0);
+	return result(G3Bypassed);
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -3413,6 +3655,121 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                     vertex_indirect_buffer, vertex_indirect_offset);
 	}
 
+	// GT7 G3.2: what this marked draw leaves for the bypass of its key's next draws; why a marked
+	// draw leaves nothing is counted by condition (a "GT7 G3 learning" line every 10 s).
+	const char* g3_refused = nullptr;
+	if (::Loader::Gt7NativeDraws::G3Bypass() && ::Loader::Gt7NativeDraws::CurrentMarked()) {
+		g3_refused = !draw.IsIndexed()                           ? "not indexed"
+		             : mesh_active                               ? "mesh"
+		             : vertex_stages.size() != 1                 ? "tessellated"
+		             : !pipeline.static_bindings                 ? "set 0 not static"
+		             : pipeline.uses_push_descriptors            ? "push descriptors"
+		             : occlusion_query >= 0                      ? "occlusion query"
+		             : emit.gpu_args_address != 0 || static_cast<bool>(vertex_indirect_buffer)
+		                 ? "GPU arguments"
+		             : index_source.host_data != nullptr         ? "indices on the host"
+		             : shader_write_stages                       ? "shader writes"
+		                                                         : nullptr;
+		static std::map<std::string, uint64_t> refusals;
+		static uint64_t                        accepted = 0;
+		static auto                            last     = std::chrono::steady_clock::now();
+		if (g3_refused != nullptr) {
+			refusals[g3_refused]++;
+		} else {
+			accepted++;
+		}
+		if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(10)) {
+			std::string text;
+			for (const auto& [why, count]: refusals) {
+				text += fmt::format(", {} {}", why, count);
+			}
+			LOGF("GT7 G3 learning (10 s): marked full-path draws of a learnable shape %" PRIu64
+			     "; refused%s\n",
+			     accepted, text.empty() ? ": none" : text.c_str());
+			refusals.clear();
+			accepted = 0;
+			last     = now;
+		}
+	}
+	if (::Loader::Gt7NativeDraws::G3Bypass() && ::Loader::Gt7NativeDraws::CurrentMarked() &&
+	    g3_refused == nullptr) {
+		const auto key = ::Loader::Gt7NativeDraws::CurrentDrawKey();
+		const std::array<const ShaderStageRuntime*, 2> runtimes {&vertex_stages.front().stage,
+		                                                         &state.ps_input_info.stage};
+		const uint32_t stage_count = state.ps_active ? 2u : 1u;
+		const auto     stages      = std::span {runtimes.data(), stage_count};
+		const bool shape = key != 0 && std::ranges::all_of(stages, [](const ShaderStageRuntime* stage) {
+			const auto& program = *stage->program;
+			return program.bindings.record && !program.bindings.write_tracking &&
+			       stage->resources->gpu_fills.empty() &&
+			       std::ranges::none_of(program.info.images, &ShaderRecompiler::IR::ImageResource::bindless) &&
+			       std::ranges::none_of(program.info.samplers,
+			                            &ShaderRecompiler::IR::SamplerResource::bindless);
+		});
+		// The vertex table, when Kyty binds vertex buffers for the draw.
+		G3VertexTable vertex_table;
+		const auto&   vertex_info = state.vertex_info[0];
+		static std::unordered_set<uint64_t> table_failed;
+		const bool learned_already =
+		    g_g3_learned.contains(key) && g_g3_learned[key].pipeline == &pipeline;
+		bool table_ok = vertex_bindings.count == 0 || learned_already ||
+		                (!table_failed.contains(key) && G3MapVertexTable(vertex_info, vertex_table));
+		if (!table_ok) {
+			table_failed.insert(key);
+		}
+		if (shape && !table_ok) {
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("GT7 G3 learning: no vertex table found for VS 0x%016" PRIx64 " (%d attributes, "
+				     "%d buffers)\n",
+				     runtimes[0]->program->shader_hash, vertex_info.resources_num,
+				     vertex_info.buffers_num);
+			}
+		}
+		if (shape && table_ok) {
+			auto& learned = g_g3_learned[key];
+			if (learned.pipeline != &pipeline || !G3SameRendering(learned.rendering, rendering)) {
+				learned.pipeline          = &pipeline;
+				learned.rendering         = rendering;
+				learned.depth             = state.depth_info;
+				learned.vertex_program    = *runtimes[0]->program;
+				learned.feedback_aspects  = feedback_aspects;
+				learned.db_count_control  = buffer.GetRegisters().GetDbCountControl();
+				learned.color_attachments = rendering.num_color_attachments != 0;
+				learned.push_stages       = vk::ShaderStageFlagBits::eFragment;
+				learned.has_pixel         = state.ps_active;
+				learned.vertex_slots      = vertex_bindings.count;
+				learned.fetch_embedded    = vertex_info.fetch_embedded;
+				const auto& vs            = *runtimes[0]->program;
+				const auto  user_index    = [&](int32_t sgpr) {
+                    return sgpr >= static_cast<int32_t>(vs.user_data_base)
+					           ? sgpr - static_cast<int32_t>(vs.user_data_base)
+					           : -1;
+				};
+				vertex_table.vertex_offset_index   = user_index(vs.info.vertex_offset_sgpr);
+				vertex_table.instance_offset_index = user_index(vs.info.instance_offset_sgpr);
+				learned.vertex_offset   = vertex_table.vertex_offset_index >= 0;
+				learned.instance_offset = vertex_table.instance_offset_index >= 0;
+				// (a key learned again for another rendering keeps the table it had)
+				if (vertex_bindings.count != 0 ? !vertex_table.slots.empty() : learned.fetch_embedded) {
+					G3LearnVertexTable(::Loader::Gt7NativeDraws::CurrentLearnedKey(0),
+					                   std::move(vertex_table));
+				}
+				for (uint32_t s = 0; s < stage_count; s++) {
+					const auto& program       = *runtimes[s]->program;
+					learned.layouts[s]        = program.bindings;
+					learned.shader_hashes[s]  = program.shader_hash;
+					learned.image_arrays[s].clear();
+					for (const auto resource: program.bindings.table_images) {
+						learned.image_arrays[s].push_back(
+						    ShaderRecompiler::IR::BindlessImageBinding(program.info.images.at(resource)));
+					}
+				}
+				learned.push_stages |= NativeShaderStage(vertex_stages.front().logical_stage);
+				::Loader::Gt7NativeDraws::AddG3Learned();
+			}
+		}
+	}
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
 	// Round 166: with barriers:guest the guest's own sync points order the draw's writes.
 	if (shader_write_stages && !GuestGpu::GuestPm4Barriers()) {
@@ -3614,6 +3971,13 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
+	// GT7 G3.2: a marked draw with whole records drawn from them, without the per-draw pipeline.
+	if (::Loader::Gt7NativeDraws::G3Bypass() && ::Loader::Gt7NativeDraws::CurrentMarked() &&
+	    ucfg.GetPrimType() != Prospero::PrimitiveType::kPatch && !primitive_restart &&
+	    TryG3Bypass(buffer, args, index_source)) {
+		ResetBindings();
+		return;
+	}
 	DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count, args.instance_count,
 	                   args.first_instance};
 	DrawStateLease   state_lease(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch);

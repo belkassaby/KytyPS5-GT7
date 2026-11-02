@@ -129,6 +129,14 @@ public:
 		TouchImage(image);
 		return image;
 	}
+	// GT7 G3 bypass: the image of `id` touched as GetImage does, or null when the slot is empty.
+	[[nodiscard]] Image* TryGetImage(ImageId id) {
+		auto* image = m_slot_images.try_get(id);
+		if (image != nullptr) {
+			TouchImage(*image);
+		}
+		return image;
+	}
 	void MarkGpuWritten(ImageId id);
 
 	// A fill of exactly an image's memory (a color or depth image's, or a depth image's stencil
