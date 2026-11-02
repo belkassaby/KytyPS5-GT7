@@ -107,6 +107,23 @@ public:
 	// The same, synchronized as ObtainBuffer synchronizes a read binding (the CPU's writes
 	// uploaded now): what a G3 bypassed draw reads, as its full path would.
 	[[nodiscard]] Buffer* TakeOwnerSynced(uint64_t vaddr, uint64_t size);
+
+	// GT7 GPU-driven G3, in-place reads (GPU thread): where a covered draw reads [vaddr, vaddr +
+	// size) from. Memory the GPU wrote: the cache's buffer, synchronized. Memory the CPU wrote
+	// since the cache's copy: the game's memory itself, imported (VK_EXT_external_memory_host),
+	// read where it lies, with no upload and no protection (no write faults after). Memory neither
+	// wrote: the cache's copy as it is. False when none of these holds the range.
+	struct ReadBinding {
+		vk::Buffer        buffer  = nullptr;
+		uint64_t          offset  = 0;
+		vk::DeviceAddress address = 0;
+	};
+	enum class ReadKind : uint8_t { Clean, InPlace, Synced };
+	[[nodiscard]] bool BindForRead(uint64_t vaddr, uint64_t size, ReadBinding& out, ReadKind* kind);
+	// Unmap (the GPU thread, the GPU idle): the imports over [vaddr, vaddr + size) dropped.
+	void ForgetImports(uint64_t vaddr, uint64_t size);
+	// Bytes of the game's memory imported now.
+	[[nodiscard]] uint64_t ImportedBytes() const noexcept { return m_imported_bytes; }
 	// needs_device_address: the caller reads the data through a buffer device address, which
 	// the stream buffer used for small CPU-written reads does not have.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -509,6 +526,20 @@ private:
 
 	GraphicContext&                                    m_graphics;
 	CommandScheduler&                                  m_scheduler;
+	// G3 in-place reads: imported windows of the game's memory by guest start, windows that
+	// could not be imported, and the bytes imported.
+	struct GuestImport {
+		vk::Buffer        buffer  = nullptr;
+		vk::DeviceMemory  memory  = nullptr;
+		vk::DeviceAddress address = 0;
+		uint64_t          vaddr   = 0;
+		uint64_t          size    = 0;
+	};
+	[[nodiscard]] const GuestImport* ImportGuestRange(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool               ImportWindow(uint64_t vaddr, uint64_t size);
+	std::map<uint64_t, GuestImport>                    m_imports;
+	std::unordered_map<uint64_t, uint8_t>              m_import_refused;
+	uint64_t                                           m_imported_bytes = 0;
 	FaultManager                                       m_fault_manager;
 	Buffer                                             m_gds_buffer;
 	Buffer                                             m_bda_pagetable_buffer;

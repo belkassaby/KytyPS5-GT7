@@ -2579,6 +2579,165 @@ Buffer* BufferCache::TakeOwnerUnsynced(uint64_t vaddr, uint64_t size) {
 	return &buffer;
 }
 
+// G3 in-place reads: windows of 4 MB of the game's memory, or the range's own pages when its window
+// spans more than one mapping; at most 4 GB imported (pinned by the driver).
+constexpr uint64_t ImportWindowBytes = 4ull << 20u;
+constexpr uint64_t ImportLimitBytes  = 4ull << 30u;
+
+bool BufferCache::ImportWindow(uint64_t vaddr, uint64_t size) {
+	if (!m_graphics.external_memory_host_enabled || m_imported_bytes + size > ImportLimitBytes) {
+		return false;
+	}
+	auto* pointer = const_cast<uint8_t*>(LibKernel::Memory::FindBacking(vaddr, size));
+	const auto alignment = std::max<uint64_t>(m_graphics.imported_host_pointer_alignment, 1);
+	if (pointer == nullptr || reinterpret_cast<uint64_t>(pointer) % alignment != 0 ||
+	    size % alignment != 0) {
+		return false;
+	}
+	constexpr auto handle = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	vk::MemoryHostPointerPropertiesEXT properties {};
+	if (m_graphics.device.getMemoryHostPointerPropertiesEXT(handle, pointer, &properties) !=
+	        vk::Result::eSuccess ||
+	    properties.memoryTypeBits == 0) {
+		return false;
+	}
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = handle;
+	vk::BufferCreateInfo info {};
+	info.size  = size;
+	info.usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
+	             vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferSrc |
+	             vk::BufferUsageFlagBits::eShaderDeviceAddress;
+	info.pNext = &external;
+	GuestImport import;
+	import.vaddr = vaddr;
+	import.size  = size;
+	if (m_graphics.device.createBuffer(&info, nullptr, &import.buffer) != vk::Result::eSuccess) {
+		return false;
+	}
+	vk::MemoryRequirements requirements {};
+	m_graphics.device.getBufferMemoryRequirements(import.buffer, &requirements);
+	const auto bits = requirements.memoryTypeBits & properties.memoryTypeBits;
+	uint32_t   type = 0;
+	while (type < 32 && (bits & (1u << type)) == 0) {
+		type++;
+	}
+	vk::ImportMemoryHostPointerInfoEXT host {};
+	host.handleType   = handle;
+	host.pHostPointer = pointer;
+	vk::MemoryAllocateFlagsInfo flags {};
+	flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+	flags.pNext = &host;
+	vk::MemoryAllocateInfo allocate {};
+	allocate.allocationSize  = size;
+	allocate.memoryTypeIndex = type;
+	allocate.pNext           = &flags;
+	if (type == 32 || requirements.size > size ||
+	    m_graphics.device.allocateMemory(&allocate, nullptr, &import.memory) != vk::Result::eSuccess) {
+		m_graphics.device.destroyBuffer(import.buffer, nullptr);
+		return false;
+	}
+	if (m_graphics.device.bindBufferMemory(import.buffer, import.memory, 0) != vk::Result::eSuccess) {
+		m_graphics.device.destroyBuffer(import.buffer, nullptr);
+		m_graphics.device.freeMemory(import.memory, nullptr);
+		return false;
+	}
+	vk::BufferDeviceAddressInfo address {};
+	address.buffer = import.buffer;
+	import.address = m_graphics.device.getBufferAddress(&address);
+	m_imported_bytes += size;
+	m_imports.emplace(vaddr, import);
+	static std::atomic<uint32_t> reported = 0;
+	if (reported.fetch_add(1) < 8) {
+		LOGF("BufferCache: imported the game's memory 0x%016" PRIx64 "+0x%" PRIx64
+		     " for in-place reads (%" PRIu64 " MB imported)\n",
+		     vaddr, size, m_imported_bytes >> 20u);
+	}
+	return true;
+}
+
+const BufferCache::GuestImport* BufferCache::ImportGuestRange(uint64_t vaddr, uint64_t size) {
+	const auto find = [&]() -> const GuestImport* {
+		auto it = m_imports.upper_bound(vaddr);
+		if (it == m_imports.begin()) {
+			return nullptr;
+		}
+		--it;
+		const auto& import = it->second;
+		return vaddr >= import.vaddr && vaddr + size <= import.vaddr + import.size ? &import : nullptr;
+	};
+	if (const auto* found = find(); found != nullptr) {
+		return found;
+	}
+	const auto window = Common::AlignDown(vaddr, ImportWindowBytes);
+	if (vaddr + size <= window + ImportWindowBytes && !m_import_refused.contains(window)) {
+		if (ImportWindow(window, ImportWindowBytes)) {
+			return find();
+		}
+		m_import_refused[window] = 1;
+	}
+	// The range's own pages (a window over two mappings, or a range over two windows).
+	const auto first = Common::AlignDown(vaddr, uint64_t {4096});
+	const auto end   = Common::AlignUp(vaddr + size, uint64_t {4096});
+	return ImportWindow(first, end - first) ? find() : nullptr;
+}
+
+void BufferCache::ForgetImports(uint64_t vaddr, uint64_t size) {
+	for (auto it = m_imports.begin(); it != m_imports.end();) {
+		const auto& import = it->second;
+		if (import.vaddr < vaddr + size && vaddr < import.vaddr + import.size) {
+			m_graphics.device.destroyBuffer(import.buffer, nullptr);
+			m_graphics.device.freeMemory(import.memory, nullptr);
+			m_imported_bytes -= import.size;
+			it = m_imports.erase(it);
+		} else {
+			++it;
+		}
+	}
+	for (auto it = m_import_refused.begin(); it != m_import_refused.end();) {
+		it = it->first < vaddr + size && vaddr < it->first + ImportWindowBytes
+		         ? m_import_refused.erase(it)
+		         : std::next(it);
+	}
+}
+
+// KYTY_GT7_G3_INPLACE=1: CPU-written ranges read in place. Off by default: the driver pins the
+// imported pages, and Kyty's write tracking changes their protection all the time; every fault and
+// protection change on them became ~10 times as slow (2 fps, docs/GT7-GPU-DRIVEN.md).
+static bool InPlaceReads() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_G3_INPLACE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool BufferCache::BindForRead(uint64_t vaddr, uint64_t size, ReadBinding& out, ReadKind* kind) {
+	const auto from = [&](Buffer* buffer, ReadKind how) {
+		out  = {buffer->Handle(), buffer->Offset(vaddr), buffer->BufferDeviceAddress() + buffer->Offset(vaddr)};
+		*kind = how;
+		return true;
+	};
+	if (IsRegionGpuModified(vaddr, size)) {
+		auto* buffer = TakeOwnerSynced(vaddr, size);
+		return buffer != nullptr && from(buffer, ReadKind::Synced);
+	}
+	if (!IsRegionCpuModified(vaddr, size)) {
+		if (auto* buffer = TakeOwnerUnsynced(vaddr, size); buffer != nullptr) {
+			return from(buffer, ReadKind::Clean);
+		}
+	}
+	if (const auto* import = InPlaceReads() ? ImportGuestRange(vaddr, size) : nullptr;
+	    import != nullptr) {
+		const auto offset = vaddr - import->vaddr;
+		out               = {import->buffer, offset, import->address + offset};
+		*kind             = ReadKind::InPlace;
+		return true;
+	}
+	auto* buffer = TakeOwnerSynced(vaddr, size);
+	return buffer != nullptr && from(buffer, ReadKind::Synced);
+}
+
 Buffer* BufferCache::TakeOwnerSynced(uint64_t vaddr, uint64_t size) {
 	auto* buffer = TakeOwnerUnsynced(vaddr, size);
 	if (buffer != nullptr) {

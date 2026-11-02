@@ -136,6 +136,8 @@ struct G3VertexTable {
 	int32_t                            instance_offset_index = -1;
 };
 void G3LearnVertexTable(uint64_t stage_key, G3VertexTable table);
+// The kind of a covered draw's read, counted for a "GT7 G3 reads" line.
+void G3NoteRead(BufferCache::ReadKind kind);
 [[nodiscard]] uint32_t G3WriteRecord(RenderContext& context,
                                      const ShaderRecompiler::IR::BindingLayout& layout,
                                      const Gt7NativeWalk::ShadowRecord& shadow);

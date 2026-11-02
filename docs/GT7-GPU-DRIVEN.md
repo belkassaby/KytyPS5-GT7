@@ -609,3 +609,27 @@ frame rate rises ~8 %, the lower quartile most (12.5 to 14.1). What limits the f
 GT7's side: its threads spend ~0.7 s per second in write faults, which the per-draw
 synchronization's protections cause (twice the faults of G1 off). The GPU reading GT7's memory in
 place (the probe: 5.9 GB/s) removes those synchronizations and their protections.
+
+## In-place reads of GT7's memory, first attempt: 2 fps (2026-11-02)
+
+`BufferCache::BindForRead` (now behind `KYTY_GT7_G3_INPLACE=1`): a bypassed draw's ranges the GPU
+wrote go through the cache's synchronized copy, ranges neither wrote through the cache's copy as
+is, and ranges the CPU wrote since the copy are read where they lie: 4 MB windows of GT7's memory
+(the backing view, `FindBacking`) imported with `VK_EXT_external_memory_host` (the range's own
+pages where a window spans two mappings), dropped at unmaps. Race (`_g3-inplace1.txt`):
+
+| | synchronized (before) | in place |
+|---|---|---|
+| reads | | clean copies ~80 %, in place ~16 %, synchronized ~5 % |
+| bypassed draw | 2.2 us | 591 us at first (imports being made), 7 us later |
+| GPU thread, a draw | ~9 us | **86 us** |
+| fault handling on GT7's threads | ~0.7 s/s | **1.2 s/s** |
+| a store to a GPU-written page handled in place | 65 us | **686 us** |
+| frame rate | 15.3 | **~2** while imports were made; 10 to 15 once they settled (bypassed draws 10 to 16 us: thousands of small imports, the 4 MB windows mostly refused, 8 MB imported in all) |
+
+The driver pins the imported pages, and Kyty's write tracking changes their protection all the
+time (each sync protects, each CPU write faults): every protection change and fault on pinned
+memory became ~10 times as slow. Reading the game's memory in place therefore needs the memory read
+in place left out of write tracking altogether: a renderer-wide change of how CPU-written memory
+reaches the GPU (the full path synchronizes the same pages for its draws), not a covered-draw one.
+Off by default; the bypass reads as before (15.3 fps).

@@ -4901,6 +4901,21 @@ bool G3SlotReady(TextureCache& textures, uint32_t array, uint32_t slot, uint64_t
 	return true;
 }
 
+// G3 in-place reads: what the covered draws' reads were (clean copies, in place, synchronized),
+// every 10 s ("GT7 G3 reads").
+void G3NoteRead(BufferCache::ReadKind kind) {
+	static std::array<uint64_t, 3> counts {};
+	static auto                    last = std::chrono::steady_clock::now();
+	counts[static_cast<size_t>(kind)]++;
+	if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(10)) {
+		LOGF("GT7 G3 reads (10 s): clean copies %" PRIu64 ", in place %" PRIu64 ", synchronized %" PRIu64
+		     "\n",
+		     counts[0], counts[1], counts[2]);
+		counts = {};
+		last   = now;
+	}
+}
+
 // A light grid's record words: its guest base (words 0-1) turned into the device address of the
 // buffer cache's synchronized copy (the grid's layers, as ObtainBuffer gives a read binding).
 static bool G3GridDeviceAddress(RenderContext& context, uint32_t* words) {
@@ -4909,11 +4924,13 @@ static bool G3GridDeviceAddress(RenderContext& context, uint32_t* words) {
 	if (guest < BufferCache::CACHING_PAGESIZE || size == 0) {
 		return false;
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(guest, size, false, false, {}, true);
-	if (buffer == nullptr || !buffer->HasDeviceAddress()) {
+	BufferCache::ReadBinding binding;
+	BufferCache::ReadKind    kind {};
+	if (!context.GetBufferCache().BindForRead(guest, size, binding, &kind)) {
 		return false;
 	}
-	const auto device = buffer->BufferDeviceAddress() + offset;
+	G3NoteRead(kind);
+	const auto device = binding.address;
 	words[0]          = static_cast<uint32_t>(device);
 	words[1]          = static_cast<uint32_t>(device >> 32u);
 	return true;
@@ -4939,19 +4956,20 @@ uint32_t G3WriteRecord(RenderContext& context, const ShaderRecompiler::IR::Bindi
 		if (size == 0) {
 			continue; // a null binding: no address, no length
 		}
-		auto* buffer = cache.TakeOwnerSynced(address, size);
-		if (buffer == nullptr) {
+		BufferCache::ReadBinding binding;
+		BufferCache::ReadKind    kind {};
+		if (!cache.BindForRead(address, size, binding, &kind)) {
 			return UINT32_MAX;
 		}
-		const auto offset     = address - buffer->CpuAddress();
-		const auto aligned    = Common::AlignDown(offset, alignment);
-		const auto adjustment = static_cast<uint32_t>(offset - aligned);
+		G3NoteRead(kind);
+		// The device address of the 256-aligned start before it, and the bytes after it.
+		const auto adjustment = static_cast<uint32_t>(binding.address % alignment);
 		if (adjustment >= 256) {
 			return UINT32_MAX;
 		}
 		words[layout.memory_offset_dword + i / 4u] |= adjustment << ((i % 4u) * 8u);
 		words[layout.BufferLengthDword() + i] = BindingLengthDwords(size + adjustment, false);
-		const auto device = buffer->BufferDeviceAddress() + aligned;
+		const auto device = binding.address - adjustment;
 		words[layout.BufferAddressDword() + 2u * i]      = static_cast<uint32_t>(device);
 		words[layout.BufferAddressDword() + 2u * i + 1u] = static_cast<uint32_t>(device >> 32u);
 	}

@@ -2979,11 +2979,15 @@ bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& arg
 	// holds (small CPU-written index data goes to the stream ring), the buffer cache's usual way.
 	vk::Buffer     index_handle = nullptr;
 	vk::DeviceSize index_offset = 0;
-	if (auto* index = m_context.GetBufferCache().TakeOwnerSynced(index_source.address,
-	                                                              index_source.size);
-	    index != nullptr) {
-		index_handle = index->Handle();
-		index_offset = index->Offset(index_source.address);
+	{
+		BufferCache::ReadBinding binding;
+		BufferCache::ReadKind    kind {};
+		if (m_context.GetBufferCache().BindForRead(index_source.address, index_source.size, binding,
+		                                           &kind)) {
+			G3NoteRead(kind);
+			index_handle = binding.buffer;
+			index_offset = binding.offset;
+		}
 	}
 	// The vertex buffers, from the record's vertex table ranges.
 	PreparedVertexBuffers vertex_buffers;
@@ -3005,12 +3009,14 @@ bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& arg
 				vertex_buffers.buffers[i] = cache.GetBuffer(NULL_BUFFER_ID).Handle();
 				continue;
 			}
-			auto* owner = cache.TakeOwnerSynced(vertex.vertex_address[i], vertex.vertex_size[i]);
-			if (owner == nullptr) {
+			BufferCache::ReadBinding binding;
+			BufferCache::ReadKind    kind {};
+			if (!cache.BindForRead(vertex.vertex_address[i], vertex.vertex_size[i], binding, &kind)) {
 				return result(G3BufferRange);
 			}
-			vertex_buffers.buffers[i] = owner->Handle();
-			vertex_buffers.offsets[i] = owner->Offset(vertex.vertex_address[i]);
+			G3NoteRead(kind);
+			vertex_buffers.buffers[i] = binding.buffer;
+			vertex_buffers.offsets[i] = binding.offset;
 			vertex_buffers.sizes[i]   = vertex.vertex_size[i];
 		}
 	}
