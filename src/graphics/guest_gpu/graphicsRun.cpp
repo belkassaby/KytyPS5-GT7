@@ -1902,8 +1902,16 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			return;
 		}
 		FrameGraph::SetGuestQueue(m_interrupt_event_id);
+		const auto native_start = std::chrono::steady_clock::now();
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
+		if (::Loader::Gt7NativeDraws::Enabled()) {
+			::Loader::Gt7NativeDraws::NoteDispatch(
+			    m_sh_ctx.GetCs().cs_regs.data_addr,
+			    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                              std::chrono::steady_clock::now() - native_start)
+			                              .count()));
+		}
 	}
 	CompleteDispatch();
 }

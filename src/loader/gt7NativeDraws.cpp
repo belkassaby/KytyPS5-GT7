@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -1938,6 +1939,100 @@ void Install(uint64_t main_base) {
 	Log::WriteToConsoleAndLog(fmt::format("Native draws: installed on gt7_BindMaterial{}{}\n",
 	                                      mesh_free ? ", gt7_DrawMeshClusters" : "",
 	                                      commit_free ? ", gt7_CommitDrawState" : ""));
+}
+
+} // namespace Loader::Gt7NativeDraws
+
+namespace Loader::Gt7NativeDraws {
+
+namespace {
+// The pending dispatch marker (GPU thread), and the census (GPU thread only).
+uint64_t g_dispatch_code    = 0;
+bool     g_dispatch_pending = false;
+struct DispatchKeyStats {
+	uint64_t count = 0;
+	uint64_t ns    = 0;
+};
+std::map<std::pair<uint64_t, uint64_t>, DispatchKeyStats> g_dispatch_keys; // (code, shader)
+uint64_t                                                  g_dispatch_marked   = 0;
+uint64_t                                                  g_dispatch_unmarked = 0;
+uint64_t                                                  g_dispatch_unmarked_ns = 0;
+auto g_dispatch_last = std::chrono::steady_clock::now();
+} // namespace
+
+bool ForDispatch(uint64_t guest_return_address) {
+	// The eboot's code: GT7's own passes (its modules' and the emulator's calls are not marked).
+	return g_enabled && guest_return_address >= g_main_base &&
+	       guest_return_address < g_main_base + 0x8000000u;
+}
+
+void WriteDispatchMarker(uint32_t* packet, uint64_t guest_return_address) {
+	const uint64_t offset = guest_return_address - g_main_base;
+	packet[0]             = KYTY_PM4(DispatchMarkerDwords, Pm4::IT_NOP, Pm4::R_GT7_DISPATCH);
+	packet[1]             = static_cast<uint32_t>(offset);
+	packet[2]             = static_cast<uint32_t>(offset >> 32u);
+}
+
+void OnDispatchMarker(const uint32_t* payload, uint32_t dwords) {
+	if (dwords < DispatchMarkerDwords - 1) {
+		return;
+	}
+	g_dispatch_code    = payload[0] | (static_cast<uint64_t>(payload[1]) << 32u);
+	g_dispatch_pending = true;
+}
+
+void NoteDispatch(uint64_t cs_address, uint64_t renderer_ns) {
+	if (g_dispatch_pending) {
+		auto& stats = g_dispatch_keys[{g_dispatch_code, cs_address}];
+		stats.count++;
+		stats.ns += renderer_ns;
+		g_dispatch_marked++;
+		g_dispatch_pending = false;
+	} else {
+		g_dispatch_unmarked++;
+		g_dispatch_unmarked_ns += renderer_ns;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_dispatch_last < ReportEvery) {
+		return;
+	}
+	g_dispatch_last = now;
+	// By the issuing code: dispatches, time, and how many shaders it runs.
+	struct Code {
+		uint64_t count = 0, ns = 0, shaders = 0;
+	};
+	std::map<uint64_t, Code> codes;
+	uint64_t                 marked_ns = 0;
+	for (const auto& [key, stats]: g_dispatch_keys) {
+		auto& code = codes[key.first];
+		code.count += stats.count;
+		code.ns += stats.ns;
+		code.shaders++;
+		marked_ns += stats.ns;
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> order;
+	for (const auto& [code, totals]: codes) {
+		order.emplace_back(totals.ns, code);
+	}
+	std::ranges::sort(order, std::greater {});
+	LOGF("Compute census (10 s): %" PRIu64 " marked dispatches (%.1f us each, %zu (code, shader) keys "
+	     "from %zu codes), %" PRIu64 " unmarked (%.1f us each)\n",
+	     g_dispatch_marked,
+	     g_dispatch_marked != 0 ? static_cast<double>(marked_ns) / 1000.0 / g_dispatch_marked : 0.0,
+	     g_dispatch_keys.size(), codes.size(), g_dispatch_unmarked,
+	     g_dispatch_unmarked != 0
+	         ? static_cast<double>(g_dispatch_unmarked_ns) / 1000.0 / g_dispatch_unmarked
+	         : 0.0);
+	for (size_t i = 0; i < std::min<size_t>(order.size(), 25); i++) {
+		const auto& totals = codes[order[i].second];
+		LOGF("  code 0x%09" PRIx64 ": %" PRIu64 " dispatches, %.1f ms, %.1f us each, %" PRIu64
+		     " shaders\n",
+		     g_main_base + order[i].second, totals.count, static_cast<double>(totals.ns) / 1e6,
+		     static_cast<double>(totals.ns) / 1000.0 / std::max<uint64_t>(totals.count, 1),
+		     totals.shaders);
+	}
+	g_dispatch_keys.clear();
+	g_dispatch_marked = g_dispatch_unmarked = g_dispatch_unmarked_ns = 0;
 }
 
 } // namespace Loader::Gt7NativeDraws

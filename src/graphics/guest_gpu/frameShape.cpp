@@ -373,7 +373,7 @@ bool IsCommandPacket(uint32_t opcode, uint32_t custom) {
 		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
 		case Pm4::IT_DISPATCH_DIRECT:
 		case Pm4::IT_DISPATCH_INDIRECT: return true;
-		case Pm4::IT_NOP: return custom == Pm4::R_GT7_DRAW;
+		case Pm4::IT_NOP: return custom == Pm4::R_GT7_DRAW || custom == Pm4::R_GT7_DISPATCH;
 		default: return false;
 	}
 }

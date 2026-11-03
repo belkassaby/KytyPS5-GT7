@@ -1789,6 +1789,16 @@ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_
 		return nullptr;
 	}
 
+	// GT7 port, native path: the GT7 code that issued this dispatch, just before it.
+	if (::Loader::Gt7NativeDraws::Enabled() &&
+	    ::Loader::Gt7NativeDraws::ForDispatch(reinterpret_cast<uint64_t>(__builtin_return_address(0)))) {
+		if (auto* marker = buf->AllocateDW(::Loader::Gt7NativeDraws::DispatchMarkerDwords);
+		    marker != nullptr) {
+			::Loader::Gt7NativeDraws::WriteDispatchMarker(
+			    marker, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+		}
+	}
+
 	auto* cmd = buf->AllocateDW(5);
 
 	if (cmd == nullptr) {

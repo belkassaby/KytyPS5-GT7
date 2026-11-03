@@ -217,3 +217,28 @@ Race: marked draws 373,000 to 407,000 per 10 s (290,000 to 365,000 before), bypa
 draws learning refuses: tessellated 50,000, occlusion queries 37,000, mesh 23,000 per 10 s.
 15.8 fps median (p25 14.7, p75 17.1): unchanged, the GPU thread still translates ~470,000 draws
 and ~230,000 dispatches per 12.5 s.
+
+### Compute census (2026-11-03)
+
+`AgcCbDispatch` marks each dispatch GT7's eboot issues with the issuing code's address
+(`R_GT7_DISPATCH`, `Gt7NativeDraws::ForDispatch`); the GPU thread counts them by (code, compute
+shader) with the renderer's time (`NoteDispatch`, a "Compute census" line every 10 s). Race:
+226,000 to 257,000 dispatches per 10 s, **all marked**, 8.7 to 9.0 us each, from only **95 to 102
+(code, shader) keys** and 70 to 74 codes. By GT7 function (six windows, 11.2 s of GPU thread):
+
+| GT7 function | Dispatches | GPU thread ms | us each | Shaders |
+|---|---|---|---|---|
+| `FUN_9016a0660` | 622,591 | 5,290 | 8.5 | 11 |
+| `gt7_DrawCaller2_de170` | 121,177 | 1,114 | 9.2 | 1 |
+| `FUN_9016abc80` | 50,367 | 842 | 16.7 | 1 |
+| `FUN_9016ac630` | 50,367 | 795 | 15.8 | 1 |
+| `gt7_BuildDrawTextureRecord_caller` | 139,895 | 629 | 4.5 | 1 |
+| `FUN_9000d23d0` | 50,367 | 534 | 10.6 | 1 |
+| `FUN_90018b960` | 35,209 | 475 | 13.5 | 1 |
+| `FUN_9016aa960` | 50,367 | 346 | 6.9 | 1 |
+| ~60 more | | ~1,130 | | |
+
+Nine functions and ~20 shaders are 90 % of the compute time: compute records keyed on (code,
+shader), learned once each like the draw states, cover nearly all of it. A dispatch's 9 us is
+half buffers (4.2 us: syncing and protecting what it writes) and half lookups (program 2.3 us,
+bindings ~2.5): the records remove the lookups; the written buffers need the memory split.

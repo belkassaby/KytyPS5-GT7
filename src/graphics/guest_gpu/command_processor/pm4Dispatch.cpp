@@ -236,6 +236,7 @@ constexpr auto MakeCustomOpcodeDispatchTable() {
 	g_cp_op_custom_func[Pm4::R_RELEASE_MEM]    = CpOpReleaseMem;
 	g_cp_op_custom_func[Pm4::R_CONTEXT_STATE]  = CpOpContextState;
 	g_cp_op_custom_func[Pm4::R_GT7_DRAW]       = CpOpGt7Draw;
+	g_cp_op_custom_func[Pm4::R_GT7_DISPATCH]   = CpOpGt7Dispatch;
 
 	return g_cp_op_custom_func;
 }

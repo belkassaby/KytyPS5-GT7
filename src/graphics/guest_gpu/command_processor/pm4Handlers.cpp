@@ -2412,6 +2412,15 @@ KYTY_CP_OP_PARSER(CpOpGt7Draw) {
 	return dw_num + 1;
 }
 
+// GT7 port, native path: the GT7 code that issued the dispatch that follows.
+KYTY_CP_OP_PARSER(CpOpGt7Dispatch) {
+	KYTY_PROFILER_FUNCTION();
+
+	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
+	::Loader::Gt7NativeDraws::OnDispatchMarker(buffer, dw_num + 1);
+	return dw_num + 1;
+}
+
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_FUNCTION();
 

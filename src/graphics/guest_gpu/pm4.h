@@ -90,6 +90,8 @@ constexpr uint32_t R_DMA_DATA       = 0x19;
 constexpr uint32_t R_CONTEXT_STATE  = 0x1A;
 // GT7 port, native path: a draw's engine identity (loader/gt7NativeDraws.h), before the draw
 constexpr uint32_t R_GT7_DRAW       = 0x1B;
+// GT7 port, native path: the GT7 code that issued the dispatch that follows (its return address)
+constexpr uint32_t R_GT7_DISPATCH   = 0x1C;
 
 constexpr uint32_t R_NUM = 0x3F + 1;
 
