@@ -190,8 +190,8 @@ GPU thread:
 | `gt7_DrawIndex` | 2,300 | marked |
 | `gt7_Draw_1a3a890` (`AgcDcbDrawIndexIndirect`) | 7,900 | not marked |
 | `gt7_DrawAuto`, `gt7_Draw_9bb0`, `gt7_Draw_53930`, `gt7_Draw_1a070` (`AgcDcbDrawIndexAuto`) | 11,200 | not marked |
-| dispatches, `FUN_9016a0660` (a compute pass: SH user data, then dispatch) | 10,200 | no |
-| dispatches, `gt7_BuildDrawTextureRecord_caller`, `gt7_DrawCaller2_de170`, ~20 more | 11,800 | no |
+| dispatches, `gt7_TireCompute_A` (a compute pass: SH user data, then dispatch) | 10,200 | no |
+| dispatches, `gt7_BuildDrawTextureRecord_caller`, `gt7_RenderModel`, ~20 more | 11,800 | no |
 
 ### Buffer range fallbacks closed (2026-11-03)
 
@@ -228,17 +228,38 @@ shader) with the renderer's time (`NoteDispatch`, a "Compute census" line every 
 
 | GT7 function | Dispatches | GPU thread ms | us each | Shaders |
 |---|---|---|---|---|
-| `FUN_9016a0660` | 622,591 | 5,290 | 8.5 | 11 |
-| `gt7_DrawCaller2_de170` | 121,177 | 1,114 | 9.2 | 1 |
-| `FUN_9016abc80` | 50,367 | 842 | 16.7 | 1 |
-| `FUN_9016ac630` | 50,367 | 795 | 15.8 | 1 |
+| `gt7_TireCompute_A` | 622,591 | 5,290 | 8.5 | 11 |
+| `gt7_RenderModel` | 121,177 | 1,114 | 9.2 | 1 |
+| `gt7_TireCompute_B` | 50,367 | 842 | 16.7 | 1 |
+| `gt7_TireCompute_C` | 50,367 | 795 | 15.8 | 1 |
 | `gt7_BuildDrawTextureRecord_caller` | 139,895 | 629 | 4.5 | 1 |
-| `FUN_9000d23d0` | 50,367 | 534 | 10.6 | 1 |
+| `gt7_TireRenderer_Dispatch` | 50,367 | 534 | 10.6 | 1 |
 | `FUN_90018b960` | 35,209 | 475 | 13.5 | 1 |
-| `FUN_9016aa960` | 50,367 | 346 | 6.9 | 1 |
+| `gt7_TireCompute_D` | 50,367 | 346 | 6.9 | 1 |
 | ~60 more | | ~1,130 | | |
 
 Nine functions and ~20 shaders are 90 % of the compute time: compute records keyed on (code,
 shader), learned once each like the draw states, cover nearly all of it. A dispatch's 9 us is
 half buffers (4.2 us: syncing and protecting what it writes) and half lookups (program 2.3 us,
 bindings ~2.5): the records remove the lookups; the written buffers need the memory split.
+
+### GT7's compute passes named (2026-11-03)
+
+The census's functions, walked up the rebuild's call graph to the RTTI-named classes that call them
+(`ghidra-tools\gt7-labels.txt`, applied to the rebuild by `rebuild\tools\rename.py`):
+
+| Name | Was | Evidence |
+|---|---|---|
+| `gt7_TireCompute_A` | FUN_9016a0660 | under `GTRender::TireRenderer`; 11 shaders, writes through the ACB; 47 % of the compute time |
+| `gt7_TireCompute_B`, `_C`, `_D` | FUN_9016abc80, FUN_9016ac630, FUN_9016aa960 | the same caller chain, one shader each, once per tire draw (50,367 each per window) |
+| `gt7_TireRenderer_Dispatch` | FUN_9000d23d0 | called by `GTRender::TireRenderer::vf0` alone |
+| `gt7_TireRenderer_ComputePasses`, `gt7_TireRenderer_Prepare` | FUN_9000d7a50, FUN_900c47650 | the tire passes' callers under `TireRenderer::vf0` |
+| `gt7_RenderModel` | gt7_DrawCaller2_de170 | a model's draws and its per-model dispatch, from `CarGraphics`, `ModelSetRender`, `CourseGraphics`, `TreeInstanced`, `PitWork` |
+| `gt7_Grass2_Compute`, `gt7_Grass2_Render` | FUN_902cf84f0, FUN_902d05110 | from `Grass2::Prepare::vf0`, `Grass2::Usual::vf0` |
+| `gt7_Sky_TransmittanceCompute` | FUN_9000edf60 | from `(anonymous)::DrawTransmittanceMap::vf0`, 12 shaders |
+| `gt7_CommitComputeState`, `gt7_DispatchCompute` | FUN_901a33cc0, FUN_901a34000 | the engine's common compute dispatch (shadows, menus, particles, effects) |
+
+So **the tire renderer is about 70 % of GT7's compute work on the GPU thread** (the four tire
+passes and the dispatcher: ~7.8 of 11.2 s in the census windows). The second biggest is the
+per-model dispatch of `gt7_RenderModel`. Two of the census's top ten stay unnamed
+(`FUN_90018b960`, reached through a function pointer; `gt7_BuildDrawTextureRecord_caller`, kept).
