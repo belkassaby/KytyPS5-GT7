@@ -4743,6 +4743,68 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	InvalidateCpuAliases(address, size);
 }
 
+// Diagnostics: KYTY_IMAGE_FAULT_STATS=1: the images in the blocks of GT7's write faults (the
+// faults that release a block around an image), by kind, summed every 10 s: whether the CPU writes
+// the image itself ("on") or memory beside it ("beside").
+void TextureCache::NoteImageFaultStats(const ImageIds& found, uint64_t address) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_FAULT_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return;
+	}
+	struct Kind {
+		uint64_t           on     = 0;
+		uint64_t           beside = 0;
+		std::set<uint64_t> images;
+		uint64_t           first  = 0;
+	};
+	static std::map<std::string, Kind> kinds;
+	static auto                        last = std::chrono::steady_clock::now();
+	for (const auto id: found) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			continue;
+		}
+		const auto& info = image->info;
+		const auto  key  = fmt::format(
+            "format {} {}x{}x{} tile {} bytes 0x{:x} gpu-written {} target {} tracked {}",
+            static_cast<int>(info.pixel_format), info.extent.width, info.extent.height,
+            info.resources.layers, static_cast<int>(info.tile_mode), info.data.size,
+            image->IsGpuModified() ? 1 : 0, image->binding.is_target ? 1 : 0,
+            image->IsTracked() ? 1 : 0);
+		auto& kind = kinds[key];
+		if (address >= info.data.address && address < info.data.address + info.data.size) {
+			kind.on++;
+		} else {
+			kind.beside++;
+		}
+		if (kind.images.size() < 4096) {
+			kind.images.insert(info.data.address);
+		}
+		if (kind.first == 0) {
+			kind.first = info.data.address;
+		}
+	}
+	if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(10)) {
+		std::vector<std::pair<uint64_t, const std::string*>> order;
+		for (const auto& [key, kind]: kinds) {
+			order.emplace_back(kind.on + kind.beside, &key);
+		}
+		std::sort(order.rbegin(), order.rend());
+		LOGF("Image fault stats (10 s, KYTY_IMAGE_FAULT_STATS): %zu kinds\n", kinds.size());
+		for (size_t i = 0; i < std::min<size_t>(order.size(), 20); i++) {
+			const auto& kind = kinds[*order[i].second];
+			LOGF("  %s: faults on it %" PRIu64 ", beside it %" PRIu64 ", %zu images, first 0x%016" PRIx64
+			     "\n",
+			     order[i].second->c_str(), kind.on, kind.beside, kind.images.size(), kind.first);
+		}
+		kinds.clear();
+		last = now;
+	}
+}
+
 bool TextureCache::InvalidateMemoryNear(uint64_t address, uint64_t size, uint64_t block,
                                         uint64_t block_size, uint64_t* image_pages) {
 	if (!GuestRange {address, size}.Valid() || !GuestRange {block, block_size}.Valid()) {
@@ -4761,6 +4823,7 @@ bool TextureCache::InvalidateMemoryNear(uint64_t address, uint64_t size, uint64_
 	if (found.empty()) {
 		return false;
 	}
+	NoteImageFaultStats(found, address);
 	if (image_pages != nullptr) {
 		// The pages the texture cache watches for each image (its tracked range: an image a CPU
 		// write untracked is uploaded again at its next use, and its pages need no fault of

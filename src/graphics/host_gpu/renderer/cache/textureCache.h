@@ -423,6 +423,7 @@ private:
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
+	void NoteImageFaultStats(const ImageIds& found, uint64_t address);
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
 
 	// The registered images of each page of the image page table: written under m_lock, read

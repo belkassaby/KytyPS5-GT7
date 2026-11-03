@@ -3983,7 +3983,14 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				}
 			}
 		}
-		if (!from_record) {
+		if (!from_record && program.info.images[i].grid) {
+			// A light grid the shader reads by address (G3): no texture cache image over GT7's
+			// per-frame memory. Tracking one write-protected its pages at every use, and GT7's
+			// CPU writes them every frame: about 90 % of the write faults around images.
+			auto desc = NullTextureDesc(program.info.images[i], TextureCache::BindingType::Texture);
+			const auto id = m_context.GetTextureCache().FindImage(desc);
+			binding       = {id, nullptr, std::move(desc)};
+		} else if (!from_record) {
 			binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
 		} else if (Gt7NativeImagesMode() == 2) {
 			const auto again = ResolveTexture(program.info.images[i], snapshot.images[i], false);
@@ -4014,6 +4021,26 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				g_g3_grids[key] = {info.extent.width, info.extent.height, info.resources.layers,
 				                   info.pitch * 8u,
 				                   static_cast<uint32_t>(info.data.size / info.resources.layers)};
+			}
+		}
+		if (grid) {
+			// Diagnostics: the light grids still resolved as texture cache images (not read by
+			// address), by shader and draw table level, every 10 s.
+			static std::mutex                                      who_mutex;
+			static std::map<std::tuple<uint64_t, uint32_t, uint32_t>, uint64_t> who;
+			static auto                                            who_last = std::chrono::steady_clock::now();
+			std::lock_guard                                        who_lock(who_mutex);
+			who[{program.shader_hash, program.bindings.draw_table ? 1u : 0u,
+			     program.bindings.record ? 1u : 0u}]++;
+			if (const auto now = std::chrono::steady_clock::now(); now - who_last >= std::chrono::seconds(10)) {
+				std::string text;
+				for (const auto& [key, count]: who) {
+					text += fmt::format(" {:016x}/table{}/record{}:{}", std::get<0>(key), std::get<1>(key),
+					                    std::get<2>(key), count);
+				}
+				LOGF("Light grids resolved as images (10 s):%s\n", text.c_str());
+				who.clear();
+				who_last = now;
 			}
 		}
 		if (grid) {

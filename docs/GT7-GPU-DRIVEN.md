@@ -694,3 +694,20 @@ regions off):
 Write faults in the race: about 2,000 a frame on 1,300 pages in 650 blocks; 45-48% "released the
 block around an image", 30-34% "released a block" (buffers). Images over GT7's blocks are the
 largest single cause, not GPU-written buffers.
+
+## Image write faults: light grids (2026-11-02)
+
+`KYTY_IMAGE_FAULT_STATS=1` names the images in the blocks of write faults that release a block
+around an image (by kind, every 10 s). In a race about 4 of 4.5 million were GT7's light grids
+(linear R32G32_UINT arrays: 30x17x16, 16x4x8, 8x8x48, 4x2x8, 8x4x8; up to 1,000 live), then a
+512x256 R32_SFLOAT linear image (0.7 million), all in GT7's per-frame memory (0x1000000000 to
+0x1005000000), none GPU-written. At the faults the grids are untracked: their own page watchers
+are not what faults, the buffer cache's protections of the same pages are (grids read through
+buffers, `G3GridDeviceAddress`), and the images only make the fault release the block around them.
+
+A light grid the shader reads by address (`ImageResource::grid`, G3) is no longer resolved as a
+texture cache image on the full path (a null texture is bound; the grid words come from the T#):
+15.3 fps median (p25 14.1, p75 17.0) against 14.8, write faults 49k/s against 56k/s, lighting
+right. Grid images are still made (16x4x8, 30x17x16, 8x4x8): by shaders whose grids are not read
+by address (`Light grids resolved as images` names them). Next: those read by address too, and a
+direct region over the grid memory (GPU-read only), so their reads need no sync or protection.
