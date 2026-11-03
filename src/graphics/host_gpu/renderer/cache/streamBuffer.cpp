@@ -326,7 +326,19 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               uint64_t size, vk::Buffer imported_buffer, vk::DeviceMemory imported_memory,
+               vk::DeviceAddress address)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_cpu_address(cpu_address), m_device_address(address), m_buffer(imported_buffer),
+      m_imported_memory(imported_memory), m_size(size), m_coherent(true) {}
+
 Buffer::~Buffer() {
+	if (m_imported_memory != nullptr) {
+		m_graphics->device.destroyBuffer(m_buffer, nullptr);
+		m_graphics->device.freeMemory(m_imported_memory, nullptr);
+		return;
+	}
 	if (m_buffer != nullptr) {
 		if (m_device_address != 0 && BufferAddressLog::Recording()) {
 			BufferAddressLog::NoteDestroyed(

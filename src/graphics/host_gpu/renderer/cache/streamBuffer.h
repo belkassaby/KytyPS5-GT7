@@ -44,6 +44,10 @@ public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
 	       bool host_cached = false);
+	// GT7 direct regions (BufferCache::TryCreateDirect): a buffer over guest memory the caller
+	// imported (VK_EXT_external_memory_host): its buffer and memory, freed with it.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, uint64_t size,
+	       vk::Buffer imported_buffer, vk::DeviceMemory imported_memory, vk::DeviceAddress address);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -88,6 +92,9 @@ public:
 	// or dispatch used it again before the download landed (then it stays).
 	bool         gc_pending = false;
 	mutable bool gc_reused  = false;
+	// GT7 direct region: the guest memory itself (imported), never synchronized, write-tracked,
+	// downloaded or collected.
+	bool         direct     = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -105,6 +112,7 @@ private:
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
+	vk::DeviceMemory              m_imported_memory = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	uint32_t                      m_properties = 0;

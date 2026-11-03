@@ -634,7 +634,7 @@ in place left out of write tracking altogether: a renderer-wide change of how CP
 reaches the GPU (the full path synchronizes the same pages for its draws), not a covered-draw one.
 Off by default; the bypass reads as before (15.3 fps).
 
-## Next: direct regions (design, 2026-11-02; not implemented yet)
+## Direct regions (2026-11-02: implemented; every hot block is GPU-written, so none stays direct)
 
 AnyPS5 upstream was measured on GT7 in a separate session (never reached a race; ~47 to 54 us a
 draw): the port stays on Kyty. The frame is now limited by write faults on GT7's threads, both
@@ -652,3 +652,24 @@ memory, no read-back protections); `ObtainBuffer`/`Written`/`Tracked` return it 
 garbage collector skips it; a request straddling a region's edge stops with a message (to see if
 it happens). Every draw and dispatch, full path and bypass, then reads and writes those pages in
 place, never write-tracked: no faults there. Then the generated-commands runs.
+
+**Results.** As designed, all three regions that were imported crashed GT7 on loading a race (the
+musical rally): GT7's own structures in them (linked lists, pointers) read back with their high
+dwords overwritten, then a null or garbage jump. The same build without `KYTY_DIRECT_REGIONS`
+does not crash. Kyty's GPU runs later than the PS5's, and GT7 reuses memory its GPU wrote once it
+takes the GPU done with it: a cached buffer's copy keeps such a late write out of GT7's memory
+(its CPU writes win), where in a direct region it landed over what GT7's CPU had written since.
+Fixes on the way, all kept: the BDA walk's batched uploads and `DownloadBufferWindow` skip direct
+buffers (they copied a stale snapshot of the memory over itself); an import waits for downloads
+into the region still on their way and refuses it over GPU-written bytes no buffer holds; an unmap
+drops the direct buffer (it holds the old pages); a fast readback from one stops the emulator.
+
+Direct regions are therefore for memory the GPU only reads: `DropDirect` turns a region back into
+a cached buffer at the GPU's first write (a written binding, range or tracked write, before it is
+recorded; a write `MarkGpuWritten` sees only after, logged as such). Race with all five hot
+addresses: no crash, but every region imported was dropped within milliseconds (0xf438800000 by a
+written binding at 0xf439f640a0+0x10, 0x125b600000 by a written range at 0x125b703e80+0x68,
+0x143d000000 by one at 0x143d051c00+0x18; 0xec06020000 and 0x125b5e0000's region never imported);
+14.8 fps median (p25 13.8, p75 16.2), 56k faults/s: the bypass as before. The fault churn is in
+blocks both the GPU and GT7's CPU write. Removing it needs those kept apart (the GT7 rebuild
+placing GPU-written data in its own blocks) or GPU writes that never land late.

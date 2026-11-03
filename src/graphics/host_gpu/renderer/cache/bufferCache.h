@@ -20,6 +20,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <string>
@@ -122,6 +123,10 @@ public:
 	[[nodiscard]] bool BindForRead(uint64_t vaddr, uint64_t size, ReadBinding& out, ReadKind* kind);
 	// Unmap (the GPU thread, the GPU idle): the imports over [vaddr, vaddr + size) dropped.
 	void ForgetImports(uint64_t vaddr, uint64_t size);
+	// GT7 direct regions (KYTY_DIRECT_REGIONS): the direct buffer holding [vaddr, vaddr + size)
+	// whole, or null.
+	[[nodiscard]] Buffer* DirectOwner(uint64_t vaddr, uint64_t size);
+	void DropDirect(Buffer& buffer, uint64_t vaddr, uint64_t size, const char* why);
 	// Bytes of the game's memory imported now.
 	[[nodiscard]] uint64_t ImportedBytes() const noexcept { return m_imported_bytes; }
 	// needs_device_address: the caller reads the data through a buffer device address, which
@@ -536,6 +541,19 @@ private:
 		uint64_t          size    = 0;
 	};
 	[[nodiscard]] const GuestImport* ImportGuestRange(uint64_t vaddr, uint64_t size);
+	// GT7 direct regions: hot mappings GT7 writes every frame (KYTY_DIRECT_REGIONS: addresses in
+	// them; KYTY_DIRECT_MAX_MB, 64 by default, the most of each), each one buffer over the guest
+	// memory itself, imported once, made at the first buffer request inside it while nothing is
+	// cached over it. State: 0 not resolved (its mapping not seen yet), 1 resolved, 2 refused, 3 made.
+	struct DirectRegion {
+		uint64_t hot   = 0;
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint8_t  state = 0;
+	};
+	[[nodiscard]] std::optional<BufferId> TryCreateDirect(uint64_t vaddr, uint64_t size);
+	std::vector<DirectRegion> m_direct_regions;
+	bool                      m_direct_loaded = false;
 	[[nodiscard]] bool               ImportWindow(uint64_t vaddr, uint64_t size);
 	std::map<uint64_t, GuestImport>                    m_imports;
 	std::unordered_map<uint64_t, uint8_t>              m_import_refused;

@@ -1378,9 +1378,12 @@ void WindowContext::CreateVulkan() {
 		}
 		// Round 116, KYTY_HOST_IMPORT_PROBE=1 (renderer/cache/hostImportProbe.h).
 		// And GT7 GPU-driven G3's in-place reads (KYTY_GT7_G3_INPLACE=1: BufferCache::BindForRead).
+		// And the direct regions (KYTY_DIRECT_REGIONS: BufferCache::TryCreateDirect).
 		const char* inplace = std::getenv("KYTY_GT7_G3_INPLACE");
+		const char* direct  = std::getenv("KYTY_DIRECT_REGIONS");
 		if (const char* probe = std::getenv("KYTY_HOST_IMPORT_PROBE");
-		    (probe != nullptr && probe[0] == '1') || (inplace != nullptr && inplace[0] == '1')) {
+		    (probe != nullptr && probe[0] == '1') || (inplace != nullptr && inplace[0] == '1') ||
+		    (direct != nullptr && direct[0] != '\0')) {
 			if (HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
 				device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 				graphic_ctx.external_memory_host_enabled = true;

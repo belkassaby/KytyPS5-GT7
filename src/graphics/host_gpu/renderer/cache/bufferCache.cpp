@@ -234,6 +234,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 template <bool async>
 bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size,
                                        uint64_t* downloaded) {
+	if (buffer.direct) {
+		return false; // the guest memory itself: a copy back would land stale bytes over the CPU's
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -1509,6 +1512,7 @@ bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, ui
                                uint64_t window_end, bool is_write, bool wait_here) {
 	// Round 135: why nothing was copied, for ReadMemoryStep (readwait:writer) and the counts.
 	m_fast_refusal      = FastRefusal::Unavailable;
+	EXIT_IF(buffer.direct); // never GPU-written (MarkGpuWritten), so never read back
 	m_fast_writer_tick  = 0;
 	m_fast_left         = 0;
 	m_fast_refused_tick = 0;
@@ -2177,7 +2181,17 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	}
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
+	if (const auto direct = TryCreateDirect(vaddr, size); direct.has_value()) {
+		return *direct;
+	}
 	const auto overlap = ResolveOverlaps(vaddr, size);
+	for (auto it = overlap.first; it != overlap.last; ++it) {
+		if (m_slot_buffers[it->second].direct) {
+			EXIT("BufferCache: a buffer request 0x%016" PRIx64 "+0x%" PRIx64
+			     " reaches past the direct region at 0x%016" PRIx64 "\n",
+			     vaddr, size, m_slot_buffers[it->second].CpuAddress());
+		}
+	}
 
 	// A mirror far larger than the request means the merge, not a descriptor, chose this
 	// size: buffers only ever grow here, so one that swallows its neighbours as a title
@@ -2327,6 +2341,9 @@ static void NoteSyncRepeat(uint64_t vaddr, uint64_t size, bool is_written, bool 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	KYTY_PROFILER_FUNCTION();
+	if (buffer.direct) {
+		return false; // the guest memory itself
+	}
 	const GpuPhases::Scope phase(GpuPhases::Phase::BufferSync);
 	if (t_guest_gpu_thread) {
 		NoteSyncRepeat(vaddr, size, is_written, is_texel_buffer);
@@ -2537,6 +2554,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
+	if (auto* direct = DirectOwner(vaddr, size); direct != nullptr) {
+		if (is_written) {
+			DropDirect(*direct, vaddr, size, "a written binding");
+			id = {};
+		} else {
+			TouchBuffer(*direct);
+			direct->last_use_tick = m_scheduler.CurrentTick();
+			return {direct, direct->Offset(vaddr)};
+		}
+	}
 
 	if (auto& stream = ActiveStream(); !is_written && size <= CACHING_PAGESIZE &&
 	                                   (!needs_device_address || stream.HasDeviceAddress()) &&
@@ -2683,6 +2710,23 @@ const BufferCache::GuestImport* BufferCache::ImportGuestRange(uint64_t vaddr, ui
 }
 
 void BufferCache::ForgetImports(uint64_t vaddr, uint64_t size) {
+	for (auto& region: m_direct_regions) {
+		if (region.state != 0 && region.state != 2 && region.begin < vaddr + size &&
+		    vaddr < region.end) {
+			// Its buffer holds the pages it was imported over, which memory mapped there again
+			// does not use: dropped, imported again over the new pages at its next use.
+			if (region.state == 3) {
+				if (const auto found = m_buffers.find(region.begin);
+				    found != m_buffers.end() && m_slot_buffers[found->second].direct) {
+					DeleteBuffer(found->second);
+				}
+				LOGF("BufferCache: direct region 0x%016" PRIx64 "+0x%" PRIx64
+				     " dropped: 0x%016" PRIx64 "+0x%" PRIx64 " unmapped\n",
+				     region.begin, region.end - region.begin, vaddr, size);
+			}
+			region.state = 0;
+		}
+	}
 	for (auto it = m_imports.begin(); it != m_imports.end();) {
 		const auto& import = it->second;
 		if (import.vaddr < vaddr + size && vaddr < import.vaddr + import.size) {
@@ -2738,6 +2782,217 @@ bool BufferCache::BindForRead(uint64_t vaddr, uint64_t size, ReadBinding& out, R
 	return buffer != nullptr && from(buffer, ReadKind::Synced);
 }
 
+// A direct region the GPU is about to write: a cached buffer from now on. Kyty's GPU runs later
+// than the PS5's, and GT7 reuses memory its GPU wrote once it takes the GPU done with it: the
+// cached buffer's copy keeps such a late write out of GT7's memory (its CPU writes win), where in
+// a direct region it landed over what GT7's CPU had written since (the crashes on loading a race,
+// docs/GT7-GPU-DRIVEN.md). Direct regions are for memory the GPU only reads.
+void BufferCache::DropDirect(Buffer& buffer, uint64_t vaddr, uint64_t size, const char* why) {
+	const auto begin  = buffer.CpuAddress();
+	const auto length = buffer.Size();
+	for (auto& region: m_direct_regions) {
+		if (region.state == 3 && region.begin == begin) {
+			region.state = 2;
+		}
+	}
+	if (const auto found = m_buffers.find(begin);
+	    found != m_buffers.end() && m_slot_buffers[found->second].direct) {
+		DeleteBuffer(found->second);
+	}
+	// The cached buffer made over it next takes its bytes from guest memory.
+	m_memory_tracker.MarkRegionAsCpuModified(begin, length);
+	m_memory_tracker.MarkBdaPending(begin, length);
+	g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+	LOGF("BufferCache: direct region 0x%016" PRIx64 "+0x%" PRIx64 " dropped: the GPU writes it (%s, "
+	     "0x%016" PRIx64 "+0x%" PRIx64 ")\n",
+	     begin, length, why, vaddr, size);
+}
+
+Buffer* BufferCache::DirectOwner(uint64_t vaddr, uint64_t size) {
+	if (m_direct_regions.empty()) {
+		return nullptr;
+	}
+	const auto id = PeekOwner(vaddr);
+	if (IsBufferInvalid(id)) {
+		return nullptr;
+	}
+	auto& buffer = m_slot_buffers[id];
+	return buffer.direct && buffer.IsInBounds(vaddr, size) ? &buffer : nullptr;
+}
+
+std::optional<BufferId> BufferCache::TryCreateDirect(uint64_t vaddr, uint64_t size) {
+	if (!m_direct_loaded) {
+		m_direct_loaded = true;
+		if (const char* list = std::getenv("KYTY_DIRECT_REGIONS"); list != nullptr) {
+			std::string text(list);
+			size_t      start = 0;
+			while (start < text.size()) {
+				const auto end = std::min(text.find(',', start), text.size());
+				if (end > start) {
+					m_direct_regions.push_back(
+					    {std::strtoull(text.substr(start, end - start).c_str(), nullptr, 16), 0, 0, 0});
+				}
+				start = end + 1;
+			}
+			LOGF("BufferCache: %zu direct regions asked for (KYTY_DIRECT_REGIONS)\n",
+			     m_direct_regions.size());
+		}
+	}
+	if (m_direct_regions.empty() || !m_graphics.external_memory_host_enabled) {
+		return std::nullopt;
+	}
+	static const uint64_t max_bytes = [] {
+		const char* value = std::getenv("KYTY_DIRECT_MAX_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {64}) << 20u;
+	}();
+	constexpr uint64_t step = CACHING_PAGESIZE;
+	for (auto& region: m_direct_regions) {
+		if (region.state == 2 || region.state == 3) {
+			continue;
+		}
+		if (region.state == 0) {
+			// The mapping around the hot address, in 64 KB steps, at most max_bytes.
+			uint64_t lo = Common::AlignDown(region.hot, step);
+			uint64_t hi = lo + step;
+			if (LibKernel::Memory::FindBacking(lo, step) == nullptr) {
+				continue; // not mapped yet
+			}
+			while (hi - lo + step <= max_bytes && lo >= step * 2 &&
+			       LibKernel::Memory::FindBacking(lo - step, hi - lo + step) != nullptr) {
+				lo -= step;
+			}
+			while (hi - lo + step <= max_bytes &&
+			       LibKernel::Memory::FindBacking(lo, hi - lo + step) != nullptr) {
+				hi += step;
+			}
+			region.begin = lo;
+			region.end   = hi;
+			region.state = 1;
+		}
+		if (vaddr < region.begin || vaddr + size > region.end) {
+			continue;
+		}
+		const auto length = region.end - region.begin;
+		const auto refuse = [&](const char* why) {
+			region.state = 2;
+			LOGF("BufferCache: direct region 0x%016" PRIx64 "+0x%" PRIx64 " refused: %s\n",
+			     region.begin, length, why);
+			return std::optional<BufferId> {};
+		};
+		// Nothing cached over it yet.
+		auto it = m_buffers.lower_bound(region.begin);
+		if (it != m_buffers.begin()) {
+			const auto& previous = m_slot_buffers[std::prev(it)->second];
+			if (previous.CpuAddress() + previous.Size() > region.begin) {
+				return refuse("a buffer was cached over it before");
+			}
+		}
+		if (it != m_buffers.end() && it->first < region.end) {
+			return refuse("a buffer was cached over it before");
+		}
+		// GPU-written bytes still on their way to guest memory (a dropped buffer's download, a
+		// fast readback): published first, or a later read fault would copy the direct buffer
+		// (the guest memory itself, still without them) back over the CPU's writes.
+		FinishFastReadbacks(region.begin, length);
+		uint64_t download_tick = 0;
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			if (m_downloading_ranges.Intersects(region.begin, length)) {
+				download_tick = m_last_async_download_tick;
+				for (const auto& batch: m_download_batches) {
+					if (batch.begin < region.end && region.begin < batch.end) {
+						download_tick = std::max(download_tick, batch.tick);
+					}
+				}
+			}
+		}
+		if (download_tick != 0) {
+			if (download_tick >= m_scheduler.CurrentTick()) {
+				m_scheduler.Flush();
+			}
+			m_scheduler.WaitPriorityOperations(download_tick);
+		}
+		if (HasGpuDirtyBytesShared(region.begin, length)) {
+			return refuse("GPU-written bytes no buffer holds are in it");
+		}
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			if (m_downloading_ranges.Intersects(region.begin, length)) {
+				return refuse("a download into it is still on its way");
+			}
+		}
+		auto* pointer = const_cast<uint8_t*>(LibKernel::Memory::FindBacking(region.begin, length));
+		const auto alignment = std::max<uint64_t>(m_graphics.imported_host_pointer_alignment, 1);
+		if (pointer == nullptr || reinterpret_cast<uint64_t>(pointer) % alignment != 0) {
+			return refuse("its backing is not importable");
+		}
+		constexpr auto handle = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+		vk::MemoryHostPointerPropertiesEXT properties {};
+		if (m_graphics.device.getMemoryHostPointerPropertiesEXT(handle, pointer, &properties) !=
+		        vk::Result::eSuccess ||
+		    properties.memoryTypeBits == 0) {
+			return refuse("the driver offers no memory type for it");
+		}
+		vk::ExternalMemoryBufferCreateInfo external {};
+		external.handleTypes = handle;
+		vk::BufferCreateInfo info {};
+		info.size  = length;
+		info.usage = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+		info.pNext = &external;
+		const std::array<uint32_t, 2> families = {m_graphics.queue_family, m_graphics.readback_family};
+		if (m_graphics.readback_family != static_cast<uint32_t>(-1) &&
+		    m_graphics.readback_family != m_graphics.queue_family) {
+			info.sharingMode           = vk::SharingMode::eConcurrent;
+			info.queueFamilyIndexCount = static_cast<uint32_t>(families.size());
+			info.pQueueFamilyIndices   = families.data();
+		}
+		vk::Buffer buffer = nullptr;
+		if (m_graphics.device.createBuffer(&info, nullptr, &buffer) != vk::Result::eSuccess) {
+			return refuse("no buffer could be made over it");
+		}
+		vk::MemoryRequirements requirements {};
+		m_graphics.device.getBufferMemoryRequirements(buffer, &requirements);
+		const auto bits = requirements.memoryTypeBits & properties.memoryTypeBits;
+		uint32_t   type = 0;
+		while (type < 32 && (bits & (1u << type)) == 0) {
+			type++;
+		}
+		vk::ImportMemoryHostPointerInfoEXT host {};
+		host.handleType   = handle;
+		host.pHostPointer = pointer;
+		vk::MemoryAllocateFlagsInfo flags {};
+		flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+		flags.pNext = &host;
+		vk::MemoryAllocateInfo allocate {};
+		allocate.allocationSize  = length;
+		allocate.memoryTypeIndex = type;
+		allocate.pNext           = &flags;
+		vk::DeviceMemory memory = nullptr;
+		if (type == 32 || requirements.size > length ||
+		    m_graphics.device.allocateMemory(&allocate, nullptr, &memory) != vk::Result::eSuccess ||
+		    m_graphics.device.bindBufferMemory(buffer, memory, 0) != vk::Result::eSuccess) {
+			m_graphics.device.destroyBuffer(buffer, nullptr);
+			if (memory) {
+				m_graphics.device.freeMemory(memory, nullptr);
+			}
+			return refuse("the import failed");
+		}
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = buffer;
+		const auto address  = m_graphics.device.getBufferAddress(&address_info);
+		const auto id = m_slot_buffers.insert(m_graphics, m_scheduler, region.begin, length, buffer,
+		                                      memory, address);
+		m_slot_buffers[id].direct = true;
+		Register(id);
+		region.state = 3;
+		LOGF("BufferCache: direct region 0x%016" PRIx64 "+0x%" PRIx64 " (%" PRIu64
+		     " KB): GT7's memory imported, read and written in place, never write-tracked\n",
+		     region.begin, length, length >> 10u);
+		return id;
+	}
+	return std::nullopt;
+}
+
 Buffer* BufferCache::TakeOwnerSynced(uint64_t vaddr, uint64_t size) {
 	auto* buffer = TakeOwnerUnsynced(vaddr, size);
 	if (buffer != nullptr) {
@@ -2753,6 +3008,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid() ||
 	    written_vaddr < vaddr || written_size > size || written_vaddr - vaddr > size - written_size) {
 		EXIT("BufferCache: invalid written-range buffer request\n");
+	}
+	if (auto* direct = DirectOwner(vaddr, size); direct != nullptr) {
+		if (true) {
+			DropDirect(*direct, vaddr, size, "a written range");
+			id = {};
+		} else {
+			TouchBuffer(*direct);
+			direct->last_use_tick = m_scheduler.CurrentTick();
+			return {direct, direct->Offset(vaddr)};
+		}
 	}
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
@@ -2815,6 +3080,16 @@ vk::DeviceAddress BufferCache::WriteBitmapAddress() {
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, uint64_t size,
                                                               BufferId id) {
+	if (auto* direct = DirectOwner(vaddr, size); direct != nullptr) {
+		if (true) {
+			DropDirect(*direct, vaddr, size, "a tracked write");
+			id = {};
+		} else {
+			TouchBuffer(*direct);
+			direct->last_use_tick = m_scheduler.CurrentTick();
+			return {direct, direct->Offset(vaddr)};
+		}
+	}
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
 	}
@@ -3268,6 +3543,19 @@ void BufferCache::WritesRecorded(bool address_writes, uint64_t shader) {
 
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
+	if (DirectOwner(vaddr, size) != nullptr) {
+		// Diagnostics: the GPU's writes into a direct region (the first 64, then every 4096th).
+		static std::atomic<uint64_t> writes {0};
+		if (const auto n = writes.fetch_add(1, std::memory_order_relaxed) + 1;
+		    n <= 64 || n % 4096 == 0) {
+			LOGF("BufferCache: GPU write %" PRIu64 " into a direct region: 0x%016" PRIx64 "+0x%" PRIx64
+			     " (tick %" PRIu64 ", tracked %d)\n",
+			     n, vaddr, size, m_scheduler.CurrentTick(), tracked ? 1 : 0);
+		}
+		// Too late to keep the write out of GT7's memory (it is recorded): dropped for the next.
+		DropDirect(*DirectOwner(vaddr, size), vaddr, size, "a write recorded before it was obtained");
+		return;
+	}
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		const auto first = Common::AlignDown(vaddr, WriteBitmapPage);
@@ -3875,6 +4163,9 @@ void BufferCache::RunGarbageCollector() {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
 		gc_visited++;
+		if (buffer.direct) {
+			return false; // the guest memory itself: nothing to free
+		}
 		if (buffer.CpuAddress() == 0) {
 			// See CreateBuffer: the tracker rejects address 0, so this one is never collected.
 			return false;
@@ -4106,6 +4397,9 @@ uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
 			}
 			for (; it != m_buffers.end() && it->first < end; ++it) {
 				const auto& buffer = m_slot_buffers[it->second];
+				if (buffer.direct) {
+					continue; // the guest memory itself: an upload would land a stale copy over it
+				}
 				const auto  start  = std::max(buffer.CpuAddress(), address);
 				const auto  finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
 				if (start >= finish) {
