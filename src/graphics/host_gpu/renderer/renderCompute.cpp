@@ -1645,6 +1645,7 @@ void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffe
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	const GpuLabelContext label_context("cs", program.shader_hash);
 	NoteDispatchRepeat(input_info.stage, input_info,
 	                   m_context.GetTextureCache().ImageSetGeneration());
 	if (GpuPhases::OpStatsOn()) {
@@ -2047,6 +2048,7 @@ void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buf
 		return;
 	}
 	// Indirect: its thread groups are on the GPU (counted as none).
+	const GpuLabelContext label_context("cs-indirect", input_info.stage.program->shader_hash);
 	if (GpuPhases::OpStatsOn()) {
 		GpuPhases::SetOpKey(input_info.stage.program->shader_hash, 0);
 	}

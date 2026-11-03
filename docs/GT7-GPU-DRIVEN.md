@@ -724,3 +724,33 @@ Warm cache: 16.2 fps median (p25 14.8, p75 17.6), against 15.3; grid image binds
 (from about 100,000); grids without words a handful. Write faults unchanged (55k/s): 42 % still
 around images (the other images in GT7's blocks), 37 % buffer blocks (grids among them: their
 reads still go through the buffer cache's synchronization).
+
+## Nsight Graphics GPU Trace (2026-11-03)
+
+Nsight Graphics 2026.4's MCP server (`ngfx-mcp.exe`, Workflow profile, HTTP on 127.0.0.1:7661)
+launches the emulator for GPU Trace; the trace itself is taken with the in-game F11 hotkey (the
+MCP `ngfx_take_gpu_trace` call fails at once with the launched session). `KYTY_GPU_LABELS=1`
+puts every recorded draw, dispatch, barrier and transfer in a debug label range,
+"<command> <context>" (`CommandRecorder::LabelRange`, `GpuLabelContext`): barriers name their
+source line, draws and dispatches their shader (`ps`, `cs`, `bypass`), the emulator's own work its
+pass (`buffer-sync`, `bda-walk`, `buffer-download`, `buffer-gc`, `image-upload`, `image-refresh`,
+`tiler`, `fault-buffer`, `conditional-clear`, `nan-scan`). Nsight reports each range's GPU time.
+
+A race frame (133 ms under the trace; 117 ms in labeled ranges; GPU busy 72 % of the frame, its
+SMs at 8.6 % of peak, 30 % of the frame waiting for idle at barriers):
+
+| GPU time | What |
+|---|---|
+| 42.4 ms | GT7's compute dispatches (1,976), **21.1 ms of them one dispatch of 2218a07ab01d4f46** |
+| 40.2 ms | draws (`draw`/`drawIndexed`/`drawIndexedIndirect`/mesh, 4,500), 6.5 ms of them bypassed |
+| 6.0 + 2.1 ms | the BDA walk's copies (422) and their barriers |
+| 5.2 ms | 1,726 barriers of `WriteDataBuffer` (the guest's CP stores, bufferCache.cpp:83) |
+| 4.9 ms | 1,095 barriers before GPU-argument indirect draws (renderDraw.cpp:3579): each ends the render pass and waits for all commands |
+| 2.3 ms | image uploads (23) |
+| 3.3 ms | guest sync points (graphicsRun.cpp:808, pm4Handlers.cpp:1350/2472) |
+
+2218a07ab01d4f46 is GT7's ray tracing compute shader (`Shader function expansion ... ray tracing
+shader`): its traversal loops run up to 8K of the 16K-round budget in some waves ("Ray loops"),
+while "GPU page faults: N pages that no cached buffer covered were read as zeros" names it every
+check. The next steps by gain: that shader's long waves (zero pages read as BVH nodes?), the
+barrier per GPU-argument draw, then the CP store and BDA walk copies.

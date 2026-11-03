@@ -2486,6 +2486,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	const GpuLabelContext label_context("image-upload");
 	DrawMutations::Note(DrawMutations::ImageUpload);
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
@@ -3734,6 +3735,7 @@ void TextureCache::RefreshByContent(ImageId id) {
 }
 
 void TextureCache::RefreshImage(ImageId id) {
+	const GpuLabelContext label_context("image-refresh");
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||

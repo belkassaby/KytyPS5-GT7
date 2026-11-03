@@ -82,6 +82,7 @@ NanScanner::~NanScanner() {
 void NanScanner::Scan(const CommandRecorder& command, vk::DeviceAddress words,
                       vk::DeviceAddress counts, uint32_t words_per_layer, uint32_t layers,
                       Packing packing, bool scrub) const {
+	const GpuLabelContext label_context("nan-scan");
 	const uint64_t total = uint64_t {words_per_layer} * layers;
 	if (!Valid() || total == 0 || total > UINT32_MAX) {
 		return;

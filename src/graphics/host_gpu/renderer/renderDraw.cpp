@@ -2913,6 +2913,7 @@ static void G3NoteMissing(const char* why) {
 bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& args,
                                  const DrawIndexBufferSource& index_source) {
 	using namespace ::Loader::Gt7NativeDraws;
+	const GpuLabelContext label_context("bypass");
 	const auto start  = std::chrono::steady_clock::now();
 	const auto result = [&](uint32_t value) {
 		AddG3Bypass(value, value != G3Bypassed
@@ -3093,6 +3094,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	const GpuLabelContext label_context(
+	    "ps", state.ps_active ? state.ps_input_info.stage.program->shader_hash
+	                          : vertex_stages.front().stage.program->shader_hash);
 	NoteDrawRepeat(draw, state, index_source, vertex_stages.size(),
 	               m_context.GetTextureCache().ImageSetGeneration());
 	NoteDrawTarget(state);

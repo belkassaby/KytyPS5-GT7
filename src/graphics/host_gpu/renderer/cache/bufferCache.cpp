@@ -234,6 +234,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 template <bool async>
 bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size,
                                        uint64_t* downloaded) {
+	const GpuLabelContext label_context("buffer-download");
 	if (buffer.direct) {
 		return false; // the guest memory itself: a copy back would land stale bytes over the CPU's
 	}
@@ -2340,6 +2341,7 @@ static void NoteSyncRepeat(uint64_t vaddr, uint64_t size, bool is_written, bool 
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	const GpuLabelContext label_context("buffer-sync");
 	KYTY_PROFILER_FUNCTION();
 	if (buffer.direct) {
 		return false; // the guest memory itself
@@ -4157,6 +4159,7 @@ uint64_t BufferCache::LruClock() const noexcept {
 }
 
 void BufferCache::RunGarbageCollector() {
+	const GpuLabelContext label_context("buffer-gc");
 	KYTY_PROFILER_FUNCTION();
 	m_gc_tick++;
 	const auto clock = LruClock();
@@ -4397,6 +4400,7 @@ void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t siz
 }
 
 uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
+	const GpuLabelContext label_context("bda-walk");
 	// Before round 69 each walk visited every tracker region of the mapped ranges with a CPU-dirty
 	// page anywhere, and synchronized every cached buffer of it: thousands of buffers a walk whose
 	// pages had not changed (the regions keep CPU-dirty the pages no buffer covers), ~30 us a

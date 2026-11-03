@@ -11,6 +11,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <source_location>
 
 namespace Libs::Graphics {
@@ -136,7 +138,90 @@ NoteBarrier(bool full, uint32_t memory, uint32_t buffers, uint32_t images, uint3
 // (KYTY_RECORD_THREAD) it copies the arguments, and every array they point to, into the
 // scheduler's command chunk and queues the call for the recording thread. Nothing the caller
 // passes by pointer is used after the method returns.
+// KYTY_GPU_LABELS=1: every draw, dispatch, barrier and transfer the renderer records sits in a
+// debug label range naming it, "<command> <context>" (GPU Trace in Nsight Graphics then names each
+// action), the context set by a GpuLabelContext around the code that records it.
+inline bool GpuLabelsOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_GPU_LABELS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+inline thread_local std::array<char, 48> t_gpu_label_context {};
+class GpuLabelContext {
+public:
+	explicit GpuLabelContext(const char* name, uint64_t hash = 0) {
+		if (!GpuLabelsOn()) {
+			return;
+		}
+		m_saved = t_gpu_label_context;
+		m_set   = true;
+		if (hash != 0) {
+			std::snprintf(t_gpu_label_context.data(), t_gpu_label_context.size(), "%s %016llx", name,
+			              static_cast<unsigned long long>(hash));
+		} else {
+			std::snprintf(t_gpu_label_context.data(), t_gpu_label_context.size(), "%s", name);
+		}
+	}
+	~GpuLabelContext() {
+		if (m_set) {
+			t_gpu_label_context = m_saved;
+		}
+	}
+	GpuLabelContext(const GpuLabelContext&)            = delete;
+	GpuLabelContext& operator=(const GpuLabelContext&) = delete;
+
+private:
+	std::array<char, 48> m_saved {};
+	bool                 m_set = false;
+};
+
 class CommandRecorder {
+	// KYTY_GPU_LABELS: the label range around one recorded command (GpuLabelsOn).
+	class LabelRange {
+	public:
+		LabelRange(const CommandRecorder& recorder, const char* command): m_recorder(recorder) {
+			if (!GpuLabelsOn() || VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdBeginDebugUtilsLabelEXT == nullptr) {
+				return;
+			}
+			m_on = true;
+			std::array<char, 64> name {};
+			std::snprintf(name.data(), name.size(), "%s %s", command, t_gpu_label_context.data());
+			recorder.Run([name](vk::CommandBuffer buffer) {
+				vk::DebugUtilsLabelEXT label {};
+				label.pLabelName = name.data();
+				buffer.beginDebugUtilsLabelEXT(&label);
+			});
+		}
+		~LabelRange() {
+			if (m_on) {
+				m_recorder.Run([](vk::CommandBuffer buffer) { buffer.endDebugUtilsLabelEXT(); });
+			}
+		}
+		LabelRange(const LabelRange&)            = delete;
+		LabelRange& operator=(const LabelRange&) = delete;
+
+	private:
+		const CommandRecorder& m_recorder;
+		bool                   m_on = false;
+	};
+	// "<command> <file>:<line>" of a barrier's recording site, for its label.
+	static std::array<char, 48> SiteLabel(const char* command, const std::source_location& site) {
+		std::array<char, 48> text {};
+		if (GpuLabelsOn()) {
+			const char* file = site.file_name();
+			for (const char* c = file; *c != '\0'; c++) {
+				if (*c == '/' || *c == '\\') {
+					file = c + 1;
+				}
+			}
+			std::snprintf(text.data(), text.size(), "%s %s:%u", command, file,
+			              static_cast<unsigned>(site.line()));
+		}
+		return text;
+	}
+
 public:
 	// NOLINTNEXTLINE(google-explicit-constructor): raw command buffers stay usable as recorders.
 	CommandRecorder(vk::CommandBuffer direct): m_direct(direct) {}
@@ -189,6 +274,7 @@ public:
 	}
 	void draw(uint32_t vertices, uint32_t instances, uint32_t first_vertex,
 	          uint32_t first_instance) const {
+		const LabelRange label_range(*this, "draw");
 		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.draw(vertices, instances, first_vertex, first_instance);
@@ -196,6 +282,7 @@ public:
 	}
 	void drawIndexed(uint32_t indices, uint32_t instances, uint32_t first_index, int32_t offset,
 	                 uint32_t first_instance) const {
+		const LabelRange label_range(*this, "drawIndexed");
 		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndexed(indices, instances, first_index, offset, first_instance);
@@ -203,6 +290,7 @@ public:
 	}
 	void drawIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                  uint32_t stride) const {
+		const LabelRange label_range(*this, "drawIndirect");
 		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndirect(buffer, offset, count, stride);
@@ -210,27 +298,32 @@ public:
 	}
 	void drawIndexedIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                         uint32_t stride) const {
+		const LabelRange label_range(*this, "drawIndexedIndirect");
 		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndexedIndirect(buffer, offset, count, stride);
 		});
 	}
 	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
+		const LabelRange label_range(*this, "drawMeshTasksEXT");
 		Touch();
 		Run([=](vk::CommandBuffer command) { command.drawMeshTasksEXT(x, y, z); });
 	}
 	void drawMeshTasksIndirectEXT(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                              uint32_t stride) const {
+		const LabelRange label_range(*this, "drawMeshTasksIndirectEXT");
 		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.drawMeshTasksIndirectEXT(buffer, offset, count, stride);
 		});
 	}
 	void dispatch(uint32_t x, uint32_t y, uint32_t z) const {
+		const LabelRange label_range(*this, "dispatch");
 		Touch();
 		Run([=](vk::CommandBuffer command) { command.dispatch(x, y, z); });
 	}
 	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
+		const LabelRange label_range(*this, "dispatchIndirect");
 		Touch();
 		Run([=](vk::CommandBuffer command) { command.dispatchIndirect(buffer, offset); });
 	}
@@ -313,6 +406,7 @@ public:
 	                     const vk::BufferMemoryBarrier* buffers, uint32_t image_count,
 	                     const vk::ImageMemoryBarrier* images,
 	                     const std::source_location& site = std::source_location::current()) const {
+		const LabelRange label_range(*this, SiteLabel("barrier", site).data());
 		Touch();
 		{
 			uint32_t layouts = 0;
@@ -375,6 +469,7 @@ public:
 	}
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
 	                const vk::BufferCopy* regions) const {
+		const LabelRange label_range(*this, "copyBuffer");
 		Touch();
 		RecordCopy(source, destination, count, regions);
 	}
@@ -434,10 +529,12 @@ public:
 	// Round 167: records the batch's "after" barrier if it is due (CommandBuffer::Handle, Submit).
 	void FlushCopyBatch() const { Touch(); }
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, const vk::BufferCopy& region) const {
+		const LabelRange label_range(*this, "copyBuffer");
 		copyBuffer(source, destination, 1, &region);
 	}
 	void updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                  const void* data) const {
+		const LabelRange label_range(*this, "updateBuffer");
 		Touch();
 		RecordedCommands::Add(RecordedCommands::BufferUpdates);
 		RecordedCommands::Add(RecordedCommands::BufferUpdateBytes, size);
@@ -468,6 +565,7 @@ public:
 	}
 	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                uint32_t value) const {
+		const LabelRange label_range(*this, "fillBuffer");
 		Touch();
 		RecordedCommands::Add(RecordedCommands::BufferFills);
 		RecordedCommands::Add(RecordedCommands::BufferFillBytes, size);
@@ -476,6 +574,7 @@ public:
 	}
 	void copyBufferToImage(vk::Buffer source, vk::Image destination, vk::ImageLayout layout,
 	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+		const LabelRange label_range(*this, "copyBufferToImage");
 		Touch();
 		RecordedCommands::Add(RecordedCommands::ImageUploads);
 		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
@@ -490,10 +589,12 @@ public:
 	}
 	void copyBufferToImage(vk::Buffer source, vk::Image destination, vk::ImageLayout layout,
 	                       const vk::BufferImageCopy& region) const {
+		const LabelRange label_range(*this, "copyBufferToImage");
 		copyBufferToImage(source, destination, layout, 1, &region);
 	}
 	void copyImageToBuffer(vk::Image source, vk::ImageLayout layout, vk::Buffer destination,
 	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+		const LabelRange label_range(*this, "copyImageToBuffer");
 		Touch();
 		RecordedCommands::Add(RecordedCommands::ImageDownloads);
 		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
@@ -508,11 +609,13 @@ public:
 	}
 	void copyImageToBuffer(vk::Image source, vk::ImageLayout layout, vk::Buffer destination,
 	                       const vk::BufferImageCopy& region) const {
+		const LabelRange label_range(*this, "copyImageToBuffer");
 		copyImageToBuffer(source, layout, destination, 1, &region);
 	}
 	void copyImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
 	               vk::ImageLayout destination_layout, uint32_t count,
 	               const vk::ImageCopy* regions) const {
+		const LabelRange label_range(*this, "copyImage");
 		Touch();
 		RecordedCommands::Add(RecordedCommands::ImageCopies);
 		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
@@ -528,10 +631,12 @@ public:
 	}
 	void copyImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
 	               vk::ImageLayout destination_layout, const vk::ImageCopy& region) const {
+		const LabelRange label_range(*this, "copyImage");
 		copyImage(source, source_layout, destination, destination_layout, 1, &region);
 	}
 	void resolveImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
 	                  vk::ImageLayout destination_layout, const vk::ImageResolve& region) const {
+		const LabelRange label_range(*this, "resolveImage");
 		Touch();
 		RecordedCommands::Add(RecordedCommands::ImageCopies);
 		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
@@ -542,6 +647,7 @@ public:
 	}
 	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue* color,
 	                     uint32_t count, const vk::ImageSubresourceRange* ranges) const {
+		const LabelRange label_range(*this, "clearColorImage");
 		Touch();
 		RecordedCommands::Add(RecordedCommands::Clears);
 		RecordedCommands::Mark(RecordedCommands::GapClear);
@@ -558,6 +664,7 @@ public:
 	void clearDepthStencilImage(vk::Image image, vk::ImageLayout layout,
 	                            const vk::ClearDepthStencilValue* value, uint32_t count,
 	                            const vk::ImageSubresourceRange* ranges) const {
+		const LabelRange label_range(*this, "clearDepthStencilImage");
 		Touch();
 		RecordedCommands::Add(RecordedCommands::Clears);
 		RecordedCommands::Mark(RecordedCommands::GapClear);
@@ -920,6 +1027,7 @@ private:
 	}
 	void RecordBarrier2(const vk::DependencyInfo&   dependency,
 	                    const std::source_location& site) const {
+		const LabelRange label_range(*this, SiteLabel("barrier2", site).data());
 		{
 			uint32_t layouts = 0;
 			bool     full    = false;

@@ -361,6 +361,7 @@ ShaderFaultReport FaultManager::CollectFaults() {
 }
 
 void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
+	const GpuLabelContext label_context("fault-buffer");
 	KYTY_PROFILER_FUNCTION();
 	(void)GetFaultBuffer();
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {

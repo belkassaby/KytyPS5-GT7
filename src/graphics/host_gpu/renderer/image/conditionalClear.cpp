@@ -261,6 +261,7 @@ uint32_t ConditionalColorClear::Record(CommandBuffer& command, vk::DeviceAddress
                                        uint32_t words, std::span<const Candidate> candidates,
                                        vk::ImageView view, vk::Format format, uint32_t samples,
                                        vk::Extent2D extent, const Note& note) {
+	const GpuLabelContext label_context("conditional-clear");
 	EXIT_IF(command.IsInvalid() || metadata == 0 || words == 0 || view == nullptr ||
 	        candidates.empty() || candidates.size() > MaxCandidates);
 	Collect();
