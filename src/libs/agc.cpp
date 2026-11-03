@@ -2729,6 +2729,18 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_c
 
 	buf->DbgDump();
 
+	// GT7 port, native path: the engine identity of this draw, just before it
+	if (::Loader::Gt7NativeDraws::Enabled()) {
+		::Loader::Gt7NativeDraws::Identity identity;
+		if (::Loader::Gt7NativeDraws::ForDraw(
+		        reinterpret_cast<uint64_t>(__builtin_return_address(0)), &identity)) {
+			if (auto* marker = buf->AllocateDW(::Loader::Gt7NativeDraws::MarkerDwords);
+			    marker != nullptr) {
+				::Loader::Gt7NativeDraws::WriteMarker(marker, identity);
+			}
+		}
+	}
+
 	auto* cmd = buf->AllocateDW(3);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2816,11 +2828,23 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t dat
 
 	buf->DbgDump();
 
+	const auto patch_offsets = decode_indirect_modifier_patch_offsets(modifier, true);
+	// GT7 port, native path: the engine identity of this draw, just before it. Not for a draw
+	// whose arguments the GPU patches into its user data (the record's user data would miss them).
+	if (::Loader::Gt7NativeDraws::Enabled() && patch_offsets == 0) {
+		::Loader::Gt7NativeDraws::Identity identity;
+		if (::Loader::Gt7NativeDraws::ForDraw(
+		        reinterpret_cast<uint64_t>(__builtin_return_address(0)), &identity)) {
+			if (auto* marker = buf->AllocateDW(::Loader::Gt7NativeDraws::MarkerDwords);
+			    marker != nullptr) {
+				::Loader::Gt7NativeDraws::WriteMarker(marker, identity);
+			}
+		}
+	}
+
 	auto* cmd = buf->AllocateDW(5);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
-
-	const auto patch_offsets = decode_indirect_modifier_patch_offsets(modifier, true);
 
 	cmd[0] = KYTY_PM4(5, Pm4::IT_DRAW_INDEX_INDIRECT, 0u);
 	cmd[1] = data_offset_in_bytes;

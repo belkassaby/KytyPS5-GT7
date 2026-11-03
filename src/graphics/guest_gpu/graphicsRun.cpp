@@ -1953,13 +1953,28 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 			args.instance_count = NumInstances();
 		}
 	}
+	if (::Loader::Gt7NativeDraws::Enabled()) {
+		// As DrawIndex: the user SGPRs each shader declares (RSRC2.USER_SGPR).
+		const auto& ps       = GetShCtx().GetPs().ps_user_sgpr;
+		const auto& gs       = GetShCtx().GetVs().gs_user_sgpr;
+		const auto  ps_count = std::min<uint32_t>(ps.count, GetShCtx().GetPs().ps_regs.rsrc2.user_sgpr);
+		const auto  gs_count = std::min<uint32_t>(gs.count, GetShCtx().GetVs().gs_regs.rsrc2.user_sgpr);
+		::Loader::Gt7NativeDraws::OnDraw(ps.value, ps_count, gs.value, gs_count);
+	}
 	if (FrameShape::Enabled()) {
 		FrameShape::OnDraw(this);
 	}
 	if (FrameShape::NullRender()) {
 		return;
 	}
+	const auto native_start = std::chrono::steady_clock::now();
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	if (::Loader::Gt7NativeDraws::Enabled()) {
+		::Loader::Gt7NativeDraws::OnDrawDone(static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+		                                                         native_start)
+		        .count()));
+	}
 	CompleteDraw();
 }
 

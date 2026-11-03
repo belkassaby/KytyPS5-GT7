@@ -2912,6 +2912,18 @@ static void G3NoteMissing(const char* why) {
 
 bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& args,
                                  const DrawIndexBufferSource& index_source) {
+	return TryG3BypassDraw(buffer, &args, &index_source, nullptr);
+}
+
+bool RenderExecutor::TryG3BypassAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
+	return TryG3BypassDraw(buffer, nullptr, nullptr, &args);
+}
+
+// A marked draw from its records: indexed (`indexed`, `index_source`; its arguments on the CPU or
+// read by the GPU, DRAW_INDEX_INDIRECT) or not (`automatic`, its counts on the CPU).
+bool RenderExecutor::TryG3BypassDraw(CommandBuffer& buffer, const DrawIndexArgs* indexed,
+                                     const DrawIndexBufferSource* index_source,
+                                     const DrawAutoArgs* automatic) {
 	using namespace ::Loader::Gt7NativeDraws;
 	const GpuLabelContext label_context("bypass");
 	const auto start  = std::chrono::steady_clock::now();
@@ -2930,9 +2942,30 @@ bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& arg
 		return result(G3NotLearned);
 	}
 	const auto& learned = it->second;
-	if (args.gpu_args_address != 0 || index_source.host_data != nullptr || index_source.size == 0 ||
-	    buffer.GetRegisters().GetDbCountControl() != learned.db_count_control) {
+	const bool  shape_ok =
+	    indexed != nullptr
+	        ? index_source->host_data == nullptr && index_source->size != 0
+	        : automatic->gpu_args_address == 0 && automatic->gpu_instance_count_address == 0 &&
+	              automatic->offset_source == DrawOffsetSource::DrawState &&
+	              automatic->vertex_count != 0 && automatic->instance_count != 0;
+	if (!shape_ok || buffer.GetRegisters().GetDbCountControl() != learned.db_count_control) {
 		return result(G3Other);
+	}
+	// DRAW_INDEX_INDIRECT: the GPU's arguments (written by GT7's culling dispatches before), as
+	// the full path binds them (ExecutePreparedDraw).
+	vk::Buffer     args_handle = nullptr;
+	vk::DeviceSize args_offset = 0;
+	if (indexed != nullptr && indexed->gpu_args_address != 0) {
+		BufferCache::ReadBinding binding;
+		BufferCache::ReadKind    kind {};
+		if (!m_context.GetBufferCache().BindForRead(indexed->gpu_args_address,
+		                                            sizeof(vk::DrawIndexedIndirectCommand), binding,
+		                                            &kind)) {
+			return result(G3Other);
+		}
+		G3NoteRead(kind);
+		args_handle = binding.buffer;
+		args_offset = binding.offset;
 	}
 	std::array<const Gt7NativeWalk::ShadowRecord*, 2> shadows {CurrentShadow(0), CurrentShadow(1)};
 	const uint32_t stage_count = learned.has_pixel ? 2u : 1u;
@@ -2980,10 +3013,10 @@ bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& arg
 	// holds (small CPU-written index data goes to the stream ring), the buffer cache's usual way.
 	vk::Buffer     index_handle = nullptr;
 	vk::DeviceSize index_offset = 0;
-	{
+	if (indexed != nullptr) {
 		BufferCache::ReadBinding binding;
 		BufferCache::ReadKind    kind {};
-		if (m_context.GetBufferCache().BindForRead(index_source.address, index_source.size, binding,
+		if (m_context.GetBufferCache().BindForRead(index_source->address, index_source->size, binding,
 		                                           &kind)) {
 			G3NoteRead(kind);
 			index_handle = binding.buffer;
@@ -3029,19 +3062,32 @@ bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& arg
 		}
 	}
 	// Every buffer the draw reads was synchronized as its full path would (TakeOwnerSynced).
-	if (index_handle == nullptr) {
-		auto [buffer_ptr, offset] = m_context.GetBufferCache().ObtainBuffer(index_source.address,
-		                                                                    index_source.size, false);
+	if (indexed != nullptr && index_handle == nullptr) {
+		auto [buffer_ptr, offset] = m_context.GetBufferCache().ObtainBuffer(index_source->address,
+		                                                                    index_source->size, false);
 		index_handle = buffer_ptr->Handle();
 		index_offset = offset;
+	}
+	const auto vk_buffer = buffer.Recorder();
+	if (args_handle) {
+		// The arguments a dispatch wrote, ready for the indirect read: outside the rendering, as
+		// the full path's barrier (renderDraw.cpp, ExecutePreparedDraw).
+		m_context.GetCommandScheduler().EndRendering();
+		vk::MemoryBarrier ready {};
+		ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+		ready.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &ready, 0, nullptr,
+		                          0, nullptr);
 	}
 	if (!m_context.GetCommandScheduler().Current().IsRendering()) {
 		m_context.GetCommandScheduler().BeginRendering(rendering_state);
 	}
 
-	const auto vk_buffer = buffer.Recorder();
 	CommitVertexBuffers(vk_buffer, vertex_buffers);
-	vk_buffer.bindIndexBuffer(index_handle, index_offset, index_source.type);
+	if (indexed != nullptr) {
+		vk_buffer.bindIndexBuffer(index_handle, index_offset, index_source->type);
+	}
 	ShaderVertexInputInfo vertex_info;
 	vertex_info.stage.program = &learned.vertex_program;
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_info, learned.depth, *rendering);
@@ -3076,8 +3122,17 @@ bool RenderExecutor::TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& arg
 			instance_offset = shadows[0]->instance_offset;
 		}
 	}
-	vk_buffer.drawIndexed(args.index_count, args.instance_count, 0, vertex_offset + args.base_vertex,
-	                      instance_offset);
+	if (args_handle) {
+		vk_buffer.drawIndexedIndirect(args_handle, args_offset, 1,
+		                              sizeof(vk::DrawIndexedIndirectCommand));
+	} else if (indexed != nullptr) {
+		vk_buffer.drawIndexed(indexed->index_count, indexed->instance_count, 0,
+		                      vertex_offset + indexed->base_vertex, instance_offset);
+	} else {
+		vk_buffer.draw(automatic->vertex_count, automatic->instance_count,
+		               static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(automatic->first_vertex)),
+		               instance_offset);
+	}
 	Profiler::Add(Profiler::Counter::Draws);
 	Common::PerfStats::AddDraw();
 	m_context.GetCommandScheduler().NoteDraw(learned.shader_hashes[learned.has_pixel ? 1 : 0], false);
@@ -3717,14 +3772,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// draw leaves nothing is counted by condition (a "GT7 G3 learning" line every 10 s).
 	const char* g3_refused = nullptr;
 	if (::Loader::Gt7NativeDraws::G3Bypass() && ::Loader::Gt7NativeDraws::CurrentMarked()) {
-		g3_refused = !draw.IsIndexed()                           ? "not indexed"
-		             : mesh_active                               ? "mesh"
+		// Non-indexed draws and indexed draws with the GPU's arguments are learned too (the bypass
+		// draws both, TryG3BypassDraw); a non-indexed draw's counts read on the GPU are not.
+		g3_refused = mesh_active                                 ? "mesh"
 		             : vertex_stages.size() != 1                 ? "tessellated"
 		             : !pipeline.static_bindings                 ? "set 0 not static"
 		             : pipeline.uses_push_descriptors            ? "push descriptors"
 		             : occlusion_query >= 0                      ? "occlusion query"
-		             : emit.gpu_args_address != 0 || static_cast<bool>(vertex_indirect_buffer)
-		                 ? "GPU arguments"
+		             : !draw.IsIndexed() && (emit.gpu_args_address != 0 ||
+		                                     emit.gpu_instance_count_address != 0)
+		                 ? "GPU arguments, not indexed"
 		             : index_source.host_data != nullptr         ? "indices on the host"
 		             : shader_write_stages                       ? "shader writes"
 		                                                         : nullptr;
@@ -4166,6 +4223,15 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		if (FrameGraph::Logging()) {
 			FrameGraph::Log("  not drawn: no vertex shader");
 		}
+		return;
+	}
+
+	// GT7 native renderer: a marked non-indexed draw with whole records drawn from them.
+	if (::Loader::Gt7NativeDraws::G3Bypass() && ::Loader::Gt7NativeDraws::CurrentMarked() &&
+	    ucfg.GetPrimType() != Prospero::PrimitiveType::kPatch &&
+	    ucfg.GetPrimType() != Prospero::PrimitiveType::kQuadListLegacy &&
+	    !Prospero::IsRectList(ucfg.GetPrimType()) && TryG3BypassAuto(buffer, args)) {
+		ResetBindings();
 		return;
 	}
 

@@ -201,3 +201,19 @@ path's binding does (`ObtainBuffer`) instead of refusing. Race: bypassed **88 to
 marked draws (72 % before), "buffer range" 0.0 %, 16.2 fps median (p25 14.8, p75 17.6; 15.6 the
 run before). Next: the indirect and non-indexed draw functions marked and recorded, then compute
 passes as records.
+
+### Non-indexed and indirect draws on the record path (2026-11-03)
+
+The census's other draw functions write markers too (`gt7NativeDraws.cpp` `OtherDraws`:
+`gt7_Draw_1a3a890` with `AgcDcbDrawIndexIndirect`, unless its modifier patches user data;
+`gt7_DrawAuto`, `gt7_Draw_9bb0`, `gt7_Draw_53930`, `gt7_Draw_1a070` with `AgcDcbDrawIndexAuto`;
+no bound material needed); the command processor's `DrawIndexAuto` takes them as `DrawIndex` does;
+the bypass draws a non-indexed draw (`draw`, the full path's offsets) and an indexed one with the
+GPU's arguments (`drawIndexedIndirect` after the full path's indirect barrier)
+(`TryG3BypassDraw`); learning takes both.
+
+Race: marked draws 373,000 to 407,000 per 10 s (290,000 to 365,000 before), bypassed 75 to 78 %
+(about 300,000, from 246,000), states learned ~1,000 (from ~750); not learned 15 %, which are the
+draws learning refuses: tessellated 50,000, occlusion queries 37,000, mesh 23,000 per 10 s.
+15.8 fps median (p25 14.7, p75 17.1): unchanged, the GPU thread still translates ~470,000 draws
+and ~230,000 dispatches per 12.5 s.

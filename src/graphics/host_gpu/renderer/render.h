@@ -297,6 +297,11 @@ private:
 	// GT7 G3.2 (renderDraw.cpp): the marked draw drawn from its records, or false (nothing done).
 	bool TryG3Bypass(CommandBuffer& buffer, const DrawIndexArgs& args,
 	                 const DrawIndexBufferSource& index_source);
+	// The same for a non-indexed draw.
+	bool TryG3BypassAuto(CommandBuffer& buffer, const DrawAutoArgs& args);
+	// Both: indexed (args, index_source) or not (automatic).
+	bool TryG3BypassDraw(CommandBuffer& buffer, const DrawIndexArgs* args,
+	                     const DrawIndexBufferSource* index_source, const DrawAutoArgs* automatic);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {

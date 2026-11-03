@@ -46,6 +46,19 @@ constexpr uint64_t MeshDraw         = 0x5fb0;  // gt7_DrawMeshClusters(mesh, ...
 constexpr uint64_t MeshDrawSize     = 9124;
 constexpr uint64_t DrawIndex        = 0xa1400; // gt7_DrawIndex
 constexpr uint64_t DrawIndexSize    = 434;
+// The engine's other draw functions (GT7-NATIVE-PORT.md's census): non-indexed draws and the
+// indirect indexed one. Their draws need not follow a gt7_BindMaterial.
+struct OtherDraw {
+	uint64_t offset;
+	uint64_t size;
+};
+constexpr std::array<OtherDraw, 5> OtherDraws = {{
+    {0x1a3a890, 444},  // gt7_Draw_1a3a890: AgcDcbDrawIndexIndirect
+    {0x18740, 349},    // gt7_DrawAuto
+    {0x9bb0, 4355},    // gt7_Draw_9bb0 (draw index auto)
+    {0x53930, 2765},   // gt7_Draw_53930 (draw index auto)
+    {0x1a070, 355},    // gt7_Draw_1a070 (draw index auto)
+}};
 constexpr uint64_t MaterialBlock    = 0x18; // GT7Material's constant block
 constexpr uint64_t CommitDrawState  = 0x16370; // gt7_CommitDrawState(ctx)
 constexpr auto     ReportEvery      = std::chrono::seconds(10);
@@ -1237,7 +1250,10 @@ bool ForDraw(uint64_t guest_return_address, Identity* identity) {
 	const auto offset = guest_return_address - g_main_base;
 	const bool engine = (offset >= MeshDraw && offset < MeshDraw + MeshDrawSize) ||
 	                    (offset >= DrawIndex && offset < DrawIndex + DrawIndexSize);
-	if (!engine || t_identity.material == 0) {
+	const bool other  = !engine && std::ranges::any_of(OtherDraws, [&](const OtherDraw& draw) {
+		                    return offset >= draw.offset && offset < draw.offset + draw.size;
+	                    });
+	if (!(engine && t_identity.material != 0) && !other) {
 		return false;
 	}
 	t_identity.sequence++;
