@@ -4947,13 +4947,13 @@ bool G3SlotReady(TextureCache& textures, uint32_t array, uint32_t slot, uint64_t
 // G3 in-place reads: what the covered draws' reads were (clean copies, in place, synchronized),
 // every 10 s ("GT7 G3 reads").
 void G3NoteRead(BufferCache::ReadKind kind) {
-	static std::array<uint64_t, 3> counts {};
+	static std::array<uint64_t, 4> counts {};
 	static auto                    last = std::chrono::steady_clock::now();
 	counts[static_cast<size_t>(kind)]++;
 	if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(10)) {
 		LOGF("GT7 G3 reads (10 s): clean copies %" PRIu64 ", in place %" PRIu64 ", synchronized %" PRIu64
-		     "\n",
-		     counts[0], counts[1], counts[2]);
+		     ", buffers made or merged %" PRIu64 "\n",
+		     counts[0], counts[1], counts[2], counts[3]);
 		counts = {};
 		last   = now;
 	}

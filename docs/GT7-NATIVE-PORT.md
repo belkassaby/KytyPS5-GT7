@@ -179,3 +179,25 @@ GPU thread:
 3. **Compute passes as records** the same way (2.2 s), then the tessellated draws (1.4 s).
 4. Then the records' commands recorded on the render threads (secondary command buffers) and the
    PM4 stream no longer decoded for covered work: the GPU thread left with ordering and submission.
+
+### Coverage census (2026-11-03)
+
+`KYTY_AGC_CALLSITES=1`, the busiest call sites named with the rebuild's index (race, per second):
+
+| GT7 function | Calls/s | Native path |
+|---|---|---|
+| `gt7_DrawMeshClusters` (`AgcDcbDrawIndex`) | 33,800 | marked |
+| `gt7_DrawIndex` | 2,300 | marked |
+| `gt7_Draw_1a3a890` (`AgcDcbDrawIndexIndirect`) | 7,900 | not marked |
+| `gt7_DrawAuto`, `gt7_Draw_9bb0`, `gt7_Draw_53930`, `gt7_Draw_1a070` (`AgcDcbDrawIndexAuto`) | 11,200 | not marked |
+| dispatches, `FUN_9016a0660` (a compute pass: SH user data, then dispatch) | 10,200 | no |
+| dispatches, `gt7_BuildDrawTextureRecord_caller`, `gt7_DrawCaller2_de170`, ~20 more | 11,800 | no |
+
+### Buffer range fallbacks closed (2026-11-03)
+
+A marked draw fell back to the translation when no single cached buffer held one of its ranges
+yet ("buffer range", 18 %): `BufferCache::BindForRead` now makes or merges the buffer as the full
+path's binding does (`ObtainBuffer`) instead of refusing. Race: bypassed **88 to 89 %** of the
+marked draws (72 % before), "buffer range" 0.0 %, 16.2 fps median (p25 14.8, p75 17.6; 15.6 the
+run before). Next: the indirect and non-indexed draw functions marked and recorded, then compute
+passes as records.

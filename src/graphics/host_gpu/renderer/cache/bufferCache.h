@@ -119,7 +119,7 @@ public:
 		uint64_t          offset  = 0;
 		vk::DeviceAddress address = 0;
 	};
-	enum class ReadKind : uint8_t { Clean, InPlace, Synced };
+	enum class ReadKind : uint8_t { Clean, InPlace, Synced, Made };
 	[[nodiscard]] bool BindForRead(uint64_t vaddr, uint64_t size, ReadBinding& out, ReadKind* kind);
 	// Unmap (the GPU thread, the GPU idle): the imports over [vaddr, vaddr + size) dropped.
 	void ForgetImports(uint64_t vaddr, uint64_t size);

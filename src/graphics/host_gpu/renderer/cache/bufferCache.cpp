@@ -2764,9 +2764,24 @@ bool BufferCache::BindForRead(uint64_t vaddr, uint64_t size, ReadBinding& out, R
 		*kind = how;
 		return true;
 	};
+	// No single cached buffer holds the range yet (none made over it, or it spans two): made or
+	// merged as the full path's binding makes it (ObtainBuffer), so the draw keeps its record path
+	// (18 % of the marked draws fell back on it, "buffer range").
+	const auto obtain = [&] {
+		if (m_scheduler.Current().IsInvalid()) {
+			return false;
+		}
+		auto [buffer, offset] = ObtainBuffer(vaddr, size, false, false, {}, true);
+		if (buffer == nullptr || !buffer->HasDeviceAddress()) {
+			return false;
+		}
+		out   = {buffer->Handle(), offset, buffer->BufferDeviceAddress() + offset};
+		*kind = ReadKind::Made;
+		return true;
+	};
 	if (IsRegionGpuModified(vaddr, size)) {
 		auto* buffer = TakeOwnerSynced(vaddr, size);
-		return buffer != nullptr && from(buffer, ReadKind::Synced);
+		return buffer != nullptr ? from(buffer, ReadKind::Synced) : obtain();
 	}
 	if (!IsRegionCpuModified(vaddr, size)) {
 		if (auto* buffer = TakeOwnerUnsynced(vaddr, size); buffer != nullptr) {
@@ -2781,7 +2796,7 @@ bool BufferCache::BindForRead(uint64_t vaddr, uint64_t size, ReadBinding& out, R
 		return true;
 	}
 	auto* buffer = TakeOwnerSynced(vaddr, size);
-	return buffer != nullptr && from(buffer, ReadKind::Synced);
+	return buffer != nullptr ? from(buffer, ReadKind::Synced) : obtain();
 }
 
 // A direct region the GPU is about to write: a cached buffer from now on. Kyty's GPU runs later
