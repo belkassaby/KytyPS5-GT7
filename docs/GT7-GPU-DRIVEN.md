@@ -673,3 +673,24 @@ written binding at 0xf439f640a0+0x10, 0x125b600000 by a written range at 0x125b7
 14.8 fps median (p25 13.8, p75 16.2), 56k faults/s: the bypass as before. The fault churn is in
 blocks both the GPU and GT7's CPU write. Removing it needs those kept apart (the GT7 rebuild
 placing GPU-written data in its own blocks) or GPU writes that never land late.
+
+**What writes the hot blocks** (`KYTY_GPU_WRITE_STATS=<address>+<size>,...`, every GPU write into
+those ranges by 4 KB page and writing shader, summed every 10 s; a race of about 3 minutes, direct
+regions off):
+
+- 0x125b400000 (4 MB) and 0x143d000000 (2.4 MB): GPU working memory. About 450,000 shader stores
+  (2 GB) from eight shaders (0x6409cd5b94d336ca, 0x67074f819c89dad5, 0x90c7815e6d201078,
+  0x4b91fa26cc7ff2c7, 0xb2ff6699a1e38963, 0x6babb2a8915d35c4, 0x02606143ff3687bf,
+  0x25118bdc8be9de91 and others), each over 170-190 pages, up to 72 KB a store. GT7's CPU writes the
+  same pages: not direct-able as laid out. The GT7 rebuild would have to keep that working memory
+  apart from CPU-written data.
+- 0xf438800000 (28 MB): six pages only, small stores (8-248 bytes) at 0xf439cb8100 and
+  0xf439d38200 from six shaders (0xe821baf688decb98, 0x34c88a519ffa6eb7, 0x1b64417c80c32e4f, ...):
+  per-object records GT7's CPU structures point at. The hot address 0xf439f80000 is not
+  GPU-written at all: its faults are reads (0xf439f8bab0, `mov [rdi+0xE0]` on Job#0 and Job#3, about
+  9 s of slow reads in the run), from protections of an image over the block.
+- 0xec06000000: no GPU writes.
+
+Write faults in the race: about 2,000 a frame on 1,300 pages in 650 blocks; 45-48% "released the
+block around an image", 30-34% "released a block" (buffers). Images over GT7's blocks are the
+largest single cause, not GPU-written buffers.

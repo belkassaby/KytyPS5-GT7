@@ -127,6 +127,7 @@ public:
 	// whole, or null.
 	[[nodiscard]] Buffer* DirectOwner(uint64_t vaddr, uint64_t size);
 	void DropDirect(Buffer& buffer, uint64_t vaddr, uint64_t size, const char* why);
+	void NoteGpuWriteStats(uint64_t vaddr, uint64_t size);
 	// Bytes of the game's memory imported now.
 	[[nodiscard]] uint64_t ImportedBytes() const noexcept { return m_imported_bytes; }
 	// needs_device_address: the caller reads the data through a buffer device address, which

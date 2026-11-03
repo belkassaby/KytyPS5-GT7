@@ -3541,6 +3541,63 @@ void BufferCache::WritesRecorded(bool address_writes, uint64_t shader) {
 	m_unrecorded_writes.clear();
 }
 
+// Diagnostics: KYTY_GPU_WRITE_STATS=<address>+<size>[,...] (hex): every GPU write into those
+// ranges, by writer (shader hash; 0 a copy or fill) and 64 KB block, summed every 10 s: the writes
+// that make GT7's hot blocks GPU-written (what keeps them out of direct regions).
+void BufferCache::NoteGpuWriteStats(uint64_t vaddr, uint64_t size) {
+	static const std::vector<std::pair<uint64_t, uint64_t>> ranges = [] {
+		std::vector<std::pair<uint64_t, uint64_t>> result;
+		const char*                                value = std::getenv("KYTY_GPU_WRITE_STATS");
+		while (value != nullptr && *value != '\0') {
+			char*      end   = nullptr;
+			const auto begin = std::strtoull(value, &end, 16);
+			uint64_t   bytes = 0x10000;
+			if (end != nullptr && *end == '+') {
+				bytes = std::strtoull(end + 1, &end, 16);
+			}
+			result.emplace_back(begin, bytes);
+			value = end != nullptr && *end == ',' ? end + 1 : nullptr;
+		}
+		return result;
+	}();
+	if (ranges.empty() ||
+	    std::ranges::none_of(ranges, [&](const auto& r) {
+		    return vaddr < r.first + r.second && r.first < vaddr + size;
+	    })) {
+		return;
+	}
+	struct Writer {
+		uint64_t           writes = 0;
+		uint64_t           bytes  = 0;
+		uint64_t           min    = UINT64_MAX;
+		uint64_t           max    = 0;
+		std::set<uint64_t> addresses;
+	};
+	static std::mutex                                       mutex;
+	static std::map<std::pair<uint64_t, uint64_t>, Writer> writers; // (block, shader)
+	static auto                                             last = std::chrono::steady_clock::now();
+	std::lock_guard                                         lock(mutex);
+	auto& writer = writers[{Common::AlignDown(vaddr, CACHING_PAGESIZE), s_diag_shader_hash}];
+	writer.writes++;
+	writer.bytes += size;
+	writer.min = std::min(writer.min, size);
+	writer.max = std::max(writer.max, size);
+	if (writer.addresses.size() < 4096) {
+		writer.addresses.insert(vaddr);
+	}
+	if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(10)) {
+		LOGF("GPU write stats (10 s, KYTY_GPU_WRITE_STATS): %zu (block, writer) pairs\n", writers.size());
+		for (const auto& [key, w]: writers) {
+			LOGF("  block 0x%016" PRIx64 " writer 0x%016" PRIx64 ": %" PRIu64 " writes, %" PRIu64
+			     " bytes (each %" PRIu64 "-%" PRIu64 "), %zu addresses, first 0x%016" PRIx64 "\n",
+			     key.first, key.second, w.writes, w.bytes, w.min, w.max, w.addresses.size(),
+			     w.addresses.empty() ? 0 : *w.addresses.begin());
+		}
+		writers.clear();
+		last = now;
+	}
+}
+
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
 	if (DirectOwner(vaddr, size) != nullptr) {
@@ -3601,6 +3658,7 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 		NoteMetadataWrite(vaddr, size);
 	}
 	RecordGpuWriter(vaddr, size, s_diag_shader_hash, m_scheduler.CurrentTick());
+	NoteGpuWriteStats(vaddr, size);
 	QueueReadahead(vaddr, size);
 	if (Libs::LibKernel::Memory::TracesMemory(vaddr, size)) {
 		// KYTY_TRACE_MEMORY: each writer's first eight writes, then at powers of two.
