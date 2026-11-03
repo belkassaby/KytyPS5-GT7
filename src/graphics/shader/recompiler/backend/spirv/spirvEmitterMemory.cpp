@@ -177,6 +177,9 @@ uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 }
 
 void RecordBdaFault(EmitterState& state, uint32_t page) {
+	if (state.program.info.uses_bvh && state.requirements.ray_loop_rounds) {
+		state.builder.AddFunction(spv::OpStore, RayFaultedVariable(state), ConstantBool(state, true));
+	}
 	const auto word =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5));
 	const auto bit =

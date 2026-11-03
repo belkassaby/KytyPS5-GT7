@@ -1057,8 +1057,14 @@ uint32_t EmitLoopBudgetTick(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto budget = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), budget, state.loop_budget_variable);
-	const auto left =
-	    Binary(state, spv::OpINotEqual, TypeBool(state), budget, ConstantU32(state, 0));
+	auto left = Binary(state, spv::OpINotEqual, TypeBool(state), budget, ConstantU32(state, 0));
+	if (state.program.info.uses_bvh && state.requirements.ray_loop_rounds) {
+		// A ray that read a page no buffer holds ends its loops now (RayFaultedVariable).
+		const auto faulted = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeBool(state), faulted, RayFaultedVariable(state));
+		left = Binary(state, spv::OpLogicalAnd, TypeBool(state), left,
+		              Unary(state, spv::OpLogicalNot, TypeBool(state), faulted));
+	}
 	const auto next =
 	    Select(state, TypeU32(state), left,
 	           Binary(state, spv::OpISub, TypeU32(state), budget, ConstantU32(state, 1)),

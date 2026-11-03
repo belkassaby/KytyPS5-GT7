@@ -754,3 +754,13 @@ shader`): its traversal loops run up to 8K of the 16K-round budget in some waves
 while "GPU page faults: N pages that no cached buffer covered were read as zeros" names it every
 check. The next steps by gain: that shader's long waves (zero pages read as BVH nodes?), the
 barrier per GPU-argument draw, then the CP store and BDA walk copies.
+
+**The ray tracing shader's stuck waves.** About one wave a frame of 2218a07ab01d4f46 ran its
+traversal (loop 0x0be8) to the 16,384-round budget: it read a page of the BVH no cached buffer held
+yet (1 to 3 new pages a frame, mapped for the next frame) as zeros, and a node list of zeros never
+ends. A ray tracing shader's invocation that records such a page fault now ends its bounded loops
+at their next round (`RayFaultedVariable`, set in `RecordBdaFault`, read in `EmitLoopBudgetTick`;
+the ray's result was the budget's leftover before). "Ray loops" in a warm race: no wave past 2K
+rounds, none spends its budget (before: 10 to 22 waves in 5 s reached 16K). Frame rate 15.6 fps
+median (p25 14.3, p75 16.7) against 16.2: no gain, the frame is not GPU-bound (the GPU thread is
+90 % busy, GT7's Job#0 at 100 %); the GPU time is freed for when it is.

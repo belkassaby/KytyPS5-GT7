@@ -205,6 +205,9 @@ struct EmitterState {
 	std::vector<RuntimeImageLookup> runtime_image_lookups;
 	// The invocation's loop budget (LoopBudgetTick): a Private u32 holding what is left.
 	uint32_t                   loop_budget_variable                  = 0;
+	// A ray tracing shader's invocation read a page no buffer holds (RecordBdaFault): its
+	// bounded loops end at their next round (EmitLoopBudgetTick, RayFaultedVariable).
+	uint32_t                   ray_faulted_variable                  = 0;
 	// The rounds the invocation ran in each row's loops (RayLoopSlot), Private u32s, the rows'
 	// loop budget ticks in the order the emission met them, and the functions that count a wave
 	// in its shader's slot (DefineRayLoopCount, DefineRayLoopRound).
@@ -798,6 +801,21 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	EmitLabel(state, merge);
 	EmitAtomicMemoryBarrier(state, kind);
 	return observed;
+}
+
+// A ray tracing shader's invocation that read a page no cached buffer holds: a Private bool, set
+// by RecordBdaFault. Its traversal reads that page as zeros (a node list that never ends, its
+// loops ran up to the 16K-round budget: one wave a frame, 21 ms of a race frame's GPU time in
+// Nsight), so its bounded loops end at their next round instead (EmitLoopBudgetTick). The ray's
+// result was the budget's leftover either way; the page is mapped for the next frame.
+inline uint32_t RayFaultedVariable(EmitterState& state) {
+	if (state.ray_faulted_variable == 0) {
+		state.ray_faulted_variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, TypeBool(state)), spv::StorageClassPrivate,
+		    ConstantBool(state, false));
+		state.builder.AddName(state.ray_faulted_variable, "ray_faulted");
+	}
+	return state.ray_faulted_variable;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
