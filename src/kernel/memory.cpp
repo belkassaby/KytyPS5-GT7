@@ -116,6 +116,45 @@ static uint64_t DirectMemoryOverflowSize() {
 }
 // The guest code of the direct allocation this thread is making (round 82), for its log lines.
 static thread_local uint64_t          t_direct_memory_caller        = 0;
+// The guest code that asked for a mapping (KYTY_MAP_LOG), set by the outermost map entry point.
+static thread_local uint64_t          t_map_caller                  = 0;
+
+// KYTY_MAP_LOG=1 (docs/GT7-NATIVE-PORT.md): every mapping the guest makes, with its CPU and GPU
+// access, its name and the guest code that asked for it: what classifies GT7's memory into
+// upload, device-local and tracked heaps.
+static bool MapLogOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_MAP_LOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+static void NoteMap(const char* kind, uint64_t vaddr, uint64_t len, int prot, const char* name) {
+	if (!MapLogOn()) {
+		return;
+	}
+	LOGF("Map: %s 0x%016" PRIx64 "+0x%" PRIx64 " (%" PRIu64 " KB) cpu %c%c gpu %c%c name '%s' "
+	     "from 0x%016" PRIx64 " on %s\n",
+	     kind, vaddr, len, len >> 10u, (prot & PROT_CPU_READ) != 0 ? 'r' : '-',
+	     (prot & PROT_CPU_WRITE) != 0 ? 'w' : '-', (prot & PROT_GPU_READ) != 0 ? 'r' : '-',
+	     (prot & PROT_GPU_WRITE) != 0 ? 'w' : '-', name != nullptr ? name : "", t_map_caller,
+	     Common::PerfStats::ThreadNameOf(Common::PerfStats::CurrentOsThreadId()).c_str());
+}
+struct MapCallerScope {
+	explicit MapCallerScope(uint64_t caller): outer(t_map_caller == 0) {
+		if (outer) {
+			t_map_caller = caller;
+		}
+	}
+	~MapCallerScope() {
+		if (outer) {
+			t_map_caller = 0;
+		}
+	}
+	MapCallerScope(const MapCallerScope&)            = delete;
+	MapCallerScope& operator=(const MapCallerScope&) = delete;
+	bool outer;
+};
 static Graphics::RenderContext*       g_gpu_resources               = nullptr;
 
 static Graphics::RenderContext& GetGpuResources() {
@@ -3058,6 +3097,7 @@ static bool UnmapPooledBackingTransactional(const std::vector<PooledMemory::Mapp
 int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot,
                                                    int flags, const char* name) {
 	PRINT_NAME();
+	const MapCallerScope map_caller(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -3181,11 +3221,13 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);
 	}
+	NoteMap("flexible", out_addr, len, prot, name);
 
 	return OK;
 }
 
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags) {
+	const MapCallerScope map_caller(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	return KernelMapNamedFlexibleMemory(addr_in_out, len, prot, flags, "");
 }
 
@@ -4101,6 +4143,7 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
                                         int64_t direct_memory_start, size_t alignment) {
 	PRINT_NAME();
+	const MapCallerScope map_caller(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -4320,6 +4363,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	}
 
 	MapGpuRange(out_addr, len);
+	NoteMap("direct", out_addr, len, prot, nullptr);
 
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);
@@ -4382,6 +4426,7 @@ int KYTY_SYSV_ABI KernelMapNamedDirectMemory(void** addr, size_t len, int prot, 
                                              int64_t direct_memory_start, size_t alignment,
                                              const char* name) {
 	PRINT_NAME();
+	const MapCallerScope map_caller(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -4397,6 +4442,7 @@ int KYTY_SYSV_ABI KernelMapNamedDirectMemory(void** addr, size_t len, int prot, 
 
 	auto ret = KernelMapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment);
 	if (ret == OK && addr != nullptr) {
+		NoteMap("named", reinterpret_cast<uint64_t>(*addr), len, prot, name);
 		g_physical_memory->SetVirtualRangeName(reinterpret_cast<uint64_t>(*addr), len, name);
 		g_virtual_ranges->Rename(reinterpret_cast<uint64_t>(*addr), len, name);
 	}
