@@ -1906,11 +1906,14 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
 		if (::Loader::Gt7NativeDraws::Enabled()) {
+			const auto& cs = m_sh_ctx.GetCs();
 			::Loader::Gt7NativeDraws::NoteDispatch(
-			    m_sh_ctx.GetCs().cs_regs.data_addr,
+			    cs.cs_regs.data_addr,
 			    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 			                              std::chrono::steady_clock::now() - native_start)
-			                              .count()));
+			                              .count()),
+			    cs.cs_user_sgpr.value,
+			    std::min<uint32_t>(cs.cs_user_sgpr.count, cs.cs_regs.user_sgpr));
 		}
 	}
 	CompleteDispatch();

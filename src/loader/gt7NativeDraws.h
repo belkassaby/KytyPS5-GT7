@@ -56,11 +56,18 @@ void OnDrawDone(uint64_t renderer_ns);
 // Compute census (docs/GT7-NATIVE-PORT.md): GT7's dispatches marked with the GT7 code that
 // issued them (Agc, a game thread), then counted on the GPU thread by (that code, compute shader)
 // with the renderer's time: which pass functions and shaders the compute records must cover.
-constexpr uint32_t DispatchMarkerDwords = 3;
+// The marker also carries the compute user data the game thread set (COMPUTE_USER_DATA_0..15,
+// kept per command buffer as GT7's register writes pass through Agc: NoteComputeUserData), which
+// the GPU thread compares with the SGPRs it loads (the compute records' first step).
+constexpr uint32_t DispatchMarkerDwords = 3 + 1 + 16;
 [[nodiscard]] bool ForDispatch(uint64_t guest_return_address);
-void               WriteDispatchMarker(uint32_t* packet, uint64_t guest_return_address);
+void               WriteDispatchMarker(uint32_t* packet, uint64_t guest_return_address,
+                                       const void* command_buffer);
 void               OnDispatchMarker(const uint32_t* payload, uint32_t dwords);
-void               NoteDispatch(uint64_t cs_address, uint64_t renderer_ns);
+void               NoteDispatch(uint64_t cs_address, uint64_t renderer_ns,
+                                const uint32_t* user_sgprs = nullptr, uint32_t user_count = 0);
+// Agc (a game thread): a value written to SH register `offset` (COMPUTE_USER_DATA_n kept).
+void NoteComputeUserData(const void* command_buffer, uint32_t offset, uint32_t value);
 
 // Milestone 3, measured first (the renderer, GPU thread): a marked draw's programs (a signature of
 // their ids) and pipeline, after the pipeline lookup. A "Native templates:" line every 10 s gives

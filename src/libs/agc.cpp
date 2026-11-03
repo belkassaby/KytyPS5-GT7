@@ -1795,7 +1795,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_
 		if (auto* marker = buf->AllocateDW(::Loader::Gt7NativeDraws::DispatchMarkerDwords);
 		    marker != nullptr) {
 			::Loader::Gt7NativeDraws::WriteDispatchMarker(
-			    marker, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+			    marker, reinterpret_cast<uint64_t>(__builtin_return_address(0)), buf);
 		}
 	}
 
@@ -1904,6 +1904,11 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32
 
 	if (values != nullptr) {
 		memcpy(cmd + 2, values, static_cast<size_t>(num_values) * 4);
+		if (::Loader::Gt7NativeDraws::Enabled()) {
+			for (uint32_t i = 0; i < num_values; i++) {
+				::Loader::Gt7NativeDraws::NoteComputeUserData(buf, (offset & 0xffffu) + i, values[i]);
+			}
+		}
 	}
 
 	return cmd;
@@ -1939,6 +1944,10 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                
 	for (uint32_t i = 0; i < num_regs; i++) {
 		local_regs[i].offset = regs[i].offset;
 		local_regs[i].value  = regs[i].value;
+		if (::Loader::Gt7NativeDraws::Enabled()) {
+			::Loader::Gt7NativeDraws::NoteComputeUserData(buf, local_regs[i].offset,
+			                                              local_regs[i].value);
+		}
 	}
 
 	uint32_t* first_cmd        = nullptr;
@@ -2414,6 +2423,11 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*             
 
 	auto vaddr = reinterpret_cast<uint64_t>(regs);
 
+	if (::Loader::Gt7NativeDraws::Enabled() && regs != nullptr) {
+		for (uint32_t i = 0; i < num_regs; i++) {
+			::Loader::Gt7NativeDraws::NoteComputeUserData(buf, regs[i].offset, regs[i].value);
+		}
+	}
 	reg_indirect_write_packet(cmd, vaddr, num_regs, RegIndirectPacket::Sh);
 
 	return cmd;

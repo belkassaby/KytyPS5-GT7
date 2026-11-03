@@ -1949,6 +1949,30 @@ namespace {
 // The pending dispatch marker (GPU thread), and the census (GPU thread only).
 uint64_t g_dispatch_code    = 0;
 bool     g_dispatch_pending = false;
+uint32_t g_dispatch_mask    = 0;
+std::array<uint32_t, 16> g_dispatch_user {};
+// The check (GPU thread): dispatches whose shadowed user data were the SGPRs, word for word.
+uint64_t g_user_checked = 0, g_user_equal = 0, g_user_missing = 0, g_user_differ = 0;
+// The game thread's shadow of the compute user data, per command buffer.
+struct ComputeShadow {
+	const void*              buffer = nullptr;
+	uint32_t                 mask   = 0;
+	std::array<uint32_t, 16> user {};
+};
+thread_local std::array<ComputeShadow, 4> t_compute_shadows {};
+ComputeShadow& ShadowOf(const void* buffer) {
+	for (auto& shadow: t_compute_shadows) {
+		if (shadow.buffer == buffer) {
+			return shadow;
+		}
+	}
+	// The least recently taken slot: shift and take the first.
+	for (size_t i = t_compute_shadows.size() - 1; i > 0; i--) {
+		t_compute_shadows[i] = t_compute_shadows[i - 1];
+	}
+	t_compute_shadows[0] = ComputeShadow {buffer, 0, {}};
+	return t_compute_shadows[0];
+}
 struct DispatchKeyStats {
 	uint64_t count = 0;
 	uint64_t ns    = 0;
@@ -1966,11 +1990,25 @@ bool ForDispatch(uint64_t guest_return_address) {
 	       guest_return_address < g_main_base + 0x8000000u;
 }
 
-void WriteDispatchMarker(uint32_t* packet, uint64_t guest_return_address) {
+void NoteComputeUserData(const void* command_buffer, uint32_t offset, uint32_t value) {
+	constexpr uint32_t ComputeUserData0 = 0x240; // Pm4::COMPUTE_USER_DATA_0
+	if (offset < ComputeUserData0 || offset >= ComputeUserData0 + 16u) {
+		return;
+	}
+	auto& shadow                            = ShadowOf(command_buffer);
+	shadow.user[offset - ComputeUserData0]  = value;
+	shadow.mask |= 1u << (offset - ComputeUserData0);
+}
+
+void WriteDispatchMarker(uint32_t* packet, uint64_t guest_return_address,
+                         const void* command_buffer) {
 	const uint64_t offset = guest_return_address - g_main_base;
+	const auto&    shadow = ShadowOf(command_buffer);
 	packet[0]             = KYTY_PM4(DispatchMarkerDwords, Pm4::IT_NOP, Pm4::R_GT7_DISPATCH);
 	packet[1]             = static_cast<uint32_t>(offset);
 	packet[2]             = static_cast<uint32_t>(offset >> 32u);
+	packet[3]             = shadow.mask;
+	std::copy(shadow.user.begin(), shadow.user.end(), packet + 4);
 }
 
 void OnDispatchMarker(const uint32_t* payload, uint32_t dwords) {
@@ -1978,10 +2016,25 @@ void OnDispatchMarker(const uint32_t* payload, uint32_t dwords) {
 		return;
 	}
 	g_dispatch_code    = payload[0] | (static_cast<uint64_t>(payload[1]) << 32u);
+	g_dispatch_mask    = payload[2];
+	std::copy_n(payload + 3, 16, g_dispatch_user.begin());
 	g_dispatch_pending = true;
 }
 
-void NoteDispatch(uint64_t cs_address, uint64_t renderer_ns) {
+void NoteDispatch(uint64_t cs_address, uint64_t renderer_ns, const uint32_t* user_sgprs,
+                  uint32_t user_count) {
+	if (g_dispatch_pending && user_sgprs != nullptr) {
+		g_user_checked++;
+		const uint32_t count = std::min<uint32_t>(user_count, 16);
+		const uint32_t need  = count >= 32 ? ~0u : (1u << count) - 1u;
+		if ((g_dispatch_mask & need) != need) {
+			g_user_missing++;
+		} else if (!std::equal(user_sgprs, user_sgprs + count, g_dispatch_user.begin())) {
+			g_user_differ++;
+		} else {
+			g_user_equal++;
+		}
+	}
 	if (g_dispatch_pending) {
 		auto& stats = g_dispatch_keys[{g_dispatch_code, cs_address}];
 		stats.count++;
@@ -2031,6 +2084,13 @@ void NoteDispatch(uint64_t cs_address, uint64_t renderer_ns) {
 		     static_cast<double>(totals.ns) / 1000.0 / std::max<uint64_t>(totals.count, 1),
 		     totals.shaders);
 	}
+	LOGF("Compute shadow (10 s): %" PRIu64 " dispatches checked: user data as the SGPRs %.2f%%, "
+	     "missing %.2f%%, different %.2f%%\n",
+	     g_user_checked,
+	     g_user_checked != 0 ? 100.0 * static_cast<double>(g_user_equal) / g_user_checked : 0.0,
+	     g_user_checked != 0 ? 100.0 * static_cast<double>(g_user_missing) / g_user_checked : 0.0,
+	     g_user_checked != 0 ? 100.0 * static_cast<double>(g_user_differ) / g_user_checked : 0.0);
+	g_user_checked = g_user_equal = g_user_missing = g_user_differ = 0;
 	g_dispatch_keys.clear();
 	g_dispatch_marked = g_dispatch_unmarked = g_dispatch_unmarked_ns = 0;
 }

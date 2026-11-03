@@ -263,3 +263,20 @@ So **the tire renderer is about 70 % of GT7's compute work on the GPU thread** (
 passes and the dispatcher: ~7.8 of 11.2 s in the census windows). The second biggest is the
 per-model dispatch of `gt7_RenderModel`. Two of the census's top ten stay unnamed
 (`FUN_90018b960`, reached through a function pointer; `gt7_BuildDrawTextureRecord_caller`, kept).
+
+### Compute: where a dispatch's time goes, and its inputs on GT7's threads (2026-11-03)
+
+`KYTY_OP_STATS=1` (the GPU thread's time by dispatch shader): compute is **15.2 to 15.8 ms of every
+GPU-thread frame**. The per-tire shaders (52 to 62 dispatches a frame each: `9cd7cb4078f570da`,
+`02606143ff3687bf`, `ece59f98c38858aa`, `9042421f1cda301b`, `39ebc09a4ca997c8`, `2862e8dfaa912b03`,
+`71a4df017c4377bf`, `67074f819c89dad5`) take 7 to 22 us each, of which page protection 0 to 6 us
+and the address table up to 5 us; `6409cd5b94d336ca` (170 to 184 a frame) 11 to 13 us, protection
+0.6. Lookups and bindings are most of a dispatch: records pay. Several of these shaders are the
+ones writing GT7's GPU working memory (`KYTY_GPU_WRITE_STATS`: 0x125b..., 0x143d...).
+
+A dispatch's inputs are its compute user data SGPRs, which GT7 writes into the command buffer
+(`sceAgcCbSetShRegisterRangeDirect`, `...RegistersDirect`, `...RegistersIndirect`): Agc now keeps
+them per command buffer on the game thread (`NoteComputeUserData`) and the dispatch marker carries
+them (20 dwords). The GPU thread compares them with the SGPRs it loads: race, 200,000 to 270,000
+dispatches per 10 s, **100.00 % equal, 0 missing, 0 different**. A compute record can be built on
+the game thread from them, as the draw records are from the render context.
