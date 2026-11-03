@@ -113,3 +113,41 @@ GPU decompression (compute, or DirectStorage's GDeflate path) only for what is o
 
 - 2026-11-03: `KYTY_MAP_LOG=1` (`kernel/memory.cpp`, `NoteMap`): direct, named and flexible maps
   with CPU/GPU access, name and caller.
+
+## Job#0 profile (2026-11-03, race, 15.6 fps)
+
+`tools/gt7/sample-threads.py --guest-funcs <rebuild>\funcs\index.tsv` (30 s at 1 kHz; guest code
+named by GT7 function from the rebuild's index; `_profile-job0-native.txt`):
+
+| Thread | Waiting | GT7's job scheduler loop | GT7 work | Emulator work |
+|---|---|---|---|---|
+| Job#0 | 14 % (kernel wait) | 34 % (`FUN_9000652f0`, self) | ~27 % | ~25 %: fault handling 18 % (`KytyExceptionHandler`, emulated loads, page watchers), the G1/G3 record walk 10 % (`Gt7NativeWalk::ReadRecordedBacking`) |
+| Job#1, Job#2 | 64 % | (all their work runs under it: 73 % inclusive) | ~14 % | allocations, page protections |
+| Rendr | 99.6 % | | | |
+| Thread_Gpu | 18 % | | | 82 %: the command translation |
+
+`FUN_9000652f0` (3.2 KB) is GT7's fiber job scheduler: `sceFiberGetSelf`/`sceFiberSwitch`, job
+queue CAS, `Thrd_yield`, mutex and condition variable; the job threads spin and wait in it for work.
+GT7's own work is a small part of its job threads (14 to 27 % of each, ~9 to 17 ms of a 64 ms
+frame, spread over the workers, some of it render command building the native renderer replaces:
+`gt7_DrawModel_1440`, `gt7_StageCxRegisters`, `gt7_WriteUserData`, `gt7_CreatePrimState_site`
+at 5 to 8 % inclusive each). The frame waits on the GPU thread's translation and the emulator's
+fault handling, not on GT7: the first thing to replace is the renderer (and with it the memory
+emulation of render data), as GT7-NATIVE-BACKEND.md planned. Whether GT7's simulation and render
+prep fit 8.3 ms is measured again once those are gone (job threads waiting less).
+
+## Map log, first look (2026-11-03)
+
+32,875 maps in a session to a race (`KYTY_MAP_LOG=1`), by access:
+
+| Base (first) | Size | CPU | GPU | Class |
+|---|---|---|---|---|
+| 0xe400000000 | 14.7 GB (1,690 maps) | write | read+write | shared pools |
+| 0x2900000000 | 722 MB (11,560 maps) | none | read+write | GPU-only: device-local |
+| 0x3000000000 | 197 MB (3,145 maps) | write | read | CPU-written, GPU-read: upload |
+
+The callers are Kyty's export thunk (0x14012e60d), not GT7's code: the map entry points are reached
+through a thunk, so `__builtin_return_address(0)` stops there. The hot areas (0x1000000000,
+0xec0..., 0x125b..., 0x143d..., 0xf43...) are not among these maps: they come through AMPR's AMM
+commands (`MapDirect`, `MapAutomaticMemory` in libs/libAmpr.cpp), which are not logged yet. Next:
+the guest caller taken from the guest stack, and AMM maps logged with the code that recorded them.

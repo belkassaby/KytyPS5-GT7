@@ -7,6 +7,8 @@ Usage: python sample-threads.py [--seconds 30] [--rate 1000] [--threads Thread_G
                                 [--out samples.txt]
 Reports, per thread: self time by function (where the thread was), and inclusive time by function
 (functions found on its stack; a stack scan, so stale return addresses add some noise).
+With --guest-funcs (the GT7 rebuild's funcs/index.tsv), guest code is named by GT7 function too:
+self and inclusive (guest return addresses on the stack) time per GT7 function.
 """
 import argparse
 import collections
@@ -156,7 +158,31 @@ def main():
     parser.add_argument('--raw', default=None, help='JSON file for every sample\'s leaf and callers')
     parser.add_argument('--guest-exact', action='store_true',
                         help='guest code by 16-byte line instead of 4 KB page')
+    parser.add_argument('--guest-funcs', default=None,
+                        help="GT7 rebuild's funcs/index.tsv: guest code by GT7 function")
     args = parser.parse_args()
+    guest_starts, guest_names, guest_ends = [], [], []
+    if args.guest_funcs:
+        import bisect
+        with open(args.guest_funcs, encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('#'):
+                    continue
+                parts = line.rstrip('\n').split('\t')
+                if len(parts) < 4:
+                    continue
+                start = int(parts[0], 16)
+                guest_starts.append(start)
+                guest_names.append(parts[1])
+                guest_ends.append(start + max(int(parts[3] or 1), 1))
+
+    def guest_function(address):
+        if not guest_starts:
+            return None
+        i = bisect.bisect_right(guest_starts, address) - 1
+        if i >= 0 and address < guest_ends[i]:
+            return guest_names[i]
+        return None
     wanted = set(args.threads.split(','))
 
     pid = find_pid()
@@ -204,12 +230,15 @@ def main():
             finally:
                 k32.ResumeThread(handle)
             callers = []
+            guest_callers = []
             for (value,) in struct.iter_unpack('<Q', stack.raw[:got.value - got.value % 8]):
                 if base <= value < end:
-                    callers.append(value)
-                    if len(callers) >= args.depth:
-                        break
-            samples[name].append((rip, tuple(callers)))
+                    if len(callers) < args.depth:
+                        callers.append(value)
+                elif guest_starts and len(guest_callers) < args.depth and \
+                        guest_function(value - 1) is not None:
+                    guest_callers.append(value - 1)
+            samples[name].append((rip, tuple(callers), tuple(guest_callers)))
         next_time += period
         delay = next_time - time.perf_counter()
         if delay > 0:
@@ -220,7 +249,7 @@ def main():
     prefer = preferred_base(exe)
     addresses = set()
     for entries in samples.values():
-        for rip, callers in entries:
+        for rip, callers, _ in entries:
             addresses.add(rip)
             addresses.update(callers)
     inside = sorted(a for a in addresses if base <= a < end)
@@ -259,7 +288,19 @@ def main():
         # Outside the emulator, by system function and the first emulator function that called it.
         outside_by_caller = collections.Counter()
         outside = 0
-        for rip, callers in entries:
+        guest_self = collections.Counter()
+        guest_incl = collections.Counter()
+        guest_samples = 0
+        for rip, callers, guest_callers in entries:
+            gleaf = guest_function(rip)
+            if gleaf is not None:
+                guest_samples += 1
+                guest_self[gleaf] += 1
+            gseen = {gleaf} if gleaf is not None else set()
+            for c in guest_callers:
+                gseen.add(guest_function(c))
+            for g in gseen:
+                guest_incl[g] += 1
             leaf = names.get(rip)
             if leaf is None:
                 outside += 1
@@ -282,11 +323,20 @@ def main():
         lines.append('-- inclusive (stack scan)')
         for fn, n in incl.most_common(60):
             lines.append('%6.2f%%  %s' % (100.0 * n / total, fn))
+        if guest_starts:
+            lines.append('-- GT7 functions, self (%.0f%% of samples in the eboot)' %
+                         (100.0 * guest_samples / max(total, 1)))
+            for fn, n in guest_self.most_common(50):
+                lines.append('%6.2f%%  %s' % (100.0 * n / total, fn))
+            lines.append('-- GT7 functions, inclusive (guest return addresses on the stack)')
+            for fn, n in guest_incl.most_common(60):
+                lines.append('%6.2f%%  %s' % (100.0 * n / total, fn))
     if args.raw:
         # Every sample's leaf and caller chain, by name, for further digging.
         import json
-        dump = {name: [[names.get(rip) or outside_name(rip)] + [names.get(c, '?') for c in callers]
-                       for rip, callers in entries] for name, entries in samples.items()}
+        dump = {name: [[names.get(rip) or guest_function(rip) or outside_name(rip)] +
+                       [names.get(c, '?') for c in callers] + [guest_function(c) for c in gcallers]
+                       for rip, callers, gcallers in entries] for name, entries in samples.items()}
         with open(args.raw, 'w', encoding='utf-8') as f:
             json.dump(dump, f)
     text = '\n'.join(lines)
