@@ -151,3 +151,31 @@ through a thunk, so `__builtin_return_address(0)` stops there. The hot areas (0x
 0xec0..., 0x125b..., 0x143d..., 0xf43...) are not among these maps: they come through AMPR's AMM
 commands (`MapDirect`, `MapAutomaticMemory` in libs/libAmpr.cpp), which are not logged yet. Next:
 the guest caller taken from the guest stack, and AMM maps logged with the code that recorded them.
+
+## Native renderer: where the GPU thread's frame goes (2026-11-03)
+
+The native renderer is GT7-NATIVE-BACKEND.md's plan (N1 to N4 done: engine state keys, records
+built on GT7's render threads, every resource named), carried on in GT7-GPU-DRIVEN.md as the G3
+bypass: a marked draw executed from its record at about 2 us instead of the 8.6 us translation.
+What the GPU thread spends a 10 s window of a race on now (`GPU phases`, 115 frames):
+
+| Work | Count / 10 s | us each | GPU thread s / 10 s |
+|---|---|---|---|
+| draws through the translation | 532,000 | 8.75 | **4.7** |
+| GT7's compute dispatches | 225,000 | 9.6 (buffers 4.3: syncs and protections of what they write) | **2.2** |
+| tessellated draws | 59,000 | 24.6 | **1.4** |
+| bypassed draws (G3 records) | 246,000 | 2.05 | 0.5 |
+
+Of the marked draws, 80.9 % are bypassed; but most draws are **not marked**: about 2,100 a frame
+bypassed against about 4,600 translated. The markers come from two engine draw functions
+(`gt7_DrawIndex`, `gt7_DrawMeshClusters`); GT-RENDER-STUDY.md lists seven, and the compute passes
+come from 59 binding functions. So the native renderer's next steps, by the time they take off the
+GPU thread:
+
+1. **Coverage census**: which GT7 functions issue the translated draws and the dispatches
+   (`KYTY_AGC_CALLSITES=1`, return addresses named with the rebuild's index), and why each marked
+   draw still falls back (11.9 % "buffer range", 3.1 % "rendering differs").
+2. **Every draw function marked** and recorded, so its draws take the record path (4.7 s).
+3. **Compute passes as records** the same way (2.2 s), then the tessellated draws (1.4 s).
+4. Then the records' commands recorded on the render threads (secondary command buffers) and the
+   PM4 stream no longer decoded for covered work: the GPU thread left with ordering and submission.
