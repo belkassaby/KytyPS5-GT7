@@ -103,6 +103,8 @@ struct ShadowRecord {
 // Image::grid); and a grid's record words from its T# (the learned shape: false when the T# does
 // not match it).
 [[nodiscard]] bool KnownGrid(uint64_t shader_hash, uint32_t image);
+// A grid T# of a shape learned for this shader's image (GridWords gives its words).
+[[nodiscard]] bool GridShapeKnown(uint64_t shader_hash, uint32_t image, const uint32_t* tsharp);
 [[nodiscard]] bool GridWords(uint64_t shader_hash, uint32_t image, const uint32_t* tsharp,
                              uint32_t* words);
 

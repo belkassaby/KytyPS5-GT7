@@ -2685,6 +2685,7 @@ struct PipelineCache::ProgramCache {
 		                     : !bindless_images || level < 2 ? 1u
 		                                                     : static_cast<uint8_t>(level);
 		if (specialization.draw_table == want) {
+			ApplyGrids(stage, snapshot, shader_hash);
 			return;
 		}
 		if (snapshot.specialization_hash_valid) {
@@ -2696,11 +2697,13 @@ struct PipelineCache::ProgramCache {
 		ApplyGrids(stage, snapshot, shader_hash);
 	}
 
-	// G3: at level 3, the pixel stage's images seen as light grids read guest memory. The flags
-	// change the specialization: its hash is not the scanner's then.
+	// G3: the pixel stage's images seen as light grids (their shape learned) read by address, at
+	// any draw table level (no texture cache image over GT7's per-frame memory, whose tracking
+	// made most of a race's write faults). The flags change the specialization: its hash is not
+	// the scanner's then.
 	static void ApplyGrids(ShaderType stage, StageSnapshot& snapshot, uint64_t shader_hash) {
 		auto&      specialization = snapshot.specialization;
-		const bool records        = specialization.draw_table >= 3u && stage == ShaderType::Pixel;
+		const bool records        = ::Loader::Gt7NativeDraws::G3Use() && stage == ShaderType::Pixel;
 		bool       changed        = false;
 		for (uint32_t i = 0; i < specialization.images.size(); i++) {
 			const bool grid = records && Gt7NativeWalk::KnownGrid(shader_hash, i);

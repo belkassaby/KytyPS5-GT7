@@ -711,3 +711,16 @@ texture cache image on the full path (a null texture is bound; the grid words co
 right. Grid images are still made (16x4x8, 30x17x16, 8x4x8): by shaders whose grids are not read
 by address (`Light grids resolved as images` names them). Next: those read by address too, and a
 direct region over the grid memory (GPU-read only), so their reads need no sync or protection.
+
+**Grids by address on every draw.** `Light grids resolved as images` showed the grid images came
+from draws outside the draw table mode (unmarked draws: 1,833 shader variants, led by
+95192c795aab5ce3, cd532109e77b2648, 7be288c0a272572f). A known grid is now read by address at any
+draw table level (`ApplyGrids` for every pixel stage with G3 on; `table_grids` in every layout,
+the words in the shader data, uploaded after `CommitBindings` writes them; shapes learned on every
+draw). A shader binds grids of several sizes: up to 8 shapes are learned per shader image, matched
+by the T#'s width, height and depth, and a grid of an unlearned shape goes through the texture
+cache once to learn it (`Light grids without words` names grids that still read zero lights).
+Warm cache: 16.2 fps median (p25 14.8, p75 17.6), against 15.3; grid image binds 5,400 a minute
+(from about 100,000); grids without words a handful. Write faults unchanged (55k/s): 42 % still
+around images (the other images in GT7's blocks), 37 % buffer blocks (grids among them: their
+reads still go through the buffer cache's synchronization).

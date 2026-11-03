@@ -1065,8 +1065,21 @@ struct G3Layout {
 // Kyty's texture had (linear R32G32_UINT: a row pitch and a layer stride in bytes).
 struct G3Grid {
 	uint32_t width = 0, height = 0, layers = 0, pitch_bytes = 0, layer_bytes = 0;
+	uint32_t depth = 0; // the T#'s depth field it was learned with
 };
-std::unordered_map<uint64_t, G3Grid> g_g3_grids;
+// The shapes of a shader's light grid (a shader binds grids of a few sizes), at most 8 each.
+std::unordered_map<uint64_t, std::vector<G3Grid>> g_g3_grids;
+// The learned shape a grid T# has, or none.
+static const G3Grid* FindGridShape(const std::vector<G3Grid>& shapes, const ShaderTextureResource& t) {
+	for (const auto& shape: shapes) {
+		if (static_cast<uint32_t>(t.Width5()) + 1u == shape.width &&
+		    static_cast<uint32_t>(t.Height5()) + 1u == shape.height &&
+		    static_cast<uint32_t>(t.Depth()) == shape.depth) {
+			return &shape;
+		}
+	}
+	return nullptr;
+}
 uint64_t G3GridKey(uint64_t shader_hash, uint32_t image) {
 	return shader_hash * 0x9e3779b97f4a7c15ull + image;
 }
@@ -3983,7 +3996,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				}
 			}
 		}
-		if (!from_record && program.info.images[i].grid) {
+		if (!from_record && program.info.images[i].grid &&
+		    Gt7NativeWalk::GridShapeKnown(program.shader_hash, i, snapshot.images[i].dwords.data())) {
 			// A light grid the shader reads by address (G3): no texture cache image over GT7's
 			// per-frame memory. Tracking one write-protected its pages at every use, and GT7's
 			// CPU writes them every frame: about 90 % of the write faults around images.
@@ -4006,21 +4020,23 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			binding       = {id, nullptr, std::move(desc)};
 		}
 		const bool grid    = pixel && IsLightGridBinding(program.info.images[i], binding);
-		if (grid && ::Loader::Gt7NativeDraws::G3Use() && ::Loader::Gt7NativeDraws::CurrentMarked()) {
+		if (grid && ::Loader::Gt7NativeDraws::G3Use()) {
 			// G3: this image of this shader is a light grid; its shape, once (the T# must name
 			// the texture's own memory, linear, one level).
-			thread_local std::unordered_set<uint64_t> learned_grids;
 			const auto key  = G3GridKey(program.shader_hash, i);
 			const auto& info = binding.desc.info;
 			const auto  tsharp = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
-			if (!learned_grids.contains(key) && !info.IsTiled() && info.resources.levels == 1 &&
-			    info.resources.layers != 0 && info.data.address == tsharp.Base40() &&
-			    info.bytes_per_block == 8u && info.pitch != 0) {
-				learned_grids.insert(key);
+			if (!info.IsTiled() && info.resources.levels == 1 && info.resources.layers != 0 &&
+			    info.data.address == tsharp.Base40() && info.bytes_per_block == 8u &&
+			    info.pitch != 0) {
 				std::unique_lock lock(g_g3_mutex);
-				g_g3_grids[key] = {info.extent.width, info.extent.height, info.resources.layers,
-				                   info.pitch * 8u,
-				                   static_cast<uint32_t>(info.data.size / info.resources.layers)};
+				auto& shapes = g_g3_grids[key];
+				if (shapes.size() < 8 && FindGridShape(shapes, tsharp) == nullptr) {
+					shapes.push_back({info.extent.width, info.extent.height, info.resources.layers,
+					                  info.pitch * 8u,
+					                  static_cast<uint32_t>(info.data.size / info.resources.layers),
+					                  static_cast<uint32_t>(tsharp.Depth())});
+				}
 			}
 		}
 		if (grid) {
@@ -4554,7 +4570,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr &&
 	    program.bindings.table_images.empty() && program.bindings.table_sampler_count == 0 &&
-	    !program.bindings.record) {
+	    program.bindings.table_grids.empty() && !program.bindings.record) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
 	}
 }
@@ -5544,7 +5560,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			                                     none_count[1]);
 			if (ShaderRecompiler::IR::FindBinding(
 			        layout, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr &&
-			    !layout.record) {
+			    !layout.record && layout.table_grids.empty()) {
 				descriptors.shader_data_buffer = NativeUpload(m_context, prepared->shader_data);
 			}
 			::Loader::Gt7NativeDraws::AddG1SlotTime(static_cast<uint64_t>(
@@ -5565,7 +5581,28 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			                              words) ||
 			    !G3GridDeviceAddress(m_context, words)) {
 				std::fill_n(words, ShaderRecompiler::IR::BindingLayout::GridDwords, 0u);
+				// Diagnostics: a grid read by address with no words (another shape than the one
+				// learned, or no buffer): it reads zero lights. Named every 10 s.
+				static std::map<uint64_t, uint64_t> failed;
+				static auto                         failed_last = std::chrono::steady_clock::now();
+				failed[program.shader_hash]++;
+				if (const auto now = std::chrono::steady_clock::now();
+				    now - failed_last >= std::chrono::seconds(10)) {
+					std::string text;
+					for (const auto& [hash, count]: failed) {
+						text += fmt::format(" {:016x}:{}", hash, count);
+					}
+					LOGF("Light grids without words (10 s, read as no lights):%s\n", text.c_str());
+					failed.clear();
+					failed_last = now;
+				}
 			}
+		}
+		if (!layout.table_grids.empty() && !layout.record &&
+		    ShaderRecompiler::IR::FindBinding(
+		        layout, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
+			// The grid words are in it now (the shader data goes as is otherwise: push data).
+			descriptors.shader_data_buffer = NativeUpload(m_context, prepared->shader_data);
 		}
 		if (layout.record) {
 			// Written straight into the mapped ring (write-only: the ring may be write-combined).
@@ -5883,21 +5920,26 @@ bool KnownGrid(uint64_t shader_hash, uint32_t image) {
 	return g_g3_grids.contains(G3GridKey(shader_hash, image));
 }
 
+bool GridShapeKnown(uint64_t shader_hash, uint32_t image, const uint32_t* tsharp) {
+	ShaderTextureResource t;
+	std::copy_n(tsharp, 8, t.fields);
+	std::shared_lock lock(g_g3_mutex);
+	const auto       it = g_g3_grids.find(G3GridKey(shader_hash, image));
+	return !t.IsNull() && it != g_g3_grids.end() && FindGridShape(it->second, t) != nullptr;
+}
+
 bool GridWords(uint64_t shader_hash, uint32_t image, const uint32_t* tsharp, uint32_t* words) {
+	ShaderTextureResource t;
+	std::copy_n(tsharp, 8, t.fields);
 	G3Grid grid;
 	{
 		std::shared_lock lock(g_g3_mutex);
 		const auto       it = g_g3_grids.find(G3GridKey(shader_hash, image));
-		if (it == g_g3_grids.end()) {
+		const auto*      shape = it == g_g3_grids.end() || t.IsNull() ? nullptr : FindGridShape(it->second, t);
+		if (shape == nullptr) {
 			return false;
 		}
-		grid = it->second;
-	}
-	ShaderTextureResource t;
-	std::copy_n(tsharp, 8, t.fields);
-	if (t.IsNull() || static_cast<uint32_t>(t.Width5()) + 1u != grid.width ||
-	    static_cast<uint32_t>(t.Height5()) + 1u != grid.height) {
-		return false;
+		grid = *shape;
 	}
 	const auto base = t.Base40();
 	words[0]        = static_cast<uint32_t>(base);

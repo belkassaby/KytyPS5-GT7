@@ -146,6 +146,14 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 			}
 		}
 		next.table_sampler_count = static_cast<uint32_t>(program.info.samplers.size());
+	} else {
+		// A light grid read by address outside the table levels too (its words in the shader
+		// data, as at level 3).
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			if (program.info.images[i].grid) {
+				next.table_grids.push_back(i);
+			}
+		}
 	}
 	next.record = program.draw_table >= 3u;
 	next.push_data_start_dword = PushData::StartFor(push_data_start_dword, next.PushDwords());
